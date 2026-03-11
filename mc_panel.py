@@ -2,16 +2,6 @@
 ⛏️  Minecraft Yönetim Paneli — Tam Sürüm
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Flask + Flask-SocketIO + Eventlet
-Özellikler:
-  • Gerçek zamanlı konsol (SocketIO)
-  • Oyuncu yönetimi (kick/ban/op/tp/give/gamemode)
-  • Dosya yönetimi (görüntüle/düzenle/yükle/indir/sil)
-  • Plugin yönetimi (yükle/sil/Hangar arama)
-  • Sunucu ayarları (server.properties GUI)
-  • Dünya yönetimi + yedekleme
-  • Otomatik Paper MC indirme
-  • Performans izleme (TPS/RAM/CPU canlı)
-  • Cloudflare tunnel entegrasyonu
 """
 
 import os, sys, json, time, threading, subprocess, shutil, zipfile
@@ -37,10 +27,10 @@ MC_RAM    = os.environ.get("MC_RAM", "2G")
 # ── Global durum ─────────────────────────────────────────────
 mc_process   = None
 console_buf  = deque(maxlen=3000)
-players      = {}     # name -> {op, joined_ts}
+players      = {}
 tunnel_info  = {"url": "", "host": ""}
 server_state = {
-    "status":  "stopped",   # stopped/starting/running/stopping
+    "status":  "stopped",
     "tps":     20.0,
     "tps15":   20.0,
     "tps5":    20.0,
@@ -63,7 +53,6 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
 # ══════════════════════════════════════════════════════════════
 
 def log(line: str):
-    """Konsol tamponuna ekle ve SocketIO ile yayınla"""
     ts    = datetime.now().strftime("%H:%M:%S")
     entry = {"ts": ts, "line": line.rstrip()}
     console_buf.append(entry)
@@ -72,8 +61,6 @@ def log(line: str):
 
 
 def _parse_mc_output(line: str):
-    """MC çıktısını parse et — oyuncu/TPS/durum"""
-    # Oyuncu bağlandı
     m = re.search(r"(\w+)\[/.+\] logged in", line)
     if m:
         name = m.group(1)
@@ -83,7 +70,6 @@ def _parse_mc_output(line: str):
         socketio.emit("stats_update", server_state)
         return
 
-    # Oyuncu ayrıldı
     m = re.search(r"(\w+) lost connection|(\w+) left the game", line)
     if m:
         name = m.group(1) or m.group(2)
@@ -93,7 +79,6 @@ def _parse_mc_output(line: str):
         socketio.emit("stats_update", server_state)
         return
 
-    # TPS (Paper MC: /tps komutu)
     m = re.search(r"TPS from last 1m, 5m, 15m: ([\d.]+),\s*([\d.]+),\s*([\d.]+)", line)
     if m:
         server_state["tps"]   = float(m.group(1))
@@ -102,23 +87,19 @@ def _parse_mc_output(line: str):
         socketio.emit("stats_update", server_state)
         return
 
-    # Versiyon
     m = re.search(r"Starting minecraft server version (.+)", line)
     if m:
         server_state["version"] = m.group(1).strip()
 
-    # Server hazır
     if "Done" in line and "help" in line.lower():
         server_state["status"]  = "running"
         server_state["started"] = time.time()
         server_state["online_players"] = 0
         socketio.emit("server_status", server_state)
         log("[Panel] ✅ Minecraft Server hazır! Oyuncular bağlanabilir.")
-        # TPS otomatik izle
         threading.Thread(target=_tps_monitor, daemon=True).start()
         return
 
-    # Server durdu
     if "Stopping server" in line:
         server_state["status"] = "stopping"
         socketio.emit("server_status", server_state)
@@ -129,7 +110,6 @@ def _players_list():
 
 
 def _tps_monitor():
-    """30 saniyede bir TPS sorgula"""
     while mc_process and mc_process.poll() is None:
         time.sleep(30)
         if server_state["status"] == "running":
@@ -137,7 +117,6 @@ def _tps_monitor():
 
 
 def _stdout_reader():
-    """MC stdout'unu oku"""
     global mc_process
     while mc_process and mc_process.poll() is None:
         try:
@@ -155,7 +134,6 @@ def _stdout_reader():
 
 
 def _ram_monitor():
-    """RAM/uptime izle, 5 sn'de yayınla"""
     import psutil
     while True:
         eventlet.sleep(5)
@@ -175,40 +153,62 @@ def _ram_monitor():
 # ══════════════════════════════════════════════════════════════
 
 def download_paper():
-    """Paper MC indir"""
+    """
+    Paper MC indir.
+    DÜZELTME: requests yerine urllib kullanıyoruz.
+    Sebep: eventlet.monkey_patch() + requests + SSL = sonsuz özyineleme hatası.
+    """
+    import urllib.request as urlreq
+    import ssl
+
+    ctx = ssl.create_default_context()
     log("[Panel] 📥 Paper MC indiriliyor...")
     try:
-        r = requests.get(
-            f"https://api.papermc.io/v2/projects/paper/versions/{MC_VERSION}/builds",
-            timeout=20
+        api_url = (
+            f"https://api.papermc.io/v2/projects/paper"
+            f"/versions/{MC_VERSION}/builds"
         )
-        builds = r.json().get("builds", [])
+        req = urlreq.Request(api_url, headers={"User-Agent": "MCPanel/2.0"})
+        with urlreq.urlopen(req, timeout=20, context=ctx) as r:
+            builds = json.loads(r.read()).get("builds", [])
+
         if not builds:
             raise ValueError("Build listesi boş")
+
         build    = builds[-1]["build"]
         jar_name = f"paper-{MC_VERSION}-{build}.jar"
-        url      = (f"https://api.papermc.io/v2/projects/paper/versions/"
-                    f"{MC_VERSION}/builds/{build}/downloads/{jar_name}")
+        url = (
+            f"https://api.papermc.io/v2/projects/paper"
+            f"/versions/{MC_VERSION}/builds/{build}/downloads/{jar_name}"
+        )
         log(f"[Panel] 📦 {jar_name} indiriliyor (build #{build})...")
-        r2 = requests.get(url, stream=True, timeout=180)
-        total = int(r2.headers.get("content-length", 0))
-        done  = 0
-        with open(MC_JAR, "wb") as f:
-            for chunk in r2.iter_content(65536):
-                f.write(chunk)
-                done += len(chunk)
-                if total:
-                    pct = int(done * 100 / total)
-                    socketio.emit("download_progress", {"pct": pct, "done": done, "total": total})
-        log(f"[Panel] ✅ Paper MC {MC_VERSION} build #{build} indirildi ({done//1024//1024} MB)")
+
+        req2 = urlreq.Request(url, headers={"User-Agent": "MCPanel/2.0"})
+        done = 0
+        with urlreq.urlopen(req2, timeout=180, context=ctx) as r2:
+            total = int(r2.headers.get("Content-Length", 0))
+            with open(MC_JAR, "wb") as f:
+                while True:
+                    chunk = r2.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        pct = int(done * 100 / total)
+                        socketio.emit("download_progress",
+                                      {"pct": pct, "done": done, "total": total})
+
+        log(f"[Panel] ✅ Paper MC {MC_VERSION} build #{build} indirildi "
+            f"({done // 1024 // 1024} MB)")
         return True
+
     except Exception as e:
         log(f"[Panel] ❌ İndirme hatası: {e}")
         return False
 
 
 def write_server_config():
-    """Eula + server.properties + JVM flags dosyasını yaz"""
     (MC_DIR / "eula.txt").write_text("eula=true\n")
 
     props_file = MC_DIR / "server.properties"
@@ -237,11 +237,9 @@ def write_server_config():
             "sync-chunk-writes=true\n"
         )
 
-    # Paper optimize config
     config_dir = MC_DIR / "config"
     config_dir.mkdir(exist_ok=True)
 
-    # Paper-world-defaults
     paper_world = config_dir / "paper-world-defaults.yml"
     if not paper_world.exists():
         paper_world.write_text(
@@ -263,9 +261,7 @@ def write_server_config():
 
 
 def get_jvm_args():
-    """Aikar's optimized JVM flags for Minecraft"""
     ram = MC_RAM
-    # Min heap = yarısı, max = tam
     num = int("".join(filter(str.isdigit, ram)))
     unit = "".join(filter(str.isalpha, ram)).upper()
     xms = f"{max(512, num // 2)}{unit}"
@@ -273,7 +269,6 @@ def get_jvm_args():
     return [
         "java",
         f"-Xms{xms}", f"-Xmx{ram}",
-        # G1GC — Aikar's flags
         "-XX:+UseG1GC",
         "-XX:+ParallelRefProcEnabled",
         "-XX:MaxGCPauseMillis=200",
@@ -292,23 +287,17 @@ def get_jvm_args():
         "-XX:SurvivorRatio=32",
         "-XX:+PerfDisableSharedMem",
         "-XX:MaxTenuringThreshold=1",
-        # String dedup + JIT
         "-XX:+UseStringDeduplication",
         "-XX:+OptimizeStringConcat",
         "-XX:ReservedCodeCacheSize=512m",
         "-XX:+UseCodeCacheFlushing",
-        # Huge pages
         "-XX:+UseLargePages",
         "-XX:LargePageSizeInBytes=2m",
-        # Network
         "-Djava.net.preferIPv4Stack=true",
-        # Encoding
         "-Dfile.encoding=UTF-8",
         "-Duser.timezone=Europe/Istanbul",
-        # Paper flags
         "-Dpaper.playerconnection.keepAlive=60",
         "-Dcom.mojang.eula.agree=true",
-        # Jar
         "-jar", str(MC_JAR), "--nogui",
     ]
 
@@ -320,7 +309,6 @@ def start_server():
 
     MC_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Jar yoksa indir
     if not MC_JAR.exists():
         server_state["status"] = "downloading"
         socketio.emit("server_status", server_state)
@@ -389,8 +377,6 @@ def send_command(cmd: str) -> bool:
 #  FLASK ROUTES
 # ══════════════════════════════════════════════════════════════
 
-# ── Sunucu kontrol ────────────────────────────────────────────
-
 @app.route("/api/start", methods=["POST"])
 def api_start():
     ok, msg = start_server()
@@ -433,8 +419,6 @@ def api_console_history():
     return jsonify(list(console_buf))
 
 
-# ── Tunnel bilgisi ─────────────────────────────────────────────
-
 @app.route("/api/internal/tunnel", methods=["POST"])
 def api_internal_tunnel():
     d = request.json or {}
@@ -448,8 +432,6 @@ def api_internal_tunnel():
 def api_tunnel():
     return jsonify(tunnel_info)
 
-
-# ── Oyuncu yönetimi ──────────────────────────────────────────
 
 @app.route("/api/players")
 def api_players():
@@ -935,11 +917,7 @@ PANEL_HTML = r"""<!DOCTYPE html>
 }
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; background: var(--bg); color: var(--t1); font-family: var(--font); overflow: hidden; }
-
-/* ── Layout ── */
 .layout { display: flex; height: 100vh; }
-
-/* ── Sidebar ── */
 .sidebar {
   width: var(--sidebar); background: var(--s1);
   border-right: 1px solid rgba(255,255,255,.06);
@@ -958,7 +936,6 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
 .dot-red    { background: var(--red);    box-shadow: 0 0 6px var(--red); }
 .dot-yellow { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); animation: blink 1s infinite; }
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
-
 .nav { padding: 10px; flex: 1; }
 .nav-sec { font-size: 9px; font-weight: 700; color: var(--t3); text-transform: uppercase;
   letter-spacing: .12em; padding: 10px 6px 5px; }
@@ -970,7 +947,6 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
 .nav-item:hover { background: rgba(255,255,255,.05); color: var(--t1); }
 .nav-item.active { background: rgba(0,229,255,.09); color: var(--a1); font-weight: 600; }
 .nav-item .ico { font-size: 15px; width: 18px; text-align: center; }
-
 .sb-ctrl { padding: 12px 10px; border-top: 1px solid rgba(255,255,255,.06); }
 .ctrl-btn {
   width: 100%; padding: 8px; border-radius: 9px; font-size: 12px; font-weight: 600;
@@ -981,10 +957,7 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
 .cb-restart { background: rgba(255,165,2,.12); color: var(--yellow); border: 1px solid rgba(255,165,2,.25); }
 .cb-stop    { background: rgba(255,71,87,.12); color: var(--red);    border: 1px solid rgba(255,71,87,.25); }
 .ctrl-btn:hover { transform: translateY(-1px); filter: brightness(1.1); }
-
-/* ── Main ── */
 .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-
 .topbar {
   height: 50px; background: var(--s1); border-bottom: 1px solid rgba(255,255,255,.06);
   display: flex; align-items: center; padding: 0 18px; gap: 14px; flex-shrink: 0;
@@ -993,8 +966,6 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
 .top-stats { display: flex; gap: 18px; font-size: 11px; color: var(--t2); font-family: var(--mono); }
 .ts { display: flex; align-items: center; gap: 4px; }
 .ts-v { color: var(--t1); font-weight: 600; }
-
-/* MC adres banner */
 .mc-addr-bar {
   background: linear-gradient(90deg, rgba(0,255,170,.08), rgba(0,229,255,.06));
   border-bottom: 1px solid rgba(0,255,170,.15);
@@ -1004,13 +975,9 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
 .mc-addr-bar .lbl { color: var(--t2); }
 .mc-addr-bar .addr { color: var(--a3); font-family: var(--mono); font-weight: 600; }
 .mc-addr-bar.hidden { display: none; }
-
-/* ── Pages ── */
 .pages { flex: 1; overflow: hidden; }
 .page  { display: none; height: 100%; overflow-y: auto; padding: 18px; }
 .page.active { display: block; }
-
-/* ── Cards ── */
 .card {
   background: var(--s1); border: 1px solid rgba(255,255,255,.06);
   border-radius: var(--r); padding: 18px; margin-bottom: 14px;
@@ -1020,20 +987,14 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
   letter-spacing: .1em; margin-bottom: 14px; display: flex; align-items: center; gap: 8px;
 }
 .card-hd::before { content:''; width: 3px; height: 11px; border-radius: 2px; background: var(--a1); }
-
 .g2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .g3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
 .g4 { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; }
-.sp2 { grid-column: span 2; }
-
-/* Stat cards */
 .sc { background: var(--s2); border: 1px solid rgba(255,255,255,.05); border-radius: 10px; padding: 16px; text-align: center; }
 .sc-val { font-size: 26px; font-weight: 700; font-family: var(--mono);
   background: linear-gradient(135deg, var(--a1), var(--a2));
   -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
 .sc-lbl { font-size: 11px; color: var(--t2); margin-top: 4px; }
-
-/* Table */
 .tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
 .tbl th { padding: 8px 10px; text-align: left; font-size: 10px; font-weight: 700;
   color: var(--t2); text-transform: uppercase; letter-spacing: .08em;
@@ -1041,16 +1002,12 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
 .tbl td { padding: 9px 10px; border-bottom: 1px solid rgba(255,255,255,.04); }
 .tbl tr:hover td { background: rgba(255,255,255,.02); }
 .tbl tr:last-child td { border: none; }
-
-/* Badges */
 .badge { border-radius: 20px; padding: 2px 8px; font-size: 10px; font-weight: 700; font-family: var(--mono); }
 .bg  { background: rgba(46,213,115,.1);  border: 1px solid rgba(46,213,115,.25);  color: var(--green); }
 .br  { background: rgba(255,71,87,.1);   border: 1px solid rgba(255,71,87,.25);   color: var(--red); }
 .bb  { background: rgba(0,229,255,.08);  border: 1px solid rgba(0,229,255,.2);    color: var(--a1); }
 .by  { background: rgba(255,165,2,.1);   border: 1px solid rgba(255,165,2,.25);   color: var(--yellow); }
 .bo  { background: rgba(255,107,53,.1);  border: 1px solid rgba(255,107,53,.25);  color: var(--orange); }
-
-/* Buttons */
 .btn {
   padding: 6px 14px; border-radius: 7px; font-size: 12px; font-weight: 600;
   border: none; cursor: pointer; font-family: var(--font); transition: all .15s;
@@ -1066,8 +1023,6 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
 .b-warn  { background: rgba(255,165,2,.1);   color: var(--yellow); border: 1px solid rgba(255,165,2,.25); }
 .b-succ  { background: rgba(46,213,115,.1);  color: var(--green);  border: 1px solid rgba(46,213,115,.25); }
 .b-ghost { background: rgba(255,255,255,.05); color: var(--t2);    border: 1px solid rgba(255,255,255,.1); }
-
-/* Console */
 .con-wrap { height: calc(100% - 42px); display: flex; flex-direction: column; }
 .con-out {
   flex: 1; background: #000; border-radius: 10px; padding: 12px; overflow-y: auto;
@@ -1095,8 +1050,6 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
   cursor: pointer; font-family: var(--font); transition: all .15s;
 }
 .con-send:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(0,229,255,.3); }
-
-/* File manager */
 .fm { display: flex; gap: 12px; height: calc(100vh - 160px); }
 .fm-tree { width: 280px; flex-shrink: 0; display: flex; flex-direction: column;
   background: var(--s1); border: 1px solid rgba(255,255,255,.06); border-radius: var(--r); overflow: hidden; }
@@ -1124,8 +1077,6 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
   font-size: 12px; border: none; outline: none; padding: 14px; resize: none;
   line-height: 1.6;
 }
-
-/* Settings */
 .set-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
 .set-item { background: var(--s2); border: 1px solid rgba(255,255,255,.05); border-radius: 9px; padding: 12px; }
 .set-lbl  { font-size: 10px; color: var(--t2); margin-bottom: 5px; text-transform: uppercase; letter-spacing: .06em; }
@@ -1136,15 +1087,11 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
 }
 .set-inp:focus { border-color: rgba(0,229,255,.4); }
 select.set-inp option { background: #1e1e1e; }
-
-/* Progress */
 .prog { height: 5px; background: rgba(255,255,255,.06); border-radius: 3px; overflow: hidden; margin-top: 5px; }
 .prog-f { height: 100%; border-radius: 3px; transition: width .5s; }
 .pf-cpu  { background: linear-gradient(90deg, var(--a1), var(--a2)); }
 .pf-ram  { background: linear-gradient(90deg, var(--a3), var(--a1)); }
 .pf-disk { background: linear-gradient(90deg, var(--a2), var(--orange)); }
-
-/* Inputs */
 .inp {
   background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1);
   color: var(--t1); border-radius: 8px; padding: 8px 12px; font-family: var(--font);
@@ -1152,8 +1099,6 @@ select.set-inp option { background: #1e1e1e; }
 }
 .inp:focus { border-color: rgba(0,229,255,.4); }
 .inp-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
-
-/* Modal */
 .modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 100;
   align-items: center; justify-content: center; }
 .modal-bg.open { display: flex; }
@@ -1165,13 +1110,9 @@ select.set-inp option { background: #1e1e1e; }
   color: var(--t1); border-radius: 8px; padding: 9px 12px; font-family: var(--mono);
   font-size: 12px; outline: none; margin-bottom: 8px; }
 .m-inp:focus { border-color: rgba(0,229,255,.4); }
-
-/* Upload zone */
 .upzone { border: 2px dashed rgba(255,255,255,.12); border-radius: 10px; padding: 20px;
   text-align: center; cursor: pointer; color: var(--t2); font-size: 13px; transition: all .2s; }
 .upzone:hover, .upzone.drag { border-color: rgba(0,229,255,.4); background: rgba(0,229,255,.04); }
-
-/* Notifications */
 .notif-wrap { position: fixed; top: 14px; right: 14px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
 .notif { padding: 10px 16px; border-radius: 10px; font-size: 12px; font-weight: 600; max-width: 300px;
   animation: slide-in .3s ease; }
@@ -1179,19 +1120,14 @@ select.set-inp option { background: #1e1e1e; }
 .n-ok   { background: rgba(46,213,115,.15);  border: 1px solid rgba(46,213,115,.3);  color: var(--green); }
 .n-err  { background: rgba(255,71,87,.15);   border: 1px solid rgba(255,71,87,.3);   color: var(--red); }
 .n-info { background: rgba(0,229,255,.1);    border: 1px solid rgba(0,229,255,.25);  color: var(--a1); }
-
-/* Scrollbar */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 3px; }
-
 input[type=file] { display: none; }
 </style>
 </head>
 <body>
 <div class="layout">
-
-<!-- ══ Sidebar ══════════════════════════════════════════ -->
 <div class="sidebar">
   <div class="sb-head">
     <h2>⛏️ MC Panel</h2>
@@ -1224,11 +1160,7 @@ input[type=file] { display: none; }
     <button class="ctrl-btn cb-stop"    onclick="srvAction('stop')">■ Durdur</button>
   </div>
 </div>
-
-<!-- ══ Main ═════════════════════════════════════════════ -->
 <div class="main">
-
-  <!-- Topbar -->
   <div class="topbar">
     <div class="page-title" id="page-title">📊 Dashboard</div>
     <div class="top-stats">
@@ -1237,17 +1169,12 @@ input[type=file] { display: none; }
       <div class="ts">🧠 <span class="ts-v" id="tb-ram">— MB</span></div>
     </div>
   </div>
-
-  <!-- MC Adres Bandı -->
   <div class="mc-addr-bar hidden" id="mc-addr-bar">
     <span class="lbl">📌 MC Server Adresi:</span>
     <span class="addr" id="mc-addr-text">bekleniyor...</span>
     <button class="btn btn-sm b-ghost" onclick="copyAddr()">📋 Kopyala</button>
   </div>
-
   <div class="pages">
-
-  <!-- ═ Dashboard ════════════════════════════════════════ -->
   <div class="page active" id="page-dashboard">
     <div class="g4" style="margin-bottom:14px">
       <div class="sc"><div class="sc-val" id="d-pl">0</div><div class="sc-lbl">👥 Online Oyuncu</div></div>
@@ -1264,7 +1191,7 @@ input[type=file] { display: none; }
           <tr><td style="color:var(--t2)">MC RAM Limiti</td><td id="d-maxram">—</td></tr>
           <tr><td style="color:var(--t2)">TPS (1m/5m/15m)</td><td id="d-tps3">—</td></tr>
           <tr><td style="color:var(--t2)">Max Oyuncu</td><td id="d-maxpl">20</td></tr>
-          <tr><td style="color:var(--t2)">Bağlantı</td><td><span class="addr" id="d-addr" style="font-family:var(--mono);font-size:11px;color:var(--a3)">—</span></td></tr>
+          <tr><td style="color:var(--t2)">Bağlantı</td><td><span id="d-addr" style="font-family:var(--mono);font-size:11px;color:var(--a3)">—</span></td></tr>
         </table>
       </div>
       <div class="card">
@@ -1275,13 +1202,11 @@ input[type=file] { display: none; }
     <div class="card">
       <div class="card-hd" style="justify-content:space-between">
         <span>Son Konsol</span>
-        <a class="btn btn-sm b-ghost" data-page="console" onclick="navTo('console')">Konsola Git →</a>
+        <a class="btn btn-sm b-ghost" onclick="navTo('console')">Konsola Git →</a>
       </div>
       <div id="d-log" style="font-family:var(--mono);font-size:11px;max-height:200px;overflow-y:auto;line-height:1.7;color:#9cdcfe"></div>
     </div>
   </div>
-
-  <!-- ═ Konsol ════════════════════════════════════════════ -->
   <div class="page" id="page-console" style="height:100%;display:none;flex-direction:column;padding:14px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
       <div class="card-hd" style="margin:0">💻 Gerçek Zamanlı Konsol</div>
@@ -1299,8 +1224,6 @@ input[type=file] { display: none; }
       </div>
     </div>
   </div>
-
-  <!-- ═ Oyuncular ══════════════════════════════════════════ -->
   <div class="page" id="page-players">
     <div class="card" style="margin-bottom:14px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -1351,8 +1274,6 @@ input[type=file] { display: none; }
       </div>
     </div>
   </div>
-
-  <!-- ═ Whitelist ══════════════════════════════════════════ -->
   <div class="page" id="page-whitelist">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -1368,8 +1289,6 @@ input[type=file] { display: none; }
         <tbody id="wl-body"></tbody></table>
     </div>
   </div>
-
-  <!-- ═ Ban ════════════════════════════════════════════════ -->
   <div class="page" id="page-banlist">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -1384,11 +1303,8 @@ input[type=file] { display: none; }
         <tbody id="ban-body"></tbody></table>
     </div>
   </div>
-
-  <!-- ═ Pluginler ══════════════════════════════════════════ -->
   <div class="page" id="page-plugins">
     <div class="g2" style="height:calc(100vh - 150px)">
-      <!-- Kurulu pluginler -->
       <div class="card" style="display:flex;flex-direction:column;overflow:hidden">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-shrink:0">
           <div class="card-hd" style="margin:0">🔌 Kurulu Pluginler</div>
@@ -1413,7 +1329,6 @@ input[type=file] { display: none; }
           </div>
         </div>
       </div>
-      <!-- Plugin market -->
       <div class="card" style="display:flex;flex-direction:column;overflow:hidden">
         <div class="card-hd">🔍 Plugin Market (Hangar)</div>
         <div style="display:flex;gap:6px;margin-bottom:12px;flex-shrink:0">
@@ -1424,8 +1339,6 @@ input[type=file] { display: none; }
       </div>
     </div>
   </div>
-
-  <!-- ═ Dosya Yöneticisi ═══════════════════════════════════ -->
   <div class="page" id="page-files" style="height:100%;padding:14px">
     <div class="fm">
       <div class="fm-tree">
@@ -1453,8 +1366,6 @@ input[type=file] { display: none; }
       </div>
     </div>
   </div>
-
-  <!-- ═ Dünyalar ════════════════════════════════════════════ -->
   <div class="page" id="page-worlds">
     <div class="card" style="margin-bottom:14px">
       <div class="card-hd">🌍 Dünya Listesi</div>
@@ -1481,8 +1392,6 @@ input[type=file] { display: none; }
       </div>
     </div>
   </div>
-
-  <!-- ═ Yedekler ════════════════════════════════════════════ -->
   <div class="page" id="page-backups">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -1495,8 +1404,6 @@ input[type=file] { display: none; }
       </table>
     </div>
   </div>
-
-  <!-- ═ Ayarlar ════════════════════════════════════════════ -->
   <div class="page" id="page-settings">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
@@ -1508,8 +1415,6 @@ input[type=file] { display: none; }
       </div>
     </div>
   </div>
-
-  <!-- ═ Performans ══════════════════════════════════════════ -->
   <div class="page" id="page-perf">
     <div class="g2" style="margin-bottom:14px">
       <div class="card">
@@ -1554,12 +1459,9 @@ input[type=file] { display: none; }
       </div>
     </div>
   </div>
-
-  </div><!-- /pages -->
-</div><!-- /main -->
-</div><!-- /layout -->
-
-<!-- Modal -->
+  </div>
+</div>
+</div>
 <div class="modal-bg" id="modal">
   <div class="modal">
     <h3 id="m-title">—</h3>
@@ -1570,625 +1472,163 @@ input[type=file] { display: none; }
     </div>
   </div>
 </div>
-
 <div class="notif-wrap" id="notif-wrap"></div>
-
 <script>
-/* ═══════════════════════════════════════════════════════
-   State
-═══════════════════════════════════════════════════════ */
 const socket = io({ transports: ['websocket', 'polling'] });
-let curPage    = 'dashboard';
-let curFile    = null;
-let curDir     = '';
-let mcAddr     = '';
-let conHistory = [];
-let srvRunning = false;
+let curPage='dashboard', curFile=null, curDir='', mcAddr='', srvRunning=false;
 
-/* ═══════════════════════════════════════════════════════
-   Socket.IO
-═══════════════════════════════════════════════════════ */
-socket.on('connect',        ()    => notify('Panele bağlandı', 'ok'));
-socket.on('disconnect',     ()    => notify('Bağlantı kesildi', 'err'));
-socket.on('console_line',   data  => addLine(data));
-socket.on('console_history',lines => { document.getElementById('con-out').innerHTML=''; lines.forEach(l=>addLine(l,false)); conBottom(); });
-socket.on('server_status',  data  => updateStatus(data));
-socket.on('players_update', list  => updatePlayers(list));
-socket.on('stats_update',   data  => updateStats(data));
-socket.on('tunnel_update',  data  => setTunnel(data));
-socket.on('download_progress', d  => notify(`⬇ İndiriliyor: %${d.pct}`, 'info'));
+socket.on('connect',        ()   => notify('Panele bağlandı', 'ok'));
+socket.on('disconnect',     ()   => notify('Bağlantı kesildi', 'err'));
+socket.on('console_line',   data => addLine(data));
+socket.on('console_history',lines=> { document.getElementById('con-out').innerHTML=''; lines.forEach(l=>addLine(l,false)); conBottom(); });
+socket.on('server_status',  data => updateStatus(data));
+socket.on('players_update', list => updatePlayers(list));
+socket.on('stats_update',   data => updateStats(data));
+socket.on('tunnel_update',  data => setTunnel(data));
+socket.on('download_progress', d => notify(`⬇ İndiriliyor: %${d.pct}`, 'info'));
 
-/* ═══════════════════════════════════════════════════════
-   Navigation
-═══════════════════════════════════════════════════════ */
 document.querySelectorAll('.nav-item').forEach(el => {
-  el.addEventListener('click', () => {
-    const page = el.dataset.page;
-    if (page) navTo(page, el);
-  });
+  el.addEventListener('click', () => { const p=el.dataset.page; if(p) navTo(p,el); });
 });
-
 function navTo(page, el) {
-  document.querySelectorAll('.page').forEach(p => { p.classList.remove('active'); p.style.display=''; });
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  const pg = document.getElementById('page-' + page);
-  if (!pg) return;
+  document.querySelectorAll('.page').forEach(p=>{p.classList.remove('active');p.style.display='';});
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  const pg=document.getElementById('page-'+page); if(!pg) return;
   pg.classList.add('active');
-  if (page === 'console') pg.style.display = 'flex';
-  const nav = el || document.querySelector(`.nav-item[data-page="${page}"]`);
-  if (nav) nav.classList.add('active');
-  const titles = {
-    dashboard:'📊 Dashboard', console:'💻 Konsol', players:'👥 Oyuncular',
-    whitelist:'📋 Beyaz Liste', banlist:'🔨 Ban Listesi', plugins:'🔌 Pluginler',
-    files:'📁 Dosya Yöneticisi', worlds:'🌍 Dünyalar', backups:'💾 Yedekler',
-    settings:'⚙️ Ayarlar', perf:'📈 Performans'
-  };
-  document.getElementById('page-title').textContent = titles[page] || page;
-  curPage = page;
-  const loaders = {
-    players:  refreshPlayers,
-    whitelist:loadWhitelist,
-    banlist:  loadBanlist,
-    plugins:  loadPlugins,
-    files:    () => fmLoad(curDir),
-    worlds:   loadWorlds,
-    backups:  loadBackups,
-    settings: loadSettings,
-    perf:     loadPerf,
-  };
-  if (loaders[page]) loaders[page]();
+  if(page==='console') pg.style.display='flex';
+  const nav=el||document.querySelector(`.nav-item[data-page="${page}"]`);
+  if(nav) nav.classList.add('active');
+  const titles={dashboard:'📊 Dashboard',console:'💻 Konsol',players:'👥 Oyuncular',
+    whitelist:'📋 Beyaz Liste',banlist:'🔨 Ban Listesi',plugins:'🔌 Pluginler',
+    files:'📁 Dosya Yöneticisi',worlds:'🌍 Dünyalar',backups:'💾 Yedekler',
+    settings:'⚙️ Ayarlar',perf:'📈 Performans'};
+  document.getElementById('page-title').textContent=titles[page]||page;
+  curPage=page;
+  const loaders={players:refreshPlayers,whitelist:loadWhitelist,banlist:loadBanlist,
+    plugins:loadPlugins,files:()=>fmLoad(curDir),worlds:loadWorlds,backups:loadBackups,
+    settings:loadSettings,perf:loadPerf};
+  if(loaders[page]) loaders[page]();
 }
-
-/* ═══════════════════════════════════════════════════════
-   Console
-═══════════════════════════════════════════════════════ */
-function addLine(data, scroll=true) {
-  const el  = document.getElementById('con-out');
-  const div = document.createElement('div');
-  const l   = data.line || '';
-  let cls   = 'cl-def';
-  if (l.includes('[Panel]'))           cls = 'cl-panel';
-  else if (/error|exception/i.test(l)) cls = 'cl-err';
-  else if (/warn/i.test(l))           cls = 'cl-warn';
-  else if (l.includes('INFO'))         cls = 'cl-info';
-  div.className   = cls;
-  div.textContent = `[${data.ts}] ${l}`;
+function addLine(data,scroll=true) {
+  const el=document.getElementById('con-out');
+  const div=document.createElement('div');
+  const l=data.line||'';
+  let cls='cl-def';
+  if(l.includes('[Panel]')) cls='cl-panel';
+  else if(/error|exception/i.test(l)) cls='cl-err';
+  else if(/warn/i.test(l)) cls='cl-warn';
+  else if(l.includes('INFO')) cls='cl-info';
+  div.className=cls; div.textContent=`[${data.ts}] ${l}`;
   el.appendChild(div);
-  if (scroll) el.scrollTop = el.scrollHeight;
-
-  // Dashboard mini log
-  const dl = document.getElementById('d-log');
-  if (dl) {
-    const s = document.createElement('div');
-    s.textContent = div.textContent;
-    s.className   = cls;
-    dl.appendChild(s);
-    while (dl.children.length > 25) dl.removeChild(dl.firstChild);
-    dl.scrollTop = dl.scrollHeight;
-  }
+  if(scroll) el.scrollTop=el.scrollHeight;
+  const dl=document.getElementById('d-log');
+  if(dl){const s=document.createElement('div');s.textContent=div.textContent;s.className=cls;
+    dl.appendChild(s);while(dl.children.length>25)dl.removeChild(dl.firstChild);dl.scrollTop=dl.scrollHeight;}
 }
-function conClear()  { document.getElementById('con-out').innerHTML = ''; }
-function conBottom() { const e = document.getElementById('con-out'); e.scrollTop = e.scrollHeight; }
-function conSearch() { const q = prompt('Ara:'); if (!q) return; document.querySelectorAll('#con-out div').forEach(d => { d.style.background = d.textContent.toLowerCase().includes(q.toLowerCase()) ? 'rgba(0,229,255,.15)' : ''; }); }
-function conSend() {
-  const inp = document.getElementById('con-inp');
-  const cmd = inp.value.trim();
-  if (!cmd) return;
-  socket.emit('send_command', { cmd });
-  inp.value = '';
-}
-document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('con-inp').addEventListener('keydown', e => { if (e.key === 'Enter') conSend(); });
-});
+function conClear(){document.getElementById('con-out').innerHTML='';}
+function conBottom(){const e=document.getElementById('con-out');e.scrollTop=e.scrollHeight;}
+function conSearch(){const q=prompt('Ara:');if(!q)return;document.querySelectorAll('#con-out div').forEach(d=>{d.style.background=d.textContent.toLowerCase().includes(q.toLowerCase())?'rgba(0,229,255,.15)':''});}
+function conSend(){const inp=document.getElementById('con-inp');const c=inp.value.trim();if(!c)return;socket.emit('send_command',{cmd:c});inp.value='';}
+document.addEventListener('DOMContentLoaded',()=>{document.getElementById('con-inp').addEventListener('keydown',e=>{if(e.key==='Enter')conSend();});});
 
-/* ═══════════════════════════════════════════════════════
-   Server Status
-═══════════════════════════════════════════════════════ */
 function updateStatus(data) {
-  srvRunning = data.status === 'running';
-  const map = {
-    stopped:     ['dot-red',    'Durduruldu',    'br'],
-    starting:    ['dot-yellow', 'Başlıyor...',   'by'],
-    downloading: ['dot-yellow', 'İndiriliyor..', 'by'],
-    running:     ['dot-green',  'Çalışıyor',     'bg'],
-    stopping:    ['dot-yellow', 'Duruyor...',    'by'],
-  };
-  const [dc, label, bc] = map[data.status] || map.stopped;
-  const dot  = document.getElementById('status-dot');
-  const txt  = document.getElementById('status-text');
-  const badge= document.getElementById('d-status');
-  dot.className = 'dot ' + dc;
-  txt.textContent = label;
-  if (badge) { badge.className = 'badge ' + bc; badge.textContent = label; }
-
-  const verEl = document.getElementById('sb-ver');
-  if (verEl && data.version && data.version !== '—')
-    verEl.textContent = 'Paper MC • ' + data.version;
-
-  const dvEl = document.getElementById('d-ver');
-  if (dvEl) dvEl.textContent = data.version || '—';
+  srvRunning=data.status==='running';
+  const map={stopped:['dot-red','Durduruldu','br'],starting:['dot-yellow','Başlıyor...','by'],
+    downloading:['dot-yellow','İndiriliyor..','by'],running:['dot-green','Çalışıyor','bg'],stopping:['dot-yellow','Duruyor...','by']};
+  const [dc,label,bc]=map[data.status]||map.stopped;
+  document.getElementById('status-dot').className='dot '+dc;
+  document.getElementById('status-text').textContent=label;
+  const badge=document.getElementById('d-status');
+  if(badge){badge.className='badge '+bc;badge.textContent=label;}
+  const verEl=document.getElementById('sb-ver');
+  if(verEl&&data.version&&data.version!=='—') verEl.textContent='Paper MC • '+data.version;
+  const dvEl=document.getElementById('d-ver');
+  if(dvEl) dvEl.textContent=data.version||'—';
 }
-
 function updateStats(data) {
-  if (data.ram_mb !== undefined) {
-    document.getElementById('d-ram').textContent  = data.ram_mb;
-    document.getElementById('tb-ram').textContent = data.ram_mb + ' MB';
-  }
-  if (data.tps !== undefined) {
-    document.getElementById('d-tps').textContent  = data.tps;
-    document.getElementById('tb-tps').textContent = data.tps;
-    document.getElementById('d-tps3').textContent = `${data.tps} / ${data.tps5||'—'} / ${data.tps15||'—'}`;
-  }
-  if (data.uptime !== undefined) {
-    document.getElementById('d-up').textContent = fmtUp(data.uptime);
-  }
-  if (data.online_players !== undefined) {
-    document.getElementById('d-pl').textContent  = data.online_players;
-    document.getElementById('tb-pl').textContent = data.online_players;
-  }
+  if(data.ram_mb!==undefined){document.getElementById('d-ram').textContent=data.ram_mb;document.getElementById('tb-ram').textContent=data.ram_mb+' MB';}
+  if(data.tps!==undefined){document.getElementById('d-tps').textContent=data.tps;document.getElementById('tb-tps').textContent=data.tps;document.getElementById('d-tps3').textContent=`${data.tps} / ${data.tps5||'—'} / ${data.tps15||'—'}`;}
+  if(data.uptime!==undefined) document.getElementById('d-up').textContent=fmtUp(data.uptime);
+  if(data.online_players!==undefined){document.getElementById('d-pl').textContent=data.online_players;document.getElementById('tb-pl').textContent=data.online_players;}
 }
-
-/* ═══════════════════════════════════════════════════════
-   Server Actions
-═══════════════════════════════════════════════════════ */
-async function srvAction(action) {
-  const r = await api('/api/' + action, {});
-  notify(r.msg || action + ' yapıldı', r.ok ? 'ok' : 'err');
+async function srvAction(action){const r=await api('/api/'+action,{});notify(r.msg||action+' yapıldı',r.ok?'ok':'err');}
+function setTunnel(data){
+  if(!data.host&&!data.url)return;
+  mcAddr=data.host||data.url.replace('https://','');
+  const bar=document.getElementById('mc-addr-bar');
+  const txt=document.getElementById('mc-addr-text');
+  const daddr=document.getElementById('d-addr');
+  if(bar) bar.classList.remove('hidden');
+  if(txt) txt.textContent=mcAddr;
+  if(daddr) daddr.textContent=mcAddr;
+  notify('📌 MC Adres: '+mcAddr,'ok');
 }
-
-/* ═══════════════════════════════════════════════════════
-   Tunnel
-═══════════════════════════════════════════════════════ */
-function setTunnel(data) {
-  if (!data.host && !data.url) return;
-  mcAddr = data.host || data.url.replace('https://','');
-  const bar  = document.getElementById('mc-addr-bar');
-  const txt  = document.getElementById('mc-addr-text');
-  const daddr= document.getElementById('d-addr');
-  if (bar)   bar.classList.remove('hidden');
-  if (txt)   txt.textContent = mcAddr;
-  if (daddr) daddr.textContent = mcAddr;
-  notify('📌 MC Adres: ' + mcAddr, 'ok');
+function copyAddr(){if(mcAddr){navigator.clipboard.writeText(mcAddr);notify('Adres kopyalandı!','ok');}}
+function updatePlayers(list){
+  document.getElementById('d-pl').textContent=list.length;
+  document.getElementById('tb-pl').textContent=list.length;
+  const plEl=document.getElementById('d-pllist');
+  if(plEl) plEl.innerHTML=list.length?list.map(p=>`<div style="padding:3px 0">🟢 ${p.name}</div>`).join(''):'<span style="color:var(--t2)">Çevrimiçi oyuncu yok</span>';
+  const tbody=document.getElementById('pl-body');
+  if(!tbody)return;
+  if(!list.length){tbody.innerHTML='<tr><td colspan="3" style="color:var(--t2);text-align:center;padding:14px">Çevrimiçi oyuncu yok</td></tr>';return;}
+  tbody.innerHTML=list.map(p=>`<tr><td><strong>${p.name}</strong></td><td><span class="badge bg">Online</span></td>
+    <td style="display:flex;gap:4px;flex-wrap:wrap">
+      <button class="btn btn-sm b-dang" onclick="quickAct('kick','${p.name}')">Kick</button>
+      <button class="btn btn-sm b-dang" onclick="quickAct('ban','${p.name}')">Ban</button>
+      <button class="btn btn-sm b-succ" onclick="quickAct('op','${p.name}')">OP</button>
+      <button class="btn btn-sm b-ghost" onclick="setGM('creative','${p.name}')">Creative</button>
+      <button class="btn btn-sm b-ghost" onclick="quickAct('heal','${p.name}')">Heal</button>
+    </td></tr>`).join('');
 }
-function copyAddr() {
-  if (mcAddr) { navigator.clipboard.writeText(mcAddr); notify('Adres kopyalandı!', 'ok'); }
-}
-
-/* ═══════════════════════════════════════════════════════
-   Players
-═══════════════════════════════════════════════════════ */
-function updatePlayers(list) {
-  document.getElementById('d-pl').textContent  = list.length;
-  document.getElementById('tb-pl').textContent = list.length;
-  const plEl = document.getElementById('d-pllist');
-  if (plEl) plEl.innerHTML = list.length
-    ? list.map(p=>`<div style="padding:3px 0">🟢 ${p.name}</div>`).join('')
-    : '<span style="color:var(--t2)">Çevrimiçi oyuncu yok</span>';
-
-  const tbody = document.getElementById('pl-body');
-  if (!tbody) return;
-  if (!list.length) { tbody.innerHTML = '<tr><td colspan="3" style="color:var(--t2);text-align:center;padding:14px">Çevrimiçi oyuncu yok</td></tr>'; return; }
-  tbody.innerHTML = list.map(p => `
-    <tr>
-      <td><strong>${p.name}</strong></td>
-      <td><span class="badge bg">Online</span></td>
-      <td style="display:flex;gap:4px;flex-wrap:wrap">
-        <button class="btn btn-sm b-dang" onclick="quickAct('kick','${p.name}')">Kick</button>
-        <button class="btn btn-sm b-dang" onclick="quickAct('ban','${p.name}')">Ban</button>
-        <button class="btn btn-sm b-succ" onclick="quickAct('op','${p.name}')">OP</button>
-        <button class="btn btn-sm b-ghost" onclick="setGM('creative','${p.name}')">Creative</button>
-        <button class="btn btn-sm b-ghost" onclick="quickAct('heal','${p.name}')">Heal</button>
-      </td>
-    </tr>`).join('');
-}
-async function refreshPlayers() {
-  const d = await api('/api/players');
-  updatePlayers(d.players || []);
-}
-async function quickAct(action, player) {
-  await api('/api/players/' + action, { player });
-  notify(`${player} → ${action}`, 'ok');
-}
-function plAct(action) {
-  const p = document.getElementById('pl-name').value.trim();
-  if (!p) return notify('Oyuncu adı girin', 'err');
-  quickAct(action, p);
-}
-function setGM(mode, player) {
-  const p = player || document.getElementById('pl-name').value.trim();
-  if (!p) return notify('Oyuncu adı girin', 'err');
-  api('/api/players/gamemode', { player: p, mode });
-  notify(`${p} → ${mode}`, 'ok');
-}
-function sendMsg() {
-  const p = document.getElementById('msg-pl').value.trim();
-  const m = document.getElementById('msg-txt').value.trim();
-  if (!p || !m) return notify('Oyuncu ve mesaj gerekli', 'err');
-  api('/api/players/msg', { player: p, message: m });
-  notify('Mesaj gönderildi', 'ok');
-}
-function giveItem() {
-  const player = document.getElementById('pl-name').value.trim() || '@a';
-  const item   = document.getElementById('give-item').value.trim();
-  const count  = document.getElementById('give-count').value || 1;
-  if (!item) return notify('Item adı girin', 'err');
-  api('/api/players/give', { player, item, count });
-  notify(`Give: ${count}x ${item} → ${player}`, 'ok');
-}
-function broadcast() {
-  const msg = prompt('Duyuru mesajı:');
-  if (msg) { cmd('say ' + msg); notify('Duyuru gönderildi', 'ok'); }
-}
-
-/* ═══════════════════════════════════════════════════════
-   Whitelist
-═══════════════════════════════════════════════════════ */
-async function loadWhitelist() {
-  const d = await fetch('/api/whitelist').then(r=>r.json());
-  const tb = document.getElementById('wl-body');
-  tb.innerHTML = d.length
-    ? d.map(p=>`<tr><td>${p.name||p}</td><td style="font-family:var(--mono);font-size:10px;color:var(--t2)">${p.uuid||'—'}</td>
-        <td><button class="btn btn-sm b-dang" onclick="wlRemove('${p.name||p}')">Kaldır</button></td></tr>`).join('')
-    : '<tr><td colspan="3" style="color:var(--t2);text-align:center;padding:12px">Beyaz liste boş</td></tr>';
-}
-async function wlAdd() {
-  const p = document.getElementById('wl-name').value.trim();
-  if (!p) return;
-  await api('/api/whitelist/add', { player: p });
-  notify(p + ' eklendi', 'ok');
-  loadWhitelist();
-}
-async function wlRemove(p) {
-  await api('/api/whitelist/remove', { player: p });
-  notify(p + ' kaldırıldı', 'ok');
-  loadWhitelist();
-}
-
-/* ═══════════════════════════════════════════════════════
-   Ban
-═══════════════════════════════════════════════════════ */
-async function loadBanlist() {
-  const d = await fetch('/api/banlist').then(r=>r.json());
-  const tb = document.getElementById('ban-body');
-  tb.innerHTML = d.length
-    ? d.map(p=>`<tr>
-        <td>${p.name}</td>
-        <td style="color:var(--t2);font-size:11px">${p.reason||'—'}</td>
-        <td style="font-size:10px;color:var(--t3)">${(p.created||'').slice(0,10)}</td>
-        <td><button class="btn btn-sm b-succ" onclick="pardon('${p.name}')">Affet</button></td>
-      </tr>`).join('')
-    : '<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Ban listesi boş</td></tr>';
-}
-async function banPlayer() {
-  const p = document.getElementById('ban-name').value.trim();
-  const r = document.getElementById('ban-reason').value.trim() || 'Banned by admin';
-  if (!p) return;
-  await api('/api/players/ban', { player: p, reason: r });
-  notify(p + ' banlandı', 'ok');
-  loadBanlist();
-}
-async function pardon(p) {
-  await api('/api/players/pardon', { player: p });
-  notify(p + ' affedildi', 'ok');
-  loadBanlist();
-}
-
-/* ═══════════════════════════════════════════════════════
-   Plugins
-═══════════════════════════════════════════════════════ */
-async function loadPlugins() {
-  const d  = await fetch('/api/plugins').then(r=>r.json());
-  const tb = document.getElementById('plug-body');
-  tb.innerHTML = d.length
-    ? d.map(p=>`<tr>
-        <td><strong>${p.name}</strong></td>
-        <td style="font-size:10px;color:var(--t2)">${fmtSize(p.size)}</td>
-        <td><span class="badge ${p.enabled?'bg':'br'}">${p.enabled?'Aktif':'Devre Dışı'}</span></td>
-        <td style="display:flex;gap:4px">
-          <button class="btn btn-sm b-warn" onclick="togglePlugin('${p.file}')">${p.enabled?'Kapat':'Aç'}</button>
-          <button class="btn btn-sm b-dang" onclick="deletePlugin('${p.file}')">🗑</button>
-        </td>
-      </tr>`).join('')
-    : '<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Plugin yok. .jar yükleyin.</td></tr>';
-}
-async function uploadPlugin(input) {
-  const fd = new FormData();
-  for (const f of input.files) fd.append(f.name, f);
-  const r = await fetch('/api/plugins/upload', { method:'POST', body: fd });
-  const d = await r.json();
-  notify(d.msg || 'Yüklendi', 'ok');
-  loadPlugins();
-}
-function dropPlugin(e) {
-  e.preventDefault();
-  document.getElementById('plug-zone').classList.remove('drag');
-  const fd = new FormData();
-  for (const f of e.dataTransfer.files) if (f.name.endsWith('.jar')) fd.append(f.name, f);
-  fetch('/api/plugins/upload', { method:'POST', body: fd })
-    .then(r=>r.json()).then(d=>{ notify(d.msg||'Yüklendi','ok'); loadPlugins(); });
-}
-async function deletePlugin(file) {
-  if (!confirm(file + ' silinsin mi?')) return;
-  await api('/api/plugins/delete', { file });
-  notify('Plugin silindi', 'ok');
-  loadPlugins();
-}
-async function togglePlugin(file) {
-  await api('/api/plugins/toggle', { file });
-  loadPlugins();
-}
-async function searchPlugins() {
-  const q = document.getElementById('plug-q').value.trim();
-  if (!q) return;
-  const res = document.getElementById('plug-results');
-  res.innerHTML = '<div style="color:var(--t2);padding:10px">Aranıyor...</div>';
-  const d = await fetch('/api/plugins/search?q=' + encodeURIComponent(q)).then(r=>r.json());
-  if (!d.length || d.error) { res.innerHTML = '<div style="color:var(--t2);padding:10px">Sonuç bulunamadı</div>'; return; }
-  res.innerHTML = d.map(p=>`
-    <div style="display:flex;justify-content:space-between;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05)">
-      <div>
-        <div style="font-size:13px;font-weight:600">${p.name}</div>
-        <div style="font-size:11px;color:var(--t2);margin-top:2px;max-width:320px">${p.description}</div>
-        <div style="font-size:10px;color:var(--t3);margin-top:2px">👤 ${p.owner} · ⬇ ${(p.downloads||0).toLocaleString()}</div>
-      </div>
-      <a class="btn btn-sm b-prim" href="${p.url}" target="_blank">🔗 Aç</a>
-    </div>`).join('');
-}
-
-/* ═══════════════════════════════════════════════════════
-   File Manager
-═══════════════════════════════════════════════════════ */
-async function fmLoad(path='') {
-  curDir = path;
-  document.getElementById('fm-bread').textContent = '/' + path;
-  const items = await fetch('/api/files?path=' + encodeURIComponent(path)).then(r=>r.json());
-  const el    = document.getElementById('fm-list');
-  el.innerHTML = items.map(f=>`
-    <div class="fm-item" onclick="fmClick('${f.path}','${f.type}','${escQ(f.name)}')">
-      <span class="fm-ico">${f.type==='dir'?'📁':fmIco(f.ext)}</span>
-      <span class="fm-name">${f.name}</span>
-      <span class="fm-size">${f.type==='dir'?'':fmtSize(f.size)}</span>
-    </div>`).join('') || '<div style="padding:12px;color:var(--t2);font-size:12px">Klasör boş</div>';
-}
-function escQ(s) { return s.replace(/'/g, "\\'"); }
-function fmIco(ext) {
-  const m = {'.properties':'⚙️','.json':'📋','.yml':'📋','.yaml':'📋',
-    '.jar':'☕','.txt':'📄','.log':'📜','.sh':'🖥️','.zip':'📦',
-    '.png':'🖼️','.jpg':'🖼️','.dat':'🗃️','.conf':'⚙️','.toml':'⚙️'};
-  return m[ext] || '📄';
-}
-function fmUp() {
-  const parts = curDir.split('/').filter(Boolean);
-  parts.pop();
-  fmLoad(parts.join('/'));
-}
-function fmRefresh() { fmLoad(curDir); }
-
-async function fmClick(path, type, name) {
-  document.querySelectorAll('.fm-item').forEach(i=>i.classList.remove('sel'));
-  event.currentTarget.classList.add('sel');
-  curFile = path;
-  if (type === 'dir') { fmLoad(path); return; }
-  document.getElementById('fm-fname').textContent = name;
-  const textExts = ['.properties','.json','.yml','.yaml','.txt','.log','.sh','.conf','.toml','.cfg','.xml','.md','.java','.py','.js'];
-  const ext = '.' + name.split('.').pop().toLowerCase();
-  if (textExts.includes(ext)) {
-    const d = await fetch('/api/files/read?path=' + encodeURIComponent(path)).then(r=>r.json());
-    document.getElementById('fm-area').value = d.content || '';
-    document.getElementById('fm-save').disabled = false;
-  } else {
-    document.getElementById('fm-area').value = '(Bu dosya türü metin editöründe açılamaz — sadece indirebilirsiniz)';
-    document.getElementById('fm-save').disabled = true;
-  }
-}
-async function fmSave() {
-  if (!curFile) return;
-  const content = document.getElementById('fm-area').value;
-  await api('/api/files/write', { path: curFile, content });
-  notify('Kaydedildi', 'ok');
-  document.getElementById('fm-save').disabled = true;
-}
-function fmDownload() {
-  if (curFile) window.open('/api/files/download?path=' + encodeURIComponent(curFile));
-}
-async function fmDelete() {
-  if (!curFile || !confirm(curFile + ' silinsin mi?')) return;
-  await api('/api/files/delete', { path: curFile });
-  notify('Silindi', 'ok');
-  fmLoad(curDir);
-  curFile = null;
-  document.getElementById('fm-area').value = '';
-  document.getElementById('fm-fname').textContent = 'Dosya seçin...';
-}
-async function fmUpload(input) {
-  const fd = new FormData();
-  fd.append('path', curDir);
-  for (const f of input.files) fd.append(f.name, f);
-  await fetch('/api/files/upload', { method:'POST', body: fd });
-  notify('Yüklendi', 'ok');
-  fmLoad(curDir);
-}
-function fmNewModal() {
-  showModal('Yeni Dosya / Klasör',
-    '<input class="m-inp" id="nf-n" placeholder="isim.txt veya klasör-adı">',
-    async () => {
-      const n = document.getElementById('nf-n').value.trim();
-      if (!n) return;
-      if (n.includes('.'))
-        await api('/api/files/write', { path: curDir + '/' + n, content: '' });
-      else
-        await api('/api/files/mkdir', { path: curDir + '/' + n });
-      fmLoad(curDir); closeModal();
-    });
-}
-
-/* ═══════════════════════════════════════════════════════
-   Worlds
-═══════════════════════════════════════════════════════ */
-async function loadWorlds() {
-  const d  = await fetch('/api/worlds').then(r=>r.json());
-  const el = document.getElementById('worlds-list');
-  el.innerHTML = d.length
-    ? d.map(w=>`
-      <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid rgba(255,255,255,.05)">
-        <div>
-          <div style="font-weight:600">🌍 ${w.name}</div>
-          <div style="font-size:11px;color:var(--t2);margin-top:2px">Boyut: ${fmtSize(w.size)}</div>
-        </div>
-        <div style="display:flex;gap:8px">
-          <button class="btn btn-sm b-prim" onclick="backupWorld('${w.name}')">💾 Yedekle</button>
-          <button class="btn btn-sm b-dang" onclick="deleteWorld('${w.name}')">🗑 Sil</button>
-        </div>
-      </div>`).join('')
-    : '<div style="color:var(--t2)">Dünya bulunamadı (server çalışıyor mu?)</div>';
-}
-async function backupWorld(name) {
-  notify('Yedekleniyor...', 'info');
-  const d = await api('/api/worlds/backup', { world: name });
-  notify(d.ok ? `Yedeklendi: ${d.file} (${fmtSize(d.size)})` : 'Hata', d.ok ? 'ok' : 'err');
-  loadBackups();
-}
-async function deleteWorld(name) {
-  if (!confirm(name + ' dünyası kalıcı olarak silinsin mi?')) return;
-  const d = await api('/api/worlds/delete', { world: name });
-  notify(d.ok ? 'Dünya silindi' : d.error, d.ok ? 'ok' : 'err');
-  loadWorlds();
-}
-
-/* ═══════════════════════════════════════════════════════
-   Backups
-═══════════════════════════════════════════════════════ */
-async function loadBackups() {
-  const d  = await fetch('/api/backups').then(r=>r.json());
-  const tb = document.getElementById('backup-body');
-  tb.innerHTML = d.length
-    ? d.map(b=>`
-      <tr>
-        <td>${b.name}</td>
-        <td style="font-size:11px;color:var(--t2)">${fmtSize(b.size)}</td>
-        <td style="font-size:11px;color:var(--t3)">${new Date(b.created*1000).toLocaleString('tr')}</td>
-        <td><a class="btn btn-sm b-prim" href="/api/files/download?path=${encodeURIComponent(b.path)}">⬇ İndir</a></td>
-      </tr>`).join('')
-    : '<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Yedek yok</td></tr>';
-}
-
-/* ═══════════════════════════════════════════════════════
-   Settings
-═══════════════════════════════════════════════════════ */
-const SET_LABELS = {
-  'server-port':'Sunucu Portu','max-players':'Max Oyuncu','online-mode':'Online Mode',
-  'gamemode':'Oyun Modu','difficulty':'Zorluk','motd':'Sunucu Adı (MOTD)',
-  'view-distance':'Görüş Mesafesi','simulation-distance':'Simülasyon Mesafesi',
-  'spawn-protection':'Spawn Koruması','allow-flight':'Uçuşa İzin',
-  'white-list':'Beyaz Liste','enable-command-block':'Komut Bloğu',
-  'pvp':'PvP','allow-nether':'Nether Boyutu','level-name':'Dünya Adı',
-  'level-seed':'Dünya Seed','max-tick-time':'Max Tick Süresi (ms)',
-  'sync-chunk-writes':'Chunk Sync Yazma','generate-structures':'Yapı Oluştur',
-};
-async function loadSettings() {
-  const d  = await fetch('/api/settings').then(r=>r.json());
-  const el = document.getElementById('settings-grid');
-  el.innerHTML = Object.entries(d).map(([k,v])=>`
-    <div class="set-item">
-      <div class="set-lbl">${SET_LABELS[k]||k}</div>
-      ${v==='true'||v==='false'
-        ? `<select class="set-inp" id="s-${k}"><option value="true" ${v==='true'?'selected':''}>true</option><option value="false" ${v==='false'?'selected':''}>false</option></select>`
-        : `<input class="set-inp" id="s-${k}" value="${v.replace(/</g,'&lt;')}">`}
-    </div>`).join('');
-}
-async function saveSettings() {
-  const d = await fetch('/api/settings').then(r=>r.json());
-  const updated = {};
-  for (const k of Object.keys(d)) {
-    const el = document.getElementById('s-' + k);
-    if (el) updated[k] = el.value;
-  }
-  const r = await api('/api/settings', updated);
-  notify(r.msg || 'Kaydedildi', 'ok');
-  setTimeout(() => srvAction('restart'), 1500);
-}
-
-/* ═══════════════════════════════════════════════════════
-   Performance
-═══════════════════════════════════════════════════════ */
-async function loadPerf() {
-  const d = await fetch('/api/performance').then(r=>r.json());
-  if (d.cpu !== undefined) {
-    document.getElementById('p-cpu').textContent  = d.cpu + '%';
-    document.getElementById('pb-cpu').style.width = d.cpu + '%';
-  }
-  if (d.ram_pct !== undefined) {
-    document.getElementById('p-ram').textContent  = `${d.ram_used_mb}MB / ${d.ram_total_mb}MB`;
-    document.getElementById('pb-ram').style.width = d.ram_pct + '%';
-  }
-  if (d.disk_pct !== undefined) {
-    document.getElementById('p-disk').textContent  = `${d.disk_used_gb}GB / ${d.disk_total_gb}GB`;
-    document.getElementById('pb-disk').style.width = d.disk_pct + '%';
-  }
-  if (d.mc && d.mc.ram) {
-    document.getElementById('p-mcram').textContent = d.mc.ram + ' MB';
-    document.getElementById('p-mccpu').textContent = d.mc.cpu + '%';
-    document.getElementById('p-mcthr').textContent = d.mc.threads;
-  }
-  document.getElementById('p-tps1').textContent  = d.tps  || '—';
-  document.getElementById('p-tps5').textContent  = d.tps5 || '—';
-  document.getElementById('p-tps15').textContent = d.tps15|| '—';
-  document.getElementById('p-pls').textContent   = document.getElementById('tb-pl').textContent;
-}
-setInterval(() => { if (curPage === 'perf') loadPerf(); }, 5000);
-
-/* ═══════════════════════════════════════════════════════
-   Utilities
-═══════════════════════════════════════════════════════ */
-function cmd(c) { socket.emit('send_command', { cmd: c }); notify('→ ' + c, 'info'); }
-async function api(url, body={}) {
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return r.json();
-}
-function fmtSize(b) {
-  if (b > 1e9) return (b/1e9).toFixed(2)+'GB';
-  if (b > 1e6) return (b/1e6).toFixed(1)+'MB';
-  if (b > 1e3) return (b/1e3).toFixed(0)+'KB';
-  return b + 'B';
-}
-function fmtUp(s) {
-  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
-  return `${h}s ${m}d ${sec}sn`;
-}
-function notify(msg, type='ok') {
-  const wrap = document.getElementById('notif-wrap');
-  const div  = document.createElement('div');
-  div.className   = 'notif n-' + type;
-  div.textContent = msg;
-  wrap.appendChild(div);
-  setTimeout(() => div.remove(), 3500);
-}
-function showModal(title, body, onok) {
-  document.getElementById('m-title').textContent = title;
-  document.getElementById('m-body').innerHTML    = body;
-  document.getElementById('m-ok').onclick        = onok;
-  document.getElementById('modal').classList.add('open');
-  setTimeout(() => { const inp = document.querySelector('#m-body input'); if (inp) inp.focus(); }, 50);
-}
-function closeModal() { document.getElementById('modal').classList.remove('open'); }
-document.getElementById('modal').addEventListener('click', e => {
-  if (e.target === document.getElementById('modal')) closeModal();
-});
-
-/* Init */
-async function init() {
-  const d = await fetch('/api/status').then(r=>r.json()).catch(()=>({}));
-  updateStatus(d);
-  updateStats(d);
-  if (d.players) updatePlayers(d.players);
-  if (d.tunnel && d.tunnel.host) setTunnel(d.tunnel);
-  const mr = document.getElementById('d-maxram');
-  if (mr) mr.textContent = (d.max_ram || '') || '';
-}
+async function refreshPlayers(){const d=await api('/api/players');updatePlayers(d.players||[]);}
+async function quickAct(action,player){await api('/api/players/'+action,{player});notify(`${player} → ${action}`,'ok');}
+function plAct(action){const p=document.getElementById('pl-name').value.trim();if(!p)return notify('Oyuncu adı girin','err');quickAct(action,p);}
+function setGM(mode,player){const p=player||document.getElementById('pl-name').value.trim();if(!p)return notify('Oyuncu adı girin','err');api('/api/players/gamemode',{player:p,mode});notify(`${p} → ${mode}`,'ok');}
+function sendMsg(){const p=document.getElementById('msg-pl').value.trim();const m=document.getElementById('msg-txt').value.trim();if(!p||!m)return notify('Oyuncu ve mesaj gerekli','err');api('/api/players/msg',{player:p,message:m});notify('Mesaj gönderildi','ok');}
+function giveItem(){const player=document.getElementById('pl-name').value.trim()||'@a';const item=document.getElementById('give-item').value.trim();const count=document.getElementById('give-count').value||1;if(!item)return notify('Item adı girin','err');api('/api/players/give',{player,item,count});notify(`Give: ${count}x ${item} → ${player}`,'ok');}
+function broadcast(){const msg=prompt('Duyuru mesajı:');if(msg){cmd('say '+msg);notify('Duyuru gönderildi','ok');}}
+async function loadWhitelist(){const d=await fetch('/api/whitelist').then(r=>r.json());const tb=document.getElementById('wl-body');tb.innerHTML=d.length?d.map(p=>`<tr><td>${p.name||p}</td><td style="font-family:var(--mono);font-size:10px;color:var(--t2)">${p.uuid||'—'}</td><td><button class="btn btn-sm b-dang" onclick="wlRemove('${p.name||p}')">Kaldır</button></td></tr>`).join(''):'<tr><td colspan="3" style="color:var(--t2);text-align:center;padding:12px">Beyaz liste boş</td></tr>';}
+async function wlAdd(){const p=document.getElementById('wl-name').value.trim();if(!p)return;await api('/api/whitelist/add',{player:p});notify(p+' eklendi','ok');loadWhitelist();}
+async function wlRemove(p){await api('/api/whitelist/remove',{player:p});notify(p+' kaldırıldı','ok');loadWhitelist();}
+async function loadBanlist(){const d=await fetch('/api/banlist').then(r=>r.json());const tb=document.getElementById('ban-body');tb.innerHTML=d.length?d.map(p=>`<tr><td>${p.name}</td><td style="color:var(--t2);font-size:11px">${p.reason||'—'}</td><td style="font-size:10px;color:var(--t3)">${(p.created||'').slice(0,10)}</td><td><button class="btn btn-sm b-succ" onclick="pardon('${p.name}')">Affet</button></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Ban listesi boş</td></tr>';}
+async function banPlayer(){const p=document.getElementById('ban-name').value.trim();const r=document.getElementById('ban-reason').value.trim()||'Banned by admin';if(!p)return;await api('/api/players/ban',{player:p,reason:r});notify(p+' banlandı','ok');loadBanlist();}
+async function pardon(p){await api('/api/players/pardon',{player:p});notify(p+' affedildi','ok');loadBanlist();}
+async function loadPlugins(){const d=await fetch('/api/plugins').then(r=>r.json());const tb=document.getElementById('plug-body');tb.innerHTML=d.length?d.map(p=>`<tr><td><strong>${p.name}</strong></td><td style="font-size:10px;color:var(--t2)">${fmtSize(p.size)}</td><td><span class="badge ${p.enabled?'bg':'br'}">${p.enabled?'Aktif':'Devre Dışı'}</span></td><td style="display:flex;gap:4px"><button class="btn btn-sm b-warn" onclick="togglePlugin('${p.file}')">${p.enabled?'Kapat':'Aç'}</button><button class="btn btn-sm b-dang" onclick="deletePlugin('${p.file}')">🗑</button></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Plugin yok.</td></tr>';}
+async function uploadPlugin(input){const fd=new FormData();for(const f of input.files)fd.append(f.name,f);const r=await fetch('/api/plugins/upload',{method:'POST',body:fd});const d=await r.json();notify(d.msg||'Yüklendi','ok');loadPlugins();}
+function dropPlugin(e){e.preventDefault();document.getElementById('plug-zone').classList.remove('drag');const fd=new FormData();for(const f of e.dataTransfer.files)if(f.name.endsWith('.jar'))fd.append(f.name,f);fetch('/api/plugins/upload',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{notify(d.msg||'Yüklendi','ok');loadPlugins();});}
+async function deletePlugin(file){if(!confirm(file+' silinsin mi?'))return;await api('/api/plugins/delete',{file});notify('Plugin silindi','ok');loadPlugins();}
+async function togglePlugin(file){await api('/api/plugins/toggle',{file});loadPlugins();}
+async function searchPlugins(){const q=document.getElementById('plug-q').value.trim();if(!q)return;const res=document.getElementById('plug-results');res.innerHTML='<div style="color:var(--t2);padding:10px">Aranıyor...</div>';const d=await fetch('/api/plugins/search?q='+encodeURIComponent(q)).then(r=>r.json());if(!d.length||d.error){res.innerHTML='<div style="color:var(--t2);padding:10px">Sonuç bulunamadı</div>';return;}res.innerHTML=d.map(p=>`<div style="display:flex;justify-content:space-between;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05)"><div><div style="font-size:13px;font-weight:600">${p.name}</div><div style="font-size:11px;color:var(--t2);margin-top:2px;max-width:320px">${p.description}</div><div style="font-size:10px;color:var(--t3);margin-top:2px">👤 ${p.owner} · ⬇ ${(p.downloads||0).toLocaleString()}</div></div><a class="btn btn-sm b-prim" href="${p.url}" target="_blank">🔗 Aç</a></div>`).join('');}
+async function fmLoad(path=''){curDir=path;document.getElementById('fm-bread').textContent='/'+path;const items=await fetch('/api/files?path='+encodeURIComponent(path)).then(r=>r.json());const el=document.getElementById('fm-list');el.innerHTML=items.map(f=>`<div class="fm-item" onclick="fmClick('${f.path}','${f.type}','${escQ(f.name)}')"><span class="fm-ico">${f.type==='dir'?'📁':fmIco(f.ext)}</span><span class="fm-name">${f.name}</span><span class="fm-size">${f.type==='dir'?'':fmtSize(f.size)}</span></div>`).join('')||'<div style="padding:12px;color:var(--t2);font-size:12px">Klasör boş</div>';}
+function escQ(s){return s.replace(/'/g,"\\'");}
+function fmIco(ext){const m={'.properties':'⚙️','.json':'📋','.yml':'📋','.yaml':'📋','.jar':'☕','.txt':'📄','.log':'📜','.sh':'🖥️','.zip':'📦','.png':'🖼️','.jpg':'🖼️','.dat':'🗃️','.conf':'⚙️','.toml':'⚙️'};return m[ext]||'📄';}
+function fmUp(){const parts=curDir.split('/').filter(Boolean);parts.pop();fmLoad(parts.join('/'));}
+function fmRefresh(){fmLoad(curDir);}
+async function fmClick(path,type,name){document.querySelectorAll('.fm-item').forEach(i=>i.classList.remove('sel'));event.currentTarget.classList.add('sel');curFile=path;if(type==='dir'){fmLoad(path);return;}document.getElementById('fm-fname').textContent=name;const textExts=['.properties','.json','.yml','.yaml','.txt','.log','.sh','.conf','.toml','.cfg','.xml','.md','.java','.py','.js'];const ext='.'+name.split('.').pop().toLowerCase();if(textExts.includes(ext)){const d=await fetch('/api/files/read?path='+encodeURIComponent(path)).then(r=>r.json());document.getElementById('fm-area').value=d.content||'';document.getElementById('fm-save').disabled=false;}else{document.getElementById('fm-area').value='(Bu dosya türü metin editöründe açılamaz)';document.getElementById('fm-save').disabled=true;}}
+async function fmSave(){if(!curFile)return;const content=document.getElementById('fm-area').value;await api('/api/files/write',{path:curFile,content});notify('Kaydedildi','ok');document.getElementById('fm-save').disabled=true;}
+function fmDownload(){if(curFile)window.open('/api/files/download?path='+encodeURIComponent(curFile));}
+async function fmDelete(){if(!curFile||!confirm(curFile+' silinsin mi?'))return;await api('/api/files/delete',{path:curFile});notify('Silindi','ok');fmLoad(curDir);curFile=null;document.getElementById('fm-area').value='';document.getElementById('fm-fname').textContent='Dosya seçin...';}
+async function fmUpload(input){const fd=new FormData();fd.append('path',curDir);for(const f of input.files)fd.append(f.name,f);await fetch('/api/files/upload',{method:'POST',body:fd});notify('Yüklendi','ok');fmLoad(curDir);}
+function fmNewModal(){showModal('Yeni Dosya / Klasör','<input class="m-inp" id="nf-n" placeholder="isim.txt veya klasör-adı">',async()=>{const n=document.getElementById('nf-n').value.trim();if(!n)return;if(n.includes('.'))await api('/api/files/write',{path:curDir+'/'+n,content:''});else await api('/api/files/mkdir',{path:curDir+'/'+n});fmLoad(curDir);closeModal();});}
+async function loadWorlds(){const d=await fetch('/api/worlds').then(r=>r.json());const el=document.getElementById('worlds-list');el.innerHTML=d.length?d.map(w=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid rgba(255,255,255,.05)"><div><div style="font-weight:600">🌍 ${w.name}</div><div style="font-size:11px;color:var(--t2);margin-top:2px">Boyut: ${fmtSize(w.size)}</div></div><div style="display:flex;gap:8px"><button class="btn btn-sm b-prim" onclick="backupWorld('${w.name}')">💾 Yedekle</button><button class="btn btn-sm b-dang" onclick="deleteWorld('${w.name}')">🗑 Sil</button></div></div>`).join(''):'<div style="color:var(--t2)">Dünya bulunamadı</div>';}
+async function backupWorld(name){notify('Yedekleniyor...','info');const d=await api('/api/worlds/backup',{world:name});notify(d.ok?`Yedeklendi: ${d.file} (${fmtSize(d.size)})`:'Hata',d.ok?'ok':'err');loadBackups();}
+async function deleteWorld(name){if(!confirm(name+' dünyası kalıcı olarak silinsin mi?'))return;const d=await api('/api/worlds/delete',{world:name});notify(d.ok?'Dünya silindi':d.error,d.ok?'ok':'err');loadWorlds();}
+async function loadBackups(){const d=await fetch('/api/backups').then(r=>r.json());const tb=document.getElementById('backup-body');tb.innerHTML=d.length?d.map(b=>`<tr><td>${b.name}</td><td style="font-size:11px;color:var(--t2)">${fmtSize(b.size)}</td><td style="font-size:11px;color:var(--t3)">${new Date(b.created*1000).toLocaleString('tr')}</td><td><a class="btn btn-sm b-prim" href="/api/files/download?path=${encodeURIComponent(b.path)}">⬇ İndir</a></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Yedek yok</td></tr>';}
+const SET_LABELS={'server-port':'Sunucu Portu','max-players':'Max Oyuncu','online-mode':'Online Mode','gamemode':'Oyun Modu','difficulty':'Zorluk','motd':'Sunucu Adı (MOTD)','view-distance':'Görüş Mesafesi','simulation-distance':'Simülasyon Mesafesi','spawn-protection':'Spawn Koruması','allow-flight':'Uçuşa İzin','white-list':'Beyaz Liste','enable-command-block':'Komut Bloğu','pvp':'PvP','allow-nether':'Nether Boyutu','level-name':'Dünya Adı','level-seed':'Dünya Seed','max-tick-time':'Max Tick Süresi (ms)','sync-chunk-writes':'Chunk Sync Yazma','generate-structures':'Yapı Oluştur'};
+async function loadSettings(){const d=await fetch('/api/settings').then(r=>r.json());const el=document.getElementById('settings-grid');el.innerHTML=Object.entries(d).map(([k,v])=>`<div class="set-item"><div class="set-lbl">${SET_LABELS[k]||k}</div>${v==='true'||v==='false'?`<select class="set-inp" id="s-${k}"><option value="true" ${v==='true'?'selected':''}>true</option><option value="false" ${v==='false'?'selected':''}>false</option></select>`:`<input class="set-inp" id="s-${k}" value="${v.replace(/</g,'&lt;')}">`}</div>`).join('');}
+async function saveSettings(){const d=await fetch('/api/settings').then(r=>r.json());const updated={};for(const k of Object.keys(d)){const el=document.getElementById('s-'+k);if(el)updated[k]=el.value;}const r=await api('/api/settings',updated);notify(r.msg||'Kaydedildi','ok');setTimeout(()=>srvAction('restart'),1500);}
+async function loadPerf(){const d=await fetch('/api/performance').then(r=>r.json());if(d.cpu!==undefined){document.getElementById('p-cpu').textContent=d.cpu+'%';document.getElementById('pb-cpu').style.width=d.cpu+'%';}if(d.ram_pct!==undefined){document.getElementById('p-ram').textContent=`${d.ram_used_mb}MB / ${d.ram_total_mb}MB`;document.getElementById('pb-ram').style.width=d.ram_pct+'%';}if(d.disk_pct!==undefined){document.getElementById('p-disk').textContent=`${d.disk_used_gb}GB / ${d.disk_total_gb}GB`;document.getElementById('pb-disk').style.width=d.disk_pct+'%';}if(d.mc&&d.mc.ram){document.getElementById('p-mcram').textContent=d.mc.ram+' MB';document.getElementById('p-mccpu').textContent=d.mc.cpu+'%';document.getElementById('p-mcthr').textContent=d.mc.threads;}document.getElementById('p-tps1').textContent=d.tps||'—';document.getElementById('p-tps5').textContent=d.tps5||'—';document.getElementById('p-tps15').textContent=d.tps15||'—';document.getElementById('p-pls').textContent=document.getElementById('tb-pl').textContent;}
+setInterval(()=>{if(curPage==='perf')loadPerf();},5000);
+function cmd(c){socket.emit('send_command',{cmd:c});notify('→ '+c,'info');}
+async function api(url,body={}){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return r.json();}
+function fmtSize(b){if(b>1e9)return(b/1e9).toFixed(2)+'GB';if(b>1e6)return(b/1e6).toFixed(1)+'MB';if(b>1e3)return(b/1e3).toFixed(0)+'KB';return b+'B';}
+function fmtUp(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return `${h}s ${m}d ${sec}sn`;}
+function notify(msg,type='ok'){const wrap=document.getElementById('notif-wrap');const div=document.createElement('div');div.className='notif n-'+type;div.textContent=msg;wrap.appendChild(div);setTimeout(()=>div.remove(),3500);}
+function showModal(title,body,onok){document.getElementById('m-title').textContent=title;document.getElementById('m-body').innerHTML=body;document.getElementById('m-ok').onclick=onok;document.getElementById('modal').classList.add('open');setTimeout(()=>{const inp=document.querySelector('#m-body input');if(inp)inp.focus();},50);}
+function closeModal(){document.getElementById('modal').classList.remove('open');}
+document.getElementById('modal').addEventListener('click',e=>{if(e.target===document.getElementById('modal'))closeModal();});
+async function init(){const d=await fetch('/api/status').then(r=>r.json()).catch(()=>({}));updateStatus(d);updateStats(d);if(d.players)updatePlayers(d.players);if(d.tunnel&&d.tunnel.host)setTunnel(d.tunnel);}
 init();
 </script>
 </body>
