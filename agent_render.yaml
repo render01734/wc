@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: mc-agent
+    runtime: docker
+    dockerfilePath: ./agent.Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: "5000"
+      - key: MAIN_URL
+        value: "https://wc-tsgd.onrender.com"   # ← Ana sunucu URL'in
+      - key: RAM_CACHE_MB
+        value: "300"   # Render free: 512MB toplam, 300MB önbelleğe ayır
+    disk:
+      name: agent-disk
+      mountPath: /agent_data
+      sizeGB: 10    # Render'da disk eklenebiliyorsa artır

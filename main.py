@@ -1,14 +1,11 @@
 """
-⛏️  Minecraft Server Boot — RENDER BYPASS v9.5
+⛏️  Minecraft Server Boot — RENDER BYPASS v9.6
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v9.5 Değişiklikler:
-  - asyncio + websockets kütüphanesi KALDIRILDI (Render'da güvenilmez)
-  - SAF PYTHON SOCKET WebSocket köprüsü eklendi (sıfır dış bağımlılık)
-  - Her adım _panel_log ile web konsoluna yansıyor
-  - mc_panel.py: manuel Başlat 0 NBD varken reddedilir
-  Akış:
-    Destek: nbd-server → raw_ws_server(8080) → cloudflared HTTP
-    Ana:    wss://host → raw_ws_client → local TCP:1081x → nbd-client → swapon
+v9.6 Değişiklikler:
+  - MIN_SUPPORT_NODES = 0 → MC hemen başlar, NBD opsiyonel
+  - NBD /dev/nbd* oluşturulamazsa: uyar ve atla (crash yok)
+  - modprobe başarısız olsa bile MC durdurmaz
+  - Destek düğümleri bağlandıkça arka planda swap eklemeye çalışır
 """
 
 import os, sys, subprocess, time, socket, resource, threading, re, glob, json
@@ -18,10 +15,10 @@ import urllib.request as _ur
 
 RENDER_RAM_LIMIT_MB  = 512
 RENDER_DISK_LIMIT_GB = 18.0
-MIN_SUPPORT_NODES    = 3
-WS_BRIDGE_PORT       = 8080    # Destek: ws_bridge_server dinleme portu
-NBD_SERVER_PORT      = 10809   # Destek: nbd-server portu
-NBD_CLIENT_BASE      = 10810   # Ana: local köprü portları (10810, 10811, ...)
+MIN_SUPPORT_NODES    = 0      # ← FIX v9.6: 0 = MC hemen başlar, NBD opsiyonel
+WS_BRIDGE_PORT       = 8080
+NBD_SERVER_PORT      = 10809
+NBD_CLIENT_BASE      = 10810
 
 MAIN_SERVER_URL = "https://wc-tsgd.onrender.com"
 MY_URL  = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -84,12 +81,12 @@ base_env = {
 }
 
 print("\n" + "━"*56)
-print("  ⛏️   Minecraft Server — RENDER BYPASS v9.5")
+print("  ⛏️   Minecraft Server — RENDER BYPASS v9.6")
 print(f"      MOD       : {'🟢 ANA' if IS_MAIN else '🔵 DESTEK'}")
 print(f"      MY_URL    : {MY_URL or '(boş → ANA)'}")
 print(f"      RAM       : {CONTAINER_RAM_MB}MB")
 if IS_MAIN:
-    print(f"      MIN DESTEK: {MIN_SUPPORT_NODES} düğüm (Raw Python WS)")
+    print(f"      NBD       : Opsiyonel (MIN={MIN_SUPPORT_NODES})")
 print("━"*56 + "\n")
 
 
@@ -220,12 +217,11 @@ def optimize_all(mode="main"):
 #  ANA SUNUCU — NBD bağlantıları (wstunnel üzerinden)
 # ══════════════════════════════════════════════════════════════
 
-_nbd_nodes = {}   # node_id → {port, dev, connected, proc}
+_nbd_nodes = {}
 _nbd_lock  = threading.Lock()
 
 
 def _next_free_slot():
-    """Boş (local_port, /dev/nbdX) çifti döner."""
     used_ports = {v["port"] for v in _nbd_nodes.values()}
     used_devs  = {v["dev"]  for v in _nbd_nodes.values()}
     for i in range(16):
@@ -260,7 +256,6 @@ _WS_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 def _ws_handshake_server(sock) -> bool:
-    """HTTP Upgrade isteğini al, 101 cevabı gönder."""
     data = b""
     try:
         while b"\r\n\r\n" not in data:
@@ -288,7 +283,6 @@ def _ws_handshake_server(sock) -> bool:
 
 
 def _ws_handshake_client(sock, host: str, path: str = "/") -> bool:
-    """WebSocket client handshake gönder, 101 bekle."""
     key = _base64.b64encode(os.urandom(16)).decode()
     req = (
         f"GET {path} HTTP/1.1\r\n"
@@ -312,7 +306,6 @@ def _ws_handshake_client(sock, host: str, path: str = "/") -> bool:
 
 
 def _ws_recv(sock) -> bytes:
-    """Tek WebSocket frame al, payload döndür."""
     def recv_exact(n: int) -> bytes:
         buf = bytearray()
         while len(buf) < n:
@@ -327,12 +320,12 @@ def _ws_recv(sock) -> bytes:
     masked = bool(hdr[1] & 0x80)
     length = hdr[1] & 0x7F
 
-    if opcode == 8:   # close
+    if opcode == 8:
         raise ConnectionError("WS close frame")
-    if opcode == 9:   # ping → pong
+    if opcode == 9:
         sock.sendall(bytes([0x8A, 0x00]))
         return _ws_recv(sock)
-    if opcode == 10:  # pong
+    if opcode == 10:
         return _ws_recv(sock)
 
     if length == 126:
@@ -349,7 +342,6 @@ def _ws_recv(sock) -> bytes:
 
 
 def _ws_send(sock, data: bytes, masked: bool = False):
-    """Binary WebSocket frame gönder."""
     length = len(data)
     if length < 126:
         hdr = bytes([0x82, (0x80 | length) if masked else length])
@@ -370,7 +362,6 @@ def _pipe_both(sock_a, sock_b,
                a_recv, b_recv,
                a_send, b_send,
                label: str, stop_ev: threading.Event):
-    """İki socket arasında çift yönlü veri aktarımı (thread-per-direction)."""
     def a_to_b():
         try:
             while not stop_ev.is_set():
@@ -402,25 +393,17 @@ def _pipe_both(sock_a, sock_b,
     t1.join(timeout=2); t2.join(timeout=2)
 
 
-# ─── Destek: WS sunucu köprüsü (raw socket) ──────────────────
+# ─── Destek: WS sunucu köprüsü ──────────────────────────────
 
 def support_start_ws_bridge():
-    """
-    Saf Python socket WS sunucu:
-      Gelen WS bağlantısını nbd-server TCP portuna (10809) köprüler.
-      cloudflared HTTP tüneli ile trycloudflare uyumlu.
-    """
     def handle_client(ws_sock):
         try:
             if not _ws_handshake_server(ws_sock):
-                print("  [ws-srv] ❌ WS handshake başarısız")
                 return
-            # nbd-server'a bağlan
             nbd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             nbd.settimeout(10)
             nbd.connect(("127.0.0.1", NBD_SERVER_PORT))
             nbd.settimeout(None)
-            print(f"  [ws-srv] ✅ WS→NBD köprüsü kuruldu")
             stop_ev = threading.Event()
             ws_sock.settimeout(None)
             _pipe_both(
@@ -432,7 +415,7 @@ def support_start_ws_bridge():
                 label="ws-srv", stop_ev=stop_ev,
             )
         except Exception as e:
-            print(f"  [ws-srv] hata: {e}")
+            pass
         finally:
             try: ws_sock.close()
             except: pass
@@ -463,16 +446,12 @@ def support_start_ws_bridge():
     if wait_port(WS_BRIDGE_PORT, timeout=8):
         print(f"  [destek] ✅ WS köprüsü :{WS_BRIDGE_PORT} hazır")
         return True
-    print(f"  [destek] ❌ WS köprüsü :{WS_BRIDGE_PORT} başlamadı!")
     return False
 
 
-# ─── Ana: WS istemci köprüsü (raw socket) ────────────────────
+# ─── Ana: WS istemci köprüsü ─────────────────────────────────
 
 def _ws_bridge_client_loop(local_port: int, remote_host: str, stop_ev: threading.Event):
-    """
-    Yerel TCP portunu dinler; her bağlantı için WSS köprüsü açar.
-    """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -493,7 +472,6 @@ def _ws_bridge_client_loop(local_port: int, remote_host: str, stop_ev: threading
             ws_raw.connect((remote_host, 443))
             ws_raw.settimeout(None)
             if not _ws_handshake_client(ws_raw, remote_host):
-                print(f"  [ws-cli] ❌ WS handshake başarısız: {remote_host}")
                 ws_raw.close(); tcp_sock.close()
                 return
             conn_stop = threading.Event()
@@ -506,7 +484,7 @@ def _ws_bridge_client_loop(local_port: int, remote_host: str, stop_ev: threading
                 label="ws-cli", stop_ev=conn_stop,
             )
         except Exception as e:
-            print(f"  [ws-cli] bağlantı hatası ({remote_host}): {e}")
+            pass
         finally:
             try: tcp_sock.close()
             except: pass
@@ -519,17 +497,14 @@ def _ws_bridge_client_loop(local_port: int, remote_host: str, stop_ev: threading
             continue
         except Exception as e:
             if not stop_ev.is_set():
-                print(f"  [ws-cli] accept hatası: {e}")
                 time.sleep(1)
     srv.close()
 
 
 def connect_worker_nbd(host: str, node_id: str = "") -> bool:
     """
-    Saf Python WS köprüsü:
-      wss://host:443 (cloudflared HTTPS tüneli)
-      → WS server (WS_BRIDGE_PORT=8080) → nbd-server (10809)
-    Sonra nbd-client yerel porta bağlanır, disk swap olarak eklenir.
+    FIX v9.6: NBD bağlantısı başarısız olursa False döner ama crash etmez.
+    /dev/nbd* oluşturulamazsa uyarı verir, MC'yi engellemez.
     """
     if not node_id:
         node_id = host
@@ -548,42 +523,39 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
     print(f"\n  {msg}")
     _panel_log(f"[Panel] {msg}")
 
-    # ── nbd kernel modülü ──
+    # ── nbd kernel modülü (başarısız olsa devam et) ──
     import shutil as _s2
-    # kmod kurulu değilse kur
-    if not _s2.which("modprobe") and not os.path.exists("/sbin/modprobe"):
-        _panel_log("[Panel] ⚙️  kmod (modprobe) kuruluyor...")
-        sh("apt-get install -y --no-install-recommends kmod 2>/dev/null")
-
     mod_ok = False
     for mp in ["/sbin/modprobe", "/usr/sbin/modprobe", "modprobe"]:
         r_mod = sh(f"{mp} nbd max_part=0 2>&1")
-        out = r_mod.stdout.decode()
         if r_mod.returncode == 0:
-            _panel_log(f"[Panel] ✅ modprobe nbd OK ({mp})")
             mod_ok = True
             break
 
     if not mod_ok:
         if os.path.exists("/sys/module/nbd"):
-            _panel_log("[Panel] ✅ nbd modülü /sys/module/nbd üzerinden tespit edildi")
             mod_ok = True
         else:
-            _panel_log("[Panel] ⚠️  modprobe başarısız — mknod ile /dev/nbd* oluşturuluyor")
+            _panel_log(f"[Panel] ⚠️  nbd modülü yüklenemedi — bu Render'da normaldir")
+            # mknod dene
             for i in range(16):
                 dp = f"/dev/nbd{i}"
                 if not os.path.exists(dp):
                     sh(f"mknod {dp} b 43 {i} 2>/dev/null")
 
-    # /dev/nbdX cihazı var mı kontrol et
+    # /dev/nbdX yoksa ve oluşturulamıyorsa: NBD atla
     if not os.path.exists(dev):
         r_mk = sh(f"mknod {dev} b 43 {dev_num} 2>&1")
         if not os.path.exists(dev):
             err = r_mk.stdout.decode()[:120]
-            _panel_log(f"[Panel] ❌ {dev} oluşturulamadı: {err}")
-            _panel_log("[Panel] ❌ Dockerfile'da 'kmod nbd-client' kurulu mu? render.yaml'da privileged:true var mı?")
-            with _nbd_lock: _nbd_nodes.pop(node_id, None)
-            return False
+            _panel_log(
+                f"[Panel] ⚠️  NBD atlandı: {dev} oluşturulamadı ({err.strip()}) "
+                f"— Render kernel'inde nbd modülü yok. MC yine de çalışacak."
+            )
+            with _nbd_lock:
+                _nbd_nodes.pop(node_id, None)
+            return False   # False döner ama MC durdurmaz (MIN_SUPPORT_NODES=0)
+
     _panel_log(f"[Panel] ✅ {dev} cihazı hazır")
 
     # ── nbd-client kurulu mu? ──
@@ -594,8 +566,9 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
            "--no-install-recommends nbd-client 2>/dev/null")
         if not _s.which("nbd-client"):
-            _panel_log("[Panel] ❌ nbd-client kurulamadı!")
-            with _nbd_lock: _nbd_nodes.pop(node_id, None)
+            _panel_log("[Panel] ⚠️  nbd-client kurulamadı — NBD atlanıyor")
+            with _nbd_lock:
+                _nbd_nodes.pop(node_id, None)
             return False
 
     # ── WS istemci köprüsü başlat ──
@@ -607,46 +580,42 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
     )
     bridge_t.start()
 
-    # Köprü TCP portu açılana kadar bekle (20sn)
     if not wait_port(port, timeout=20):
-        _panel_log(f"[Panel] ❌ WS köprü portu {port} açılmadı (20sn)")
+        _panel_log(f"[Panel] ⚠️  WS köprü portu {port} açılmadı — NBD atlanıyor")
         stop_ev.set()
-        with _nbd_lock: _nbd_nodes.pop(node_id, None)
+        with _nbd_lock:
+            _nbd_nodes.pop(node_id, None)
         return False
 
-    # ── WS bağlantısının karşı tarafa ulaşmasını bekle ──
-    # Port açık = TCP server hazır. Ama SSL+WS handshake için ekstra 5sn bekle
-    # Bu sayede nbd-server'ın magic bytes'larını hazır buluruz.
-    _panel_log(f"[Panel] ✅ WS köprüsü :{port} hazır, cloudflare handshake 5sn bekleniyor...")
+    _panel_log(f"[Panel] ✅ WS köprüsü :{port} hazır, 5sn bekleniyor...")
     time.sleep(5)
 
-    # Önceki kullanımdan kalan dev'i temizle
     sh(f"nbd-client -d {dev} 2>/dev/null")
     time.sleep(1)
 
     _panel_log(f"[Panel] 🔗 nbd-client bağlanıyor: 127.0.0.1:{port} → {dev}")
 
-    # nbd-client bağlan
     r = sh(f"nbd-client 127.0.0.1 {port} {dev} -N disk -b 4096 -t 30 2>&1")
     if r.returncode != 0:
         out = r.stdout.decode()[:300]
-        _panel_log(f"[Panel] ❌ nbd-client hatası ({node_id}): {out}")
+        _panel_log(f"[Panel] ⚠️  nbd-client başarısız ({node_id}): {out[:100]} — atlanıyor")
         stop_ev.set()
-        with _nbd_lock: _nbd_nodes.pop(node_id, None)
+        with _nbd_lock:
+            _nbd_nodes.pop(node_id, None)
         return False
 
     _panel_log(f"[Panel] ✅ nbd-client bağlandı: {dev}")
 
-    # mkswap + swapon
     sh(f"mkswap {dev} 2>/dev/null")
     prio = max(1, 10 - cnt_before)
     r2 = sh(f"swapon -p {prio} {dev} 2>&1")
     if r2.returncode != 0:
         err = r2.stdout.decode()[:150]
-        _panel_log(f"[Panel] ❌ swapon {dev}: {err}")
+        _panel_log(f"[Panel] ⚠️  swapon {dev} başarısız: {err}")
         sh(f"nbd-client -d {dev} 2>/dev/null")
         stop_ev.set()
-        with _nbd_lock: _nbd_nodes.pop(node_id, None)
+        with _nbd_lock:
+            _nbd_nodes.pop(node_id, None)
         return False
 
     with _nbd_lock:
@@ -656,7 +625,7 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
     cnt = nbd_connected_count()
     swp = psutil.swap_memory()
     msg2 = (f"🔗 NBD ✅ {node_id}: {dev} (prio:{prio}) | "
-            f"Swap:{swp.total//1024//1024}MB | {cnt}/{MIN_SUPPORT_NODES} düğüm")
+            f"Swap:{swp.total//1024//1024}MB | {cnt} düğüm")
     print(f"  [nbd] {msg2}")
     _panel_log(f"[Panel] {msg2}")
 
@@ -679,8 +648,6 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
 
 
 def _connect_node_loop(host: str, node_id: str):
-    """Tek bir düğümü bağlayana kadar sürekli yeniden dene."""
-    # İlk deneme öncesi küçük stagger (race condition önlemek için)
     import random
     time.sleep(random.uniform(0.5, 2.5))
     attempt = 0
@@ -688,31 +655,23 @@ def _connect_node_loop(host: str, node_id: str):
         attempt += 1
         if connect_worker_nbd(host, node_id):
             return
-        wait = min(120, 15 * attempt)
-        print(f"  [nbd] {node_id} başarısız (#{attempt}), {wait}sn sonra yeniden...")
-        _panel_log(f"[Panel] ⚠️  NBD {node_id} #{attempt} başarısız, {wait}sn sonra tekrar")
+        wait = min(120, 30 * attempt)   # v9.6: daha seyrek tekrar (30s * attempt)
+        print(f"  [nbd] {node_id} NBD bağlanamadı (#{attempt}), {wait}sn sonra tekrar...")
+        _panel_log(f"[Panel] ℹ️  NBD {node_id} #{attempt} — {wait}sn sonra tekrar (MC çalışmaya devam ediyor)")
         time.sleep(wait)
 
 
 def _ensure_main_tools():
-    """Ana sunucuda nbd-client kurulu olduğundan emin ol."""
     import shutil as _s
     missing = [t for t in ["nbd-client"] if not _s.which(t)]
     if missing:
-        print(f"  [ana] nbd-client kuruluyor...")
         sh("apt-get update -qq 2>/dev/null && "
            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
            f"--no-install-recommends {' '.join(missing)} 2>/dev/null")
-    _panel_log("[Panel] ⚙️  Ana sunucu araçları hazır (nbd-client, raw WS köprüsü)")
+    _panel_log("[Panel] ⚙️  Ana sunucu araçları kontrol edildi")
 
 
 def try_connect_all_workers():
-    """
-    Panel hazır olana kadar bekle, ardından tüm düğümleri
-    paralel thread'lerle bağla. Yeni düğümler için sürekli polling.
-    WORKER_HOST env: virgülle ayrılmış ön-tanımlı hostlar.
-    """
-    # ❶ Önce araçları kur (nbd-client (websockets pip))
     _ensure_main_tools()
 
     print("  [worker] Panel bekleniyor...")
@@ -725,7 +684,6 @@ def try_connect_all_workers():
 
     seen = set()
 
-    # Çevre değişkeninden ön-tanımlı bağlantılar
     env_hosts = [h.strip() for h in
                  os.environ.get("WORKER_HOST", "").split(",") if h.strip()]
     for host in env_hosts:
@@ -744,7 +702,7 @@ def try_connect_all_workers():
                 nid  = node.get("node_id", host)
                 if host and host not in seen:
                     seen.add(host)
-                    print(f"  [worker] Yeni düğüm keşfedildi: {nid}")
+                    print(f"  [worker] Yeni düğüm: {nid}")
                     threading.Thread(target=_connect_node_loop,
                                      args=(host, nid), daemon=True).start()
         except:
@@ -754,16 +712,22 @@ def try_connect_all_workers():
 
 def _wait_for_support_nodes():
     """
-    En az MIN_SUPPORT_NODES NBD bağlantısı hazır olana kadar BLOKE eder.
-    MC başlatma bu fonksiyon dönmeden gerçekleşmez.
+    FIX v9.6: MIN_SUPPORT_NODES=0 ise anında geçer.
+    MC NBD olmadan da başlar.
     """
+    if MIN_SUPPORT_NODES == 0:
+        swp = psutil.swap_memory()
+        msg = (f"✅ NBD zorunluluğu yok (MIN=0) — MC hemen başlatılıyor! "
+               f"Swap:{swp.total//1024//1024}MB")
+        print(f"\n  {msg}\n")
+        _panel_log(f"[Sistem] {msg}")
+        return
+
     print(f"\n{'═'*56}")
     print(f"  ⏳ MC başlamadan önce {MIN_SUPPORT_NODES} destek düğümü bekleniyor...")
-    print(f"  (disk, RAM, ağ hazırlığı tamamlanıyor...)")
     print(f"{'═'*56}\n")
     _panel_log(
-        f"[Sistem] ⏳ MC başlayabilmek için {MIN_SUPPORT_NODES} destek düğümü "
-        "bekleniyor — disk/RAM/ağ hazırlanıyor..."
+        f"[Sistem] ⏳ {MIN_SUPPORT_NODES} destek düğümü bekleniyor..."
     )
 
     last_log = 0
@@ -774,7 +738,7 @@ def _wait_for_support_nodes():
             swp = psutil.swap_memory()
             msg = (
                 f"✅ {cnt}/{MIN_SUPPORT_NODES} destek düğümü hazır! "
-                f"Toplam Swap: {swp.total//1024//1024}MB — MC başlatılıyor!"
+                f"Swap:{swp.total//1024//1024}MB — MC başlatılıyor!"
             )
             print(f"\n  {msg}\n")
             _panel_log(f"[Sistem] {msg}")
@@ -784,8 +748,8 @@ def _wait_for_support_nodes():
             swp     = psutil.swap_memory()
             elapsed = int(now - start)
             msg = (
-                f"[Sistem] ⏳ {cnt}/{MIN_SUPPORT_NODES} düğüm bağlı | "
-                f"Swap:{swp.total//1024//1024}MB | {elapsed}sn geçti"
+                f"[Sistem] ⏳ {cnt}/{MIN_SUPPORT_NODES} düğüm | "
+                f"Swap:{swp.total//1024//1024}MB | {elapsed}sn"
             )
             print(f"  {msg}")
             _panel_log(msg)
@@ -802,21 +766,11 @@ def start_panel():
 
 
 def auto_start_sequence():
-    """
-    Sıra:
-      1. Panel hazır ol
-      2. MIN_SUPPORT_NODES NBD bağlantısı hazır ol  ← BARIYER
-      3. MC Server başlat
-      4. MC port hazır ol
-      5. MC cloudflare tünelini aç
-    """
     time.sleep(3)
-    _panel_log("[Sistem] 🔵 Hazırlık başladı — destek düğümleri bekleniyor...")
+    _panel_log("[Sistem] 🟢 v9.6 hazır — MC başlatma sırası başlıyor...")
 
-    # ❶ Bariyer: min 3 NBD bağlı olmadan devam etme
-    _wait_for_support_nodes()
+    _wait_for_support_nodes()   # MIN=0 ise anında geçer
 
-    # ❷ MC başlat (internal flag ile — bariyer zaten geçildi)
     try:
         _ur.urlopen(
             _ur.Request(
@@ -831,13 +785,11 @@ def auto_start_sequence():
     except Exception as e:
         print(f"  ⚠️  MC start hatası: {e}")
 
-    # ❸ MC port
     if wait_port(MC_PORT, 300):
         print("  ✅ MC Server hazır!")
     else:
         print("  ⚠️  MC port timeout (300sn)")
 
-    # ❹ Cloudflare TCP tüneli
     _start_mc_tunnel()
 
 
@@ -925,11 +877,9 @@ def support_create_disk():
 
 def support_start_nbd(disk_gb):
     support_install_tools()
-    # modprobe tam yol dene
     for mp in ["/sbin/modprobe", "/usr/sbin/modprobe", "modprobe"]:
         if sh(f"{mp} nbd max_part=0 2>/dev/null").returncode == 0:
             break
-    # /dev/nbd* cihazları oluştur (modprobe başarısız olsa bile)
     for i in range(4):
         dp = f"/dev/nbd{i}"
         if not os.path.exists(dp):
@@ -947,7 +897,6 @@ def support_start_nbd(disk_gb):
     if proc.poll() is None:
         print(f"  [destek] ✅ nbd-server (:{NBD_SERVER_PORT})")
         return True
-    # socat fallback
     import shutil as _s
     if _s.which("socat") and os.path.exists(SUPPORT_NBD_FILE):
         subprocess.Popen(
@@ -963,10 +912,6 @@ def support_start_nbd(disk_gb):
 
 
 def support_start_tunnel(disk_gb):
-    """
-    cloudflared HTTP tüneli: HTTPS → ws_bridge(8080) → nbd-server(10809)
-    trycloudflare uyumlu — sadece HTTP/HTTPS, WebSocket upgrade desteklenir.
-    """
     log = "/tmp/cf_support.log"
     print("  [destek] 🌐 Cloudflare HTTP tüneli açılıyor...")
     subprocess.Popen(
@@ -1076,7 +1021,7 @@ def run_support_mode():
     from flask import Flask, jsonify
 
     print(f"\n{'═'*56}")
-    print(f"  🔵 DESTEK MODU v9.3")
+    print(f"  🔵 DESTEK MODU v9.6")
     print(f"  Ana sunucu : {MAIN_SERVER_URL}")
     print(f"  Node ID    : {SUPPORT_NODE_ID}")
     print(f"{'═'*56}\n")
@@ -1147,7 +1092,7 @@ SUPPORT_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="8">
-<title>Destek Sunucusu v9.4</title>
+<title>Destek Sunucusu v9.6</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{background:#0a0b12;color:#eef0f8;font-family:'Segoe UI',sans-serif;
@@ -1184,7 +1129,7 @@ h1{{font-size:19px;font-weight:700;margin-bottom:4px;color:#7c6aff}}
 </style></head><body>
 <div class="card">
   <div style="font-size:40px;margin-bottom:8px">&#128309;</div>
-  <div class="badge"><div class="dot"></div> DESTEK MODU AKTIF - v9.4</div>
+  <div class="badge"><div class="dot"></div> DESTEK MODU AKTIF - v9.6</div>
   <h1>Destek Sunucusu</h1>
   <div class="sub">Node: {node_id} - 8sn sonra yenilenir</div>
   <div class="grid">
@@ -1222,9 +1167,9 @@ optimize_all(mode)
 
 if IS_MAIN:
     print(f"\n{'━'*56}")
-    print(f"  ANA SUNUCU v9.4 — Panel :{PORT}")
-    print(f"  MC, {MIN_SUPPORT_NODES} NBD dugumu hazir olmadan BASLAMAZ")
-    print(f"  Protokol: cloudflared HTTPS → Python WS → nbd-client")
+    print(f"  ANA SUNUCU v9.6 — Panel :{PORT}")
+    print(f"  MC, NBD beklemeden HEMEN başlar (MIN=0)")
+    print(f"  NBD düğümleri bağlandıkça arka planda swap eklenir")
     print(f"{'━'*56}\n")
     panel_proc = start_panel()
     threading.Thread(target=try_connect_all_workers, daemon=True).start()
