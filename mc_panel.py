@@ -419,15 +419,59 @@ def _world_backup_loop():
         time.sleep(180)   # 3 dakika
 
 
+def _warm_single_agent(agent_client, log_fn=None):
+    """
+    Tek bir agent'a tüm statik MC dosyalarını gönder.
+    Yeni agent bağlandığında veya warm loop'ta çağrılır.
+    """
+    _log = log_fn or print
+    pushed = 0
+    # 1. Server JAR
+    if MC_JAR.exists():
+        try:
+            data = MC_JAR.read_bytes()
+            if agent_client.cache_set("mc/server.jar", data):
+                pushed += 1
+        except: pass
+    # 2. Config dosyaları
+    for cfg in ["paper.yml", "spigot.yml", "bukkit.yml", "server.properties",
+                "paper-world-defaults.yml", "config/paper-global.yml"]:
+        p = MC_DIR / cfg
+        if p.exists():
+            try:
+                if agent_client.cache_set(f"mc/config/{cfg}", p.read_bytes()):
+                    pushed += 1
+            except: pass
+    # 3. Plugin JARlar (max 15)
+    plugins_dir = MC_DIR / "plugins"
+    if plugins_dir.exists():
+        for pjar in sorted(plugins_dir.glob("*.jar"))[:15]:
+            try:
+                if agent_client.cache_set(f"mc/plugins/{pjar.name}", pjar.read_bytes()):
+                    pushed += 1
+            except: pass
+    if pushed:
+        _log(f"[Pool] 🧠 Agent {agent_client.node_id} ısındı: {pushed} dosya → RAM")
+    return pushed
+
+
 def _ram_cache_warm_loop():
     """
-    Agent RAM Cache'ini statik MC dosyalarıyla doldur:
-      • server.jar (47MB)
-      • plugins/*.jar
-      • configs: paper.yml, spigot.yml, bukkit.yml, server.properties
-    Böylece 8 × 382MB = ~3GB agent RAM aktif kullanılır.
+    Agent RAM Cache'ini statik MC dosyalarıyla doldur.
+    MC JAR hazır ve en az 1 agent bağlı olana kadar bekler.
+    Böylece 5+ agent × ~50MB = 250MB+ agent RAM aktif kullanılır.
     """
-    time.sleep(45)  # Agentlar bağlansın
+    # MC JAR indirilinceye kadar bekle (max 10 dk)
+    for _ in range(600):
+        if MC_JAR.exists() and _pool.agent_count() > 0:
+            break
+        time.sleep(1)
+    else:
+        # Zaman aşımı — agent yoksa 10dk sonra tekrar dene
+        log("[Pool] ⚠️  Cache warm: JAR veya agent yok (10dk beklendi)")
+        return
+
+    time.sleep(5)  # MC başlamaya başlasın, JAR tam yazılmış olsun
 
     def _push_file(path: Path, key: str, replicate: bool = False):
         """
@@ -445,51 +489,54 @@ def _ram_cache_warm_loop():
         except Exception as e:
             return False
 
-    cached = 0
+    # Tüm agentlara paralel olarak dosya gönder
+    agents = _pool.get_agents()
+    total_pushed = 0
+    threads = []
+    results = []
 
-    # 1. Server JAR → tüm agentlara dağıt (47MB × N agent = N × 47MB kullanılır)
-    # Her agent kendi kopyasını tutar → RAM Cache doluluk artar
-    if MC_JAR.exists():
-        if _push_file(MC_JAR, "mc/server.jar", replicate=True):
-            cached += 1
+    def _warm_agent_thread(a):
+        n = _warm_single_agent(a, log_fn=log)
+        results.append(n)
 
-    # 2. Config dosyaları → tüm agentlara (küçük, hızlı)
-    for cfg in ["paper.yml", "spigot.yml", "bukkit.yml", "server.properties",
-                "paper-world-defaults.yml", "config/paper-global.yml"]:
-        p = MC_DIR / cfg
-        if p.exists():
-            if _push_file(p, f"mc/config/{cfg}", replicate=True):
-                cached += 1
+    for a in agents:
+        t = threading.Thread(target=_warm_agent_thread, args=(a,), daemon=True)
+        threads.append(t)
+        t.start()
 
-    # 3. Plugin JARlar → round-robin agentlara dağıt
-    plugins_dir = MC_DIR / "plugins"
-    if plugins_dir.exists():
-        agents = _pool.get_agents()
-        plugin_jars = sorted(plugins_dir.glob("*.jar"))[:30]
-        for i, pjar in enumerate(plugin_jars):
-            # Her plugin farklı agenta gider → yük dağılımı
-            prefer = agents[i % len(agents)].node_id if agents else None
-            if _push_file(pjar, f"mc/plugins/{pjar.name}", replicate=False):
-                cached += 1
+    for t in threads:
+        t.join(timeout=120)
 
-    if cached:
-        log(f"[Pool] 🧠 RAM Cache ısındı: {cached} dosya → {_pool.agent_count()} agent RAM")
+    total_pushed = sum(results)
+    if total_pushed:
+        log(f"[Pool] 🧠 RAM Cache ısındı: {len(agents)} agent × dosya = {total_pushed} toplam gönderim")
         socketio.emit("pool_update", _pool_summary())
 
-    # Periyodik config güncelleme (10 dakikada bir)
+    # Periyodik: yeni bağlanan agentları ısıt + config güncelle
+    _warmed_agents: set = set(a.node_id for a in _pool.get_agents())
+
     while True:
-        time.sleep(600)
+        time.sleep(300)  # 5 dakika
         try:
             if _pool.agent_count() == 0:
                 continue
-            refreshed = 0
+            # Yeni bağlanan agentları bul ve ısıt
+            current = set(a.node_id for a in _pool.get_agents())
+            new_agents_ids = current - _warmed_agents
+            for nid in new_agents_ids:
+                a = _pool.agents.get(nid)
+                if a:
+                    threading.Thread(
+                        target=_warm_single_agent, args=(a, log), daemon=True
+                    ).start()
+            _warmed_agents.update(current)
+
+            # Config yenile (değişmiş olabilir)
             for cfg in ["server.properties", "paper.yml", "spigot.yml"]:
                 p = MC_DIR / cfg
                 if p.exists():
-                    if _pool.cache_set(f"mc/config/{cfg}", p.read_bytes()):
-                        refreshed += 1
-            if refreshed:
-                socketio.emit("pool_update", _pool_summary())
+                    _pool.cache_set(f"mc/config/{cfg}", p.read_bytes(), replicate=True)
+            socketio.emit("pool_update", _pool_summary())
         except Exception:
             pass
 
@@ -638,21 +685,37 @@ def get_jvm_args():
 
     agent_count = _pool.agent_count()
 
-    # Render.com free tier: 512MB container, swapon yok.
-    # JVM toplam footprint = Xmx + Metaspace(128) + CodeCache(32) + Class(32)
-    #                      + Thread stacks(~50) + JVM overhead(~50) ≈ Xmx + 290MB
-    # 512MB - 290MB = 222MB → güvenli Xmx = 200-220MB
-    # overcommit_memory=1 aktifken JVM 256MB heap ile stabil çalışıyor.
-    xmx_mb = 220   # sabit — swapon yok, 512MB container kesin sınırı
-    xms_mb = 32
+    # Render.com free tier: 512MB container, swapon yok AMA UserSwap aktif.
+    # UserSwap (LD_PRELOAD mmap hook) → JVM anonim mmap'leri /swapfile_mmap'e yönlendirir.
+    # Fiziksel taşma dosyaya gider → SIGKILL yok, OOM yok.
+    #
+    # Paper 1.21 Bootstrap blok-state yüklemesi: ~260MB heap gerektirir.
+    # Xmx=220 → OOM: Java heap space (Bootstrap sırasında crash!)
+    #
+    # Güvenli hesap (UserSwap ile):
+    #   Fiziksel: Xmx_rss + Meta(96) + Code(28) + Class(24) + Stack(14) + Python(130) ≤ 512
+    #   Xmx=320 → RSS_JVM ≈ 250MB (aktif heap) + 220MB (swap'a taşan) → fiziksel ~480MB peak
+    #   Peak 512MB'yi aşınca UserSwap devreye girer → dosyaya yazar, crash YOK
+    #   Steady-state (GC sonrası): RSS ~380MB → güvenli
+    xmx_mb = 320   # UserSwap aktif → Paper 1.21 bootstrap için yeterli heap
+    xms_mb = 48    # Düşük başlangıç → JVM lazy expand eder
 
-    log(f"[Panel] 🧠 Container={container_ram_mb}MB Swap=0MB Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
-    return [
-        "env", f"LD_PRELOAD={USERSWAP_SO}", "java",
+    userswap_ok = os.path.exists(USERSWAP_SO)
+    swap_label  = f"UserSwap(4GB)" if userswap_ok else "NoSwap"
+    log(f"[Panel] 🧠 Container={container_ram_mb}MB {swap_label} Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
+
+    java_cmd = []
+    if userswap_ok:
+        java_cmd = ["env", f"LD_PRELOAD={USERSWAP_SO}"]
+    else:
+        log("[Panel] ⚠️  userswap.so yok — LD_PRELOAD atlandı (OOM riski artabilir)")
+    java_cmd.append("java")
+
+    return java_cmd + [
         f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
-        # ── Bellek alanları (512MB container için kesin sınırlar) ──
-        # Toplam JVM RSS ≈ Xmx(220) + Meta(96) + Code(28) + Class(24) + Stacks(14) = 382MB
-        # Python panel + OS ≈ 130MB → 382+130 = 512MB TAMAM
+        # ── Bellek alanları (UserSwap ile taşma dosyaya gider) ──
+        # Meta + Code + Class + Stack ≈ 162MB sabit
+        # Fiziksel peak ≈ 320(heap) + 162(meta/etc) + 130(python) = 612MB → ~100MB UserSwap'a
         "-XX:MaxMetaspaceSize=96m",
         "-XX:CompressedClassSpaceSize=24m",
         "-XX:ReservedCodeCacheSize=28m",
@@ -925,12 +988,23 @@ def api_agent_register():
             f"RAM:{d.get('ram',{}).get('free_mb',0)}MB | "
             f"Disk:{d.get('disk',{}).get('free_gb',0):.1f}GB | "
             f"CPU:{d.get('cpu',{}).get('cores',0)} core")
-        # ── Proxy otomatik başlat ──────────────────────────────
-        # MC çalışıyorsa yeni agent'ta hemen proxy aç
-        # Proxy otomatik başlatma devre dışı:
-        # Agent'tan ana sunucuya TCP tüneli Cloudflare HTTP tünel üzerinden çalışmıyor.
-        # Agent'lar RAM Cache + Disk Store ile katkı sağlıyor.
-        pass
+        # Yeni agent'ı hemen ısıt (warm loop'u bekleme)
+        agent_client = _pool.agents.get(node_id)
+        if agent_client and MC_JAR.exists():
+            threading.Thread(
+                target=_warm_single_agent,
+                args=(agent_client, log),
+                daemon=True
+            ).start()
+        # Proxy: MC tüneli varsa başlat
+        mc_host = tunnel_info.get("host", "")
+        if mc_host and mc_process and mc_process.poll() is None:
+            def _new_agent_proxy():
+                time.sleep(3)
+                ok = agent_client.proxy_start(mc_host, 25565, 25565)
+                if ok:
+                    log(f"[Pool] 🔀 Yeni agent proxy: {node_id} → {mc_host}:25565")
+            threading.Thread(target=_new_agent_proxy, daemon=True).start()
     socketio.emit("pool_update", _pool_summary())
     return jsonify({"ok": True})
 
