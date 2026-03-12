@@ -995,6 +995,13 @@ def api_internal_tunnel():
     return jsonify({"ok": True})
 
 
+@app.route("/api/ping")
+@app.route("/api/ping", methods=["POST"])
+def api_ping():
+    """Agent'lar ve dış izleme araçları için hafif keep-alive endpoint."""
+    return jsonify({"ok": True, "t": int(__import__("time").time()), "status": server_state.get("status","?")}), 200
+
+
 @app.route("/api/internal/status_msg", methods=["POST"])
 def api_internal_status_msg():
     msg = (request.json or {}).get("msg", "")
@@ -2408,6 +2415,31 @@ init();
 threading.Thread(target=_ram_monitor,        daemon=True).start()
 threading.Thread(target=_ram_watchdog,       daemon=True).start()
 # _pool_health_watchdog KALDIRILDI: resource_pool.health_monitor() zaten arka planda çalışıyor
+
+def _keepalive_loop():
+    """
+    Render free tier 15 dakika inaktivite sonrası servisleri uyutur.
+    Ana sunucu her 10 dakikada bir:
+      1. Kendini ping'ler (Render bu servisi ayakta tutar)
+      2. Tüm bağlı agent'ları ping'ler (onları da ayakta tutar)
+    """
+    import urllib.request as _ka
+    while True:
+        time.sleep(600)  # 10 dakika
+        # 1. Self-ping (bu servisi ayakta tut)
+        try:
+            _ka.urlopen("http://localhost:5000/api/ping", timeout=5)
+        except: pass
+        # 2. Tüm agent'ları ping'le (onları uyutma)
+        agents = _pool.get_agents()
+        for ag in agents:
+            try:
+                _ka.urlopen(f"{ag.url}/ping", timeout=8)
+            except: pass
+        if agents:
+            log(f"[Keepalive] 💓 {len(agents)} agent ayakta tutuldu")
+
+threading.Thread(target=_keepalive_loop, daemon=True).start()
 threading.Thread(target=_pool_auto_optimize,  daemon=True).start()
 threading.Thread(target=_world_backup_loop,   daemon=True).start()  # Agent disk doldur
 threading.Thread(target=_ram_cache_warm_loop, daemon=True).start()  # Agent RAM doldur

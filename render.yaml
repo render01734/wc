@@ -11,5 +11,5 @@ services:
         value: "300M"
       - key: RENDER_DISK_LIMIT_GB
         value: "18.0"  # Render free plan disk kotası — psutil host değerini sınırlar
-    healthCheckPath: /
+    healthCheckPath: /api/ping
     numInstances: 1

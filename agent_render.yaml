@@ -4,6 +4,7 @@ services:
     runtime: docker
     dockerfilePath: ./agent.Dockerfile
     plan: free
+    healthCheckPath: /ping
     envVars:
       - key: PORT
         value: "5000"
