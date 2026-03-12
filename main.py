@@ -398,8 +398,13 @@ def support_create_disk():
 
 def support_start_nbd():
     sh("modprobe nbd max_part=0 2>/dev/null")
-    os.makedirs("/etc/nbd-server", exist_ok=True)
-    open("/etc/nbd-server/config", "w").write(f"""
+
+    # ── nbd-server dene ────────────────────────────────────────
+    import shutil as _shutil
+    if _shutil.which("nbd-server"):
+        try:
+            os.makedirs("/etc/nbd-server", exist_ok=True)
+            open("/etc/nbd-server/config", "w").write(f"""
 [generic]
     port = {SUPPORT_NBD_PORT}
     allowlist = true
@@ -408,20 +413,65 @@ def support_start_nbd():
     readonly = false
     flush = true
 """)
-    print(f"  [destek] 🔌 nbd-server başlatılıyor...")
-    proc = subprocess.Popen(
-        ["nbd-server", "-C", "/etc/nbd-server/config"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-    )
-    time.sleep(2)
-    if proc.poll() is None:
-        print(f"  [destek] ✅ nbd-server aktif (port {SUPPORT_NBD_PORT})")
-        return True
-    print("  [destek] ⚠️  nbd-server yok → socat fallback...")
-    subprocess.Popen([
-        "socat", f"TCP-LISTEN:{SUPPORT_NBD_PORT},reuseaddr,fork",
-        f"FILE:{SUPPORT_NBD_FILE},rdwr,creat"
-    ])
+            print(f"  [destek] 🔌 nbd-server başlatılıyor...")
+            proc = subprocess.Popen(
+                ["nbd-server", "-C", "/etc/nbd-server/config"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            )
+            time.sleep(2)
+            if proc.poll() is None:
+                print(f"  [destek] ✅ nbd-server aktif (port {SUPPORT_NBD_PORT})")
+                return True
+        except Exception as e:
+            print(f"  [destek] ⚠️  nbd-server başlatma hatası: {e}")
+    else:
+        print("  [destek] ℹ️  nbd-server kurulu değil → socat ile devam")
+
+    # ── socat fallback (raw TCP köprüsü) ──────────────────────
+    if _shutil.which("socat"):
+        try:
+            subprocess.Popen([
+                "socat",
+                f"TCP-LISTEN:{SUPPORT_NBD_PORT},reuseaddr,fork",
+                f"FILE:{SUPPORT_NBD_FILE},rdwr"
+            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            time.sleep(1)
+            print(f"  [destek] ✅ socat TCP köprüsü aktif (port {SUPPORT_NBD_PORT})")
+            return True
+        except Exception as e:
+            print(f"  [destek] ⚠️  socat hatası: {e}")
+    else:
+        print("  [destek] ℹ️  socat kurulu değil → Python TCP sunucusu kullanılıyor")
+
+    # ── Pure-Python fallback (hiçbir araç yoksa) ──────────────
+    def _py_tcp_server():
+        import socketserver, struct
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                try:
+                    with open(SUPPORT_NBD_FILE, "r+b") as f:
+                        conn = self.request
+                        conn.settimeout(60)
+                        while True:
+                            hdr = conn.recv(8)
+                            if not hdr or len(hdr) < 8:
+                                break
+                            cmd, offset, length = struct.unpack(">BIH", hdr[:7])
+                            if cmd == 0:   # read
+                                f.seek(offset)
+                                conn.sendall(f.read(length))
+                            elif cmd == 1: # write
+                                data = conn.recv(length)
+                                f.seek(offset)
+                                f.write(data)
+                except Exception:
+                    pass
+        server = socketserver.ThreadingTCPServer(("0.0.0.0", SUPPORT_NBD_PORT), Handler)
+        server.allow_reuse_address = True
+        print(f"  [destek] ✅ Python TCP sunucusu aktif (port {SUPPORT_NBD_PORT})")
+        server.serve_forever()
+
+    threading.Thread(target=_py_tcp_server, daemon=True).start()
     time.sleep(1)
     return True
 
