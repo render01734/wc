@@ -419,100 +419,160 @@ def _world_backup_loop():
         time.sleep(180)   # 3 dakika
 
 
-def _warm_single_agent(agent_client, log_fn=None):
+# ── Agent başına kaç MB cache dolduralım ──────────────────────────────────
+# Her agent 382MB free RAM var, RamCache limiti agent'ta RAM_CACHE_MB env ile ayarlanır.
+# Ana sunucu bu değeri bilmez — agent'ın cache/stats endpoint'inden okur.
+# Güvenli hedef: cache limitinin %90'ı
+AGENT_CACHE_FILL_TARGET = 0.90   # Her agentin cache'ini %90 doldur
+
+
+def _get_agent_cache_limit_mb(agent_client) -> int:
+    """Agent'ın gerçek RAM_CACHE_MB limitini öğren (API'den)."""
+    try:
+        stats = agent_client.cache_stats()
+        return stats.get("limit_mb", 256)
+    except:
+        return 256
+
+
+def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
     """
-    Tek bir agent'a tüm statik MC dosyalarını gönder.
-    Yeni agent bağlandığında veya warm loop'ta çağrılır.
+    Tek bir agent'ı cache limitinin %90'ına kadar doldur:
+      1. server.jar   (~47MB)
+      2. Config dosyaları (~1MB)
+      3. Plugin JARlar  (değişken)
+      4. World region dosyaları (.mca) — ASIL DOLDURMA KAYNAGI
+         Her agent farklı region'ları alır → tüm harita dağıtılmış şekilde önbelleğe girer.
+
+    5 agent × 256MB = 1280MB toplam cache kapasitesi.
     """
     _log = log_fn or print
-    pushed = 0
-    # 1. Server JAR
+    pushed_bytes = 0
+    pushed_count = 0
+
+    limit_mb    = _get_agent_cache_limit_mb(agent_client)
+    target_mb   = int(limit_mb * AGENT_CACHE_FILL_TARGET)
+    target_bytes= target_mb * 1024 * 1024
+
+    def _send(key: str, data: bytes) -> bool:
+        nonlocal pushed_bytes, pushed_count
+        if pushed_bytes >= target_bytes:
+            return False  # Bu agent dolu
+        try:
+            ok = agent_client.cache_set(key, data)
+            if ok:
+                pushed_bytes += len(data)
+                pushed_count += 1
+            return ok
+        except:
+            return False
+
+    # 1. Server JAR (tüm agentlara — sık erişilen)
     if MC_JAR.exists():
         try:
-            data = MC_JAR.read_bytes()
-            if agent_client.cache_set("mc/server.jar", data):
-                pushed += 1
+            _send("mc/server.jar", MC_JAR.read_bytes())
         except: pass
+
     # 2. Config dosyaları
     for cfg in ["paper.yml", "spigot.yml", "bukkit.yml", "server.properties",
                 "paper-world-defaults.yml", "config/paper-global.yml"]:
         p = MC_DIR / cfg
         if p.exists():
-            try:
-                if agent_client.cache_set(f"mc/config/{cfg}", p.read_bytes()):
-                    pushed += 1
+            try: _send(f"mc/config/{cfg}", p.read_bytes())
             except: pass
-    # 3. Plugin JARlar (max 15)
+
+    # 3. Plugin JARlar
     plugins_dir = MC_DIR / "plugins"
     if plugins_dir.exists():
-        for pjar in sorted(plugins_dir.glob("*.jar"))[:15]:
-            try:
-                if agent_client.cache_set(f"mc/plugins/{pjar.name}", pjar.read_bytes()):
-                    pushed += 1
+        for pjar in sorted(plugins_dir.glob("*.jar"))[:20]:
+            try: _send(f"mc/plugins/{pjar.name}", pjar.read_bytes())
             except: pass
-    if pushed:
-        _log(f"[Pool] 🧠 Agent {agent_client.node_id} ısındı: {pushed} dosya → RAM")
-    return pushed
+
+    # 4. World region dosyaları — ASIL DOLDURMA ─────────────────────────────
+    # Her .mca dosyası ~2-8MB. 5 agent dağılımı: dosya hash'i % agent_index
+    # Böylece her agent farklı region'ları önbelleğe alır → toplam harita kapsamı artar.
+    if fill_regions and pushed_bytes < target_bytes:
+        agents     = _pool.get_agents()
+        n_agents   = max(1, len(agents))
+        # Bu agent'ın index'i (kararlı sıralama)
+        try:
+            sorted_ids = sorted(a.node_id for a in agents)
+            my_idx     = sorted_ids.index(agent_client.node_id)
+        except:
+            my_idx = 0
+
+        dim_dirs = [
+            (MC_DIR / "world"          / "region",          "world"),
+            (MC_DIR / "world_nether"   / "DIM-1" / "region","world_nether"),
+            (MC_DIR / "world_the_end"  / "DIM1"  / "region","world_the_end"),
+        ]
+        for region_dir, dim_name in dim_dirs:
+            if not region_dir.exists():
+                continue
+            # En son erişilen region'lar önce (aktif bölgeler daha değerli)
+            mca_files = sorted(region_dir.glob("*.mca"),
+                               key=lambda f: f.stat().st_mtime, reverse=True)
+            for rf in mca_files:
+                if pushed_bytes >= target_bytes:
+                    break
+                # Dosya hash'i % n_agents == my_idx → bu agent bu dosyayı alır
+                import hashlib as _hl
+                file_idx = int(_hl.md5(rf.name.encode()).hexdigest(), 16) % n_agents
+                if file_idx != my_idx:
+                    continue  # Başka agent'ın payı
+                key = f"mc/region/{dim_name}/{rf.name}"
+                try:
+                    _send(key, rf.read_bytes())
+                except: pass
+
+    used_mb = pushed_bytes // 1024 // 1024
+    if pushed_count:
+        _log(f"[Pool] 🧠 {agent_client.node_id}: {pushed_count} dosya, "
+             f"{used_mb}MB/{target_mb}MB hedef → cache doldu")
+    return pushed_count
 
 
 def _ram_cache_warm_loop():
     """
-    Agent RAM Cache'ini statik MC dosyalarıyla doldur.
-    MC JAR hazır ve en az 1 agent bağlı olana kadar bekler.
-    Böylece 5+ agent × ~50MB = 250MB+ agent RAM aktif kullanılır.
+    Tüm agent cache'lerini paralel doldur.
+    Her 5 dakikada bir yeni region'ları ve yeni agentları güncelle.
     """
-    # MC JAR indirilinceye kadar bekle (max 10 dk)
-    for _ in range(600):
+    # MC JAR + en az 1 agent hazır olana kadar bekle (max 15 dk)
+    for _ in range(900):
         if MC_JAR.exists() and _pool.agent_count() > 0:
             break
         time.sleep(1)
     else:
-        # Zaman aşımı — agent yoksa 10dk sonra tekrar dene
-        log("[Pool] ⚠️  Cache warm: JAR veya agent yok (10dk beklendi)")
+        log("[Pool] ⚠️  Cache warm: JAR veya agent 15dk içinde hazır olmadı")
         return
 
-    time.sleep(5)  # MC başlamaya başlasın, JAR tam yazılmış olsun
+    time.sleep(10)  # MC başlasın + world dosyaları oluşsun
 
-    def _push_file(path: Path, key: str, replicate: bool = False):
-        """
-        replicate=True  → tüm agentlara yaz (büyük statik dosyalar: JAR, plugin)
-        replicate=False → hash ile sabit 1 agenta yaz (config, küçük dosya)
-        """
-        try:
-            data = path.read_bytes()
-            ok = _pool.cache_set(key, data, replicate=replicate)
-            if ok:
-                agents = _pool.agent_count()
-                dst = f"tüm {agents} agent" if replicate else "1 agent"
-                log(f"[Pool] 🧠 Cache: {key} ({len(data)//1024}KB) → {dst} RAM")
-            return ok
-        except Exception as e:
-            return False
+    def _fill_all_agents():
+        agents = _pool.get_agents()
+        if not agents:
+            return 0
+        threads, results = [], []
 
-    # Tüm agentlara paralel olarak dosya gönder
-    agents = _pool.get_agents()
-    total_pushed = 0
-    threads = []
-    results = []
+        def _t(a):
+            n = _warm_single_agent(a, log_fn=log, fill_regions=True)
+            results.append(n)
 
-    def _warm_agent_thread(a):
-        n = _warm_single_agent(a, log_fn=log)
-        results.append(n)
+        for a in agents:
+            t = threading.Thread(target=_t, args=(a,), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=180)
+        total = sum(results)
+        if total:
+            log(f"[Pool] 🧠 Cache tamamlandı: {len(agents)} agent, toplam {total} dosya gönderildi")
+            socketio.emit("pool_update", _pool_summary())
+        return total
 
-    for a in agents:
-        t = threading.Thread(target=_warm_agent_thread, args=(a,), daemon=True)
-        threads.append(t)
-        t.start()
+    _fill_all_agents()
 
-    for t in threads:
-        t.join(timeout=120)
-
-    total_pushed = sum(results)
-    if total_pushed:
-        log(f"[Pool] 🧠 RAM Cache ısındı: {len(agents)} agent × dosya = {total_pushed} toplam gönderim")
-        socketio.emit("pool_update", _pool_summary())
-
-    # Periyodik: yeni bağlanan agentları ısıt + config güncelle
+    # Periyodik: yeni agentları ısıt + tüm havuzu tazele
     _warmed_agents: set = set(a.node_id for a in _pool.get_agents())
 
     while True:
@@ -520,25 +580,24 @@ def _ram_cache_warm_loop():
         try:
             if _pool.agent_count() == 0:
                 continue
-            # Yeni bağlanan agentları bul ve ısıt
-            current = set(a.node_id for a in _pool.get_agents())
-            new_agents_ids = current - _warmed_agents
-            for nid in new_agents_ids:
-                a = _pool.agents.get(nid)
-                if a:
-                    threading.Thread(
-                        target=_warm_single_agent, args=(a, log), daemon=True
-                    ).start()
-            _warmed_agents.update(current)
 
-            # Config yenile (değişmiş olabilir)
-            for cfg in ["server.properties", "paper.yml", "spigot.yml"]:
-                p = MC_DIR / cfg
-                if p.exists():
-                    _pool.cache_set(f"mc/config/{cfg}", p.read_bytes(), replicate=True)
-            socketio.emit("pool_update", _pool_summary())
-        except Exception:
-            pass
+            current = set(a.node_id for a in _pool.get_agents())
+            new_ids = current - _warmed_agents
+            if new_ids:
+                log(f"[Pool] 🧠 Yeni agent ısınıyor: {new_ids}")
+                for nid in new_ids:
+                    a = _pool.agents.get(nid)
+                    if a:
+                        threading.Thread(
+                            target=_warm_single_agent,
+                            args=(a, log, True), daemon=True
+                        ).start()
+                _warmed_agents.update(current)
+
+            # World yeni region'ları çıktıysa tazele (oyun genişledi)
+            _fill_all_agents()
+        except Exception as e:
+            log(f"[Pool] ⚠️  Cache warm döngü hatası: {e}")
 
 
 def _pool_auto_optimize():

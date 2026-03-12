@@ -38,7 +38,9 @@ NODE_ID      = (
 )
 
 DATA_DIR     = Path("/agent_data")          # Dosya deposu
-RAM_CACHE_MB  = int(os.environ.get("RAM_CACHE_MB",   "256"))  # RAM önbelleği boyutu
+# Agent 382MB free RAM'e sahip. Cache için 350MB ayır (32MB Flask/OS büyümesi için bırak).
+# Ana sunucu bu limiti agent'ın /api/cache/stats endpoint'inden okur.
+RAM_CACHE_MB  = int(os.environ.get("RAM_CACHE_MB",   "350"))  # RAM önbelleği boyutu
 RAM_LIMIT_MB  = int(os.environ.get("RAM_LIMIT_MB",   "512"))  # Render plan RAM kotası
 DISK_LIMIT_GB = float(os.environ.get("DISK_LIMIT_GB", "17.5")) # Render plan Disk kotası
 AGENT_OVERHEAD_MB = 130  # Flask + psutil + OS taban kullanımı (~130MB)
