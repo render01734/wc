@@ -467,7 +467,26 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
         except:
             return False
 
-    # 1. Server JAR — ATLA (47MB × N_agent = OOM, MC lokal diskten okur)
+    # 1. Server JAR — 4MB chunk'larla gönder
+    # read_bytes() = 47MB tek seferde panel RAM'ine → OOM
+    # chunk okuma = panel'de max 4MB → sonra GC atar
+    _CHUNK_MB = 4 * 1024 * 1024
+    if MC_JAR.exists():
+        try:
+            import gc as _gc
+            jar_size  = MC_JAR.stat().st_size
+            n_chunks  = (jar_size + _CHUNK_MB - 1) // _CHUNK_MB
+            with open(MC_JAR, "rb") as _jf:
+                for _ci in range(n_chunks):
+                    _chunk = _jf.read(_CHUNK_MB)
+                    if not _chunk:
+                        break
+                    _send(f"mc/jar/c{_ci:04d}", _chunk)
+                    del _chunk; _gc.collect()  # hemen serbest bırak
+            _send("mc/jar/meta",
+                  f'{{"n":{n_chunks},"sz":{jar_size}}}'.encode())
+        except Exception as _je:
+            pass
 
     # 2. Config dosyaları
     for cfg in ["paper.yml", "spigot.yml", "bukkit.yml", "server.properties",
@@ -481,9 +500,7 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
     plugins_dir = MC_DIR / "plugins"
     if plugins_dir.exists():
         for pjar in sorted(plugins_dir.glob("*.jar"))[:20]:
-            try:
-                if pjar.stat().st_size <= 5 * 1024 * 1024:  # 5MB altı
-                    _send(f"mc/plugins/{pjar.name}", pjar.read_bytes())
+            try: _send(f"mc/plugins/{pjar.name}", pjar.read_bytes())
             except: pass
 
     # 4. World region dosyaları — ASIL DOLDURMA ─────────────────────────────
@@ -520,8 +537,6 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
                     continue  # Başka agent'ın payı
                 key = f"mc/region/{dim_name}/{rf.name}"
                 try:
-                    if rf.stat().st_size > 8 * 1024 * 1024:
-                        continue  # 8MB üstü atla
                     _send(key, rf.read_bytes())
                 except: pass
 
@@ -537,7 +552,7 @@ def _ram_cache_warm_loop():
     Tüm agent cache'lerini paralel doldur.
     Her 5 dakikada bir yeni region'ları ve yeni agentları güncelle.
     """
-    # ── Adım 1: JAR + en az 1 agent bekle ───────────────────────────────
+    # MC JAR + en az 1 agent hazır olana kadar bekle (max 15 dk)
     for _ in range(900):
         if MC_JAR.exists() and _pool.agent_count() > 0:
             break
@@ -546,21 +561,17 @@ def _ram_cache_warm_loop():
         log("[Pool] ⚠️  Cache warm: JAR veya agent 15dk içinde hazır olmadı")
         return
 
-    # ── Adım 2: MC "running" durumuna geçene kadar bekle ──────────────
-    # MC başlangıç peak'i sırasında cache warm YAPMA — RAM dolup restart olur.
-    # "Done" mesajı geldiğinde server_state["status"] = "running" olur.
+    # MC "Done" mesajına kadar bekle — başlangıç peak'inde cache warm yapma
     log("[Pool] 🕐 Cache warm: MC tam başlayana kadar bekliyor...")
-    for _ in range(600):  # max 10 dk
+    for _ in range(600):   # max 10 dk
         if server_state.get("status") == "running":
             break
         time.sleep(1)
     else:
-        log("[Pool] ⚠️  Cache warm: MC 10dk içinde başlamadı, atlanıyor")
+        log("[Pool] ⚠️  Cache warm: MC 10dk içinde hazır olmadı, atlandı")
         return
-
-    # ── Adım 3: World dosyaları diske yazılsın, RAM sakinleşsin ───────
-    # "Done"dan 90sn sonra region .mca dosyaları oluşmuş olur.
-    log("[Pool] 🕐 Cache warm: 90sn bekleniyor (world I/O + GC sakinleşsin)...")
+    # 90sn bekle: world .mca dosyaları yazılsın + GC sakinleşsin
+    log("[Pool] 🕐 Cache warm: 90sn bekleniyor (world I/O + GC)...")
     time.sleep(90)
 
     def _fill_all_agents():
@@ -568,16 +579,17 @@ def _ram_cache_warm_loop():
         if not agents:
             return 0
         total = 0
-        # SERİ: paralel çalıştırmak N×buffer = OOM yapar
+        # SERİ: her agent bittikten sonra GC → max 1 agent buffer bellekte
         for a in agents:
             try:
                 n = _warm_single_agent(a, log_fn=log, fill_regions=True)
                 total += n
-                time.sleep(2)  # GC nefes
+                import gc as _gc2; _gc2.collect()
+                time.sleep(2)
             except Exception as _e:
                 log(f"[Pool] ⚠️  Cache warm {a.node_id}: {_e}")
         if total:
-            log(f"[Pool] 🧠 Cache: {len(agents)} agent, {total} dosya gönderildi")
+            log(f"[Pool] 🧠 Cache: {len(agents)} agent, {total} dosya")
             socketio.emit("pool_update", _pool_summary())
         return total
 
@@ -599,11 +611,10 @@ def _ram_cache_warm_loop():
                 for nid in new_ids:
                     a = _pool.agents.get(nid)
                     if a:
-                        try:
-                            _warm_single_agent(a, log_fn=log, fill_regions=True)
-                            time.sleep(2)
-                        except Exception as _ew:
-                            log(f"[Pool] ⚠️  Yeni agent warm {nid}: {_ew}")
+                        threading.Thread(
+                            target=_warm_single_agent,
+                            args=(a, log, True), daemon=True
+                        ).start()
                 _warmed_agents.update(current)
 
             # World yeni region'ları çıktıysa tazele (oyun genişledi)
@@ -908,27 +919,25 @@ def send_command(cmd: str) -> bool:
 def _ram_watchdog():
     import psutil
     _pressure_count = 0
-    _CONTAINER_RAM_MB = int(os.environ.get("CONTAINER_RAM_MB", "512"))
+    _CONTAINER_MB = int(os.environ.get("CONTAINER_RAM_MB", "512"))
     while True:
         eventlet.sleep(8)
         try:
-            # psutil.virtual_memory() RENDER'DA HOST'U okur (10-30GB) — YANLIŞ
-            # Kendi process RSS'ini ölç → gerçek container kullanımı
+            # psutil.virtual_memory() Render'da HOST'u okur (10-30GB) → YANLIŞ
+            # Kendi ve JVM process RSS'ini topla → gerçek container kullanımı
             try:
-                _my_rss = int(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
+                _panel_rss = int(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
             except:
-                _my_rss = 200
-            swp = psutil.swap_memory()
-            used_mb  = _my_rss
-            total_mb = _CONTAINER_RAM_MB
-            swap_pct = swp.percent if swp.total > 0 else 0
-
-            # MC JVM RSS'ini de ekle
+                _panel_rss = 200
+            _mc_rss = 0
             if mc_process and mc_process.poll() is None:
                 try:
-                    mc_rss = int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
-                    used_mb = _my_rss + mc_rss
+                    _mc_rss = int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
                 except: pass
+            used_mb  = _panel_rss + _mc_rss
+            total_mb = _CONTAINER_MB
+            swp = psutil.swap_memory()
+            swap_pct = swp.percent if swp.total > 0 else 0
 
             pressure = used_mb > (total_mb * 0.88) or swap_pct > 80
 
@@ -1087,7 +1096,7 @@ def api_agent_register():
         mc_host = tunnel_info.get("host", "")
         if mc_host and mc_process and mc_process.poll() is None:
             def _new_agent_proxy():
-                time.sleep(60)  # cache warm bitmesini bekle
+                time.sleep(3)
                 ok = agent_client.proxy_start(mc_host, 25565, 25565)
                 if ok:
                     log(f"[Pool] 🔀 Yeni agent proxy: {node_id} → {mc_host}:25565")
