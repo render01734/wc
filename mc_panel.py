@@ -46,9 +46,9 @@ server_state = {
 }
 
 # ── Resource Pool ─────────────────────────────────────────────
-# key: node_id  val: {url, node_id, healthy, last_ping, info:{ram,disk,cpu,proxy}}
-_agents: dict = {}
-_agents_lock  = threading.Lock()
+# resource_pool.py'deki ResourcePool singleton kullanılır.
+# _agents/_agents_lock KALDIRILDI → _pool.agents/_pool.lock kullanılıyor.
+from resource_pool import pool as _pool   # AgentClient + health monitor burada
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
@@ -149,193 +149,114 @@ def _ram_monitor():
 
 
 # ══════════════════════════════════════════════════════════════
-#  RESOURCE POOL — Agent yönetimi
+#  RESOURCE POOL — Agent yönetimi  (resource_pool.py'e delege edilir)
 # ══════════════════════════════════════════════════════════════
-
-def _pool_register(tunnel_url: str, node_id: str, info: dict):
-    with _agents_lock:
-        is_new = node_id not in _agents
-        _agents[node_id] = {
-            "url":       tunnel_url.rstrip("/"),
-            "node_id":   node_id,
-            "healthy":   True,
-            "last_ping": time.time(),
-            "connected_at": _agents.get(node_id, {}).get("connected_at", time.time()),
-            "info":      info,
-        }
-    return is_new
-
+# Tüm agent kaydı, heartbeat, sağlık izleme ve dosya işlemleri
+# resource_pool.ResourcePool (singleton: _pool) tarafından yönetilir.
+# mc_panel.py yalnızca Flask route'larını barındırır.
 
 def _pool_summary() -> dict:
-    with _agents_lock:
-        agents = list(_agents.values())
-    healthy = [a for a in agents if a["healthy"]]
-    total_ram_mb   = sum(a["info"].get("ram",  {}).get("free_mb",   0) for a in healthy)
-    total_disk_gb  = sum(a["info"].get("disk", {}).get("free_gb",   0) for a in healthy)
-    total_cache_mb = sum(a["info"].get("ram",  {}).get("cache_mb",  0) for a in healthy)
-    total_cpu      = sum(a["info"].get("cpu",  {}).get("cores",     0) for a in healthy)
+    """resource_pool.pool.summary() biçimini mc_panel uyumlu hale getirir."""
+    s = _pool.summary()
+    res = s.get("resources", {})
     return {
-        "total":    len(agents),
-        "healthy":  len(healthy),
+        "total":   s["total"],
+        "healthy": s["healthy"],
         "resources": {
-            "ram_free_mb":   total_ram_mb,
-            "disk_free_gb":  round(total_disk_gb, 1),
-            "cache_used_mb": total_cache_mb,
-            "cpu_cores":     total_cpu,
+            "ram_free_mb":   res.get("ram_free_mb",  0),
+            "disk_free_gb":  round(res.get("disk_free_gb", 0), 1),
+            "cache_used_mb": res.get("ram_cache_mb", 0),
+            "cpu_cores":     res.get("cpu_cores",    0),
         },
         "agents": [
             {
                 "node_id":      a["node_id"],
                 "url":          a["url"],
                 "healthy":      a["healthy"],
-                "connected_at": a["connected_at"],
-                "last_ping":    a["last_ping"],
-                "ram":          a["info"].get("ram",   {}),
-                "disk":         a["info"].get("disk",  {}),
-                "cpu":          a["info"].get("cpu",   {}),
-                "proxy":        a["info"].get("proxy", {}),
+                "connected_at": a.get("last_ok", 0),
+                "last_ping":    a.get("last_ok", 0),
+                "ram":          a.get("ram",   {}),
+                "disk":         a.get("disk",  {}),
+                "cpu":          a.get("cpu",   {}),
+                "proxy":        a.get("proxy", {}),
             }
-            for a in agents
+            for a in s["agents"]
         ],
     }
 
 
-def _agent_req(agent: dict, method: str, path: str,
-               data: bytes = None, headers: dict = None, timeout: int = 15):
-    try:
-        req = _urllib_req.Request(
-            agent["url"] + path,
-            data=data,
-            headers={"Content-Type": "application/octet-stream", **(headers or {})},
-            method=method,
-        )
-        with _urllib_req.urlopen(req, timeout=timeout) as r:
-            agent["healthy"]   = True
-            agent["last_ping"] = time.time()
-            return r.read()
-    except Exception as e:
-        agent["healthy"] = False
-        return None
-
-
-def _agent_json(agent: dict, method: str, path: str,
-                body: dict = None, timeout: int = 15):
-    raw = _agent_req(
-        agent, method, path,
-        data=json.dumps(body).encode() if body else None,
-        headers={"Content-Type": "application/json"},
-        timeout=timeout,
-    )
-    if raw:
-        try: return json.loads(raw)
-        except: pass
-    return None
-
-
-def _best_agent_by_disk() -> dict | None:
-    with _agents_lock:
-        agents = [a for a in _agents.values() if a["healthy"]]
-    if not agents:
-        return None
-    return max(agents, key=lambda a: a["info"].get("disk", {}).get("free_gb", 0))
-
-
-def _best_agent_by_ram() -> dict | None:
-    with _agents_lock:
-        agents = [a for a in _agents.values() if a["healthy"]]
-    if not agents:
-        return None
-    return min(agents, key=lambda a: a["info"].get("ram", {}).get("cache_mb", 9999))
-
-
-def _pool_health_watchdog():
-    """Arka planda agent sağlığını izle."""
-    while True:
-        time.sleep(35)
-        with _agents_lock:
-            agents = list(_agents.values())
-        for ag in agents:
-            r = _agent_json(ag, "GET", "/api/status", timeout=8)
-            if r:
-                ag["info"]      = r
-                ag["healthy"]   = True
-                ag["last_ping"] = time.time()
-            else:
-                # 90sn yanıt yoksa unhealthy
-                if time.time() - ag["last_ping"] > 90:
-                    ag["healthy"] = False
-        socketio.emit("pool_update", _pool_summary())
-
-
-def _pool_auto_optimize():
-    """
-    Periyodik olarak:
-    1. Eski region'ları agent'a taşı → ana sunucuda disk aç → swap büyüt
-    2. Düşük RAM'de JVM dışı cache devreye girer
-    """
-    time.sleep(120)   # Sunucu stabil olana kadar bekle
-    while True:
-        try:
-            _auto_archive_old_regions()
-        except Exception as e:
-            log(f"[Pool] ⚠️  Otomatik arşiv hatası: {e}")
-        time.sleep(600)   # 10 dakikada bir
-
-
 def _auto_archive_old_regions(older_than_days: int = 5):
+    """
+    Ana sunucudaki eski region dosyalarını en fazla boş diski olan
+    agent'a yükler. Ardından açılan disk alanını swap'a dönüştürür.
+    resource_pool._most_disk() + store_region() kullanır.
+    """
     import shutil as _sh
-    best = _best_agent_by_disk()
-    if not best:
-        return
+    best_agent = _pool._most_disk()
+    if not best_agent:
+        return None
     free_gb = _sh.disk_usage("/").free / 1e9
     if free_gb > 8.0:
-        return   # Yeterli yer var, gerek yok
+        return None   # Yeterli yer var
 
-    archived  = 0
-    freed_mb  = 0
-    now       = time.time()
+    archived = 0
+    freed_mb = 0
+    now      = time.time()
 
     for dim_dir in [MC_DIR / "world" / "region",
                     MC_DIR / "world_nether" / "DIM-1" / "region",
                     MC_DIR / "world_the_end" / "DIM1" / "region"]:
         if not dim_dir.exists():
             continue
-        dim = dim_dir.parts[-3]   # world / world_nether / world_the_end
+        dim = dim_dir.parts[-3]
 
         for rf in sorted(dim_dir.glob("*.mca"), key=lambda f: f.stat().st_mtime):
             if (now - rf.stat().st_mtime) / 86400 < older_than_days:
                 continue
+            if _pool.region_exists_remote(dim, rf.name):
+                continue   # Zaten uzakta
             try:
-                data = rf.read_bytes()
-                url  = best["url"] + f"/api/files/regions/{dim}/{rf.name}"
-                req  = _urllib_req.Request(url, data=data, method="PUT",
-                                           headers={"Content-Type": "application/octet-stream"})
-                _urllib_req.urlopen(req, timeout=120)
-                rf.unlink()
-                freed_mb += len(data) / 1e6
-                archived  += 1
-            except Exception as e:
-                continue   # sessiz hata
+                ok = _pool.store_region(dim, rf)
+                if ok:
+                    freed_mb += rf.stat().st_size / 1e6
+                    rf.unlink()
+                    archived += 1
+            except Exception:
+                continue
 
     if archived > 0:
-        # Swap dosyası büyüt
         new_free_gb = _sh.disk_usage("/").free / 1e9
-        sw_mb       = min(6144, int(new_free_gb * 0.7 * 1024))
-        sf2         = "/swapfile2"
+        sw_mb = min(6144, int(new_free_gb * 0.7 * 1024))
+        sf2   = "/swapfile2"
         subprocess.run(f"swapoff {sf2} 2>/dev/null", shell=True)
         try:
             if Path(sf2).exists(): Path(sf2).unlink()
         except: pass
-        r = subprocess.run(f"fallocate -l {sw_mb}M {sf2} && chmod 600 {sf2} && "
-                           f"mkswap -f {sf2} && swapon -p 1 {sf2}",
-                           shell=True, capture_output=True)
+        r = subprocess.run(
+            f"fallocate -l {sw_mb}M {sf2} && chmod 600 {sf2} && mkswap -f {sf2} && swapon -p 1 {sf2}",
+            shell=True, capture_output=True
+        )
         if r.returncode == 0:
-            log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB boşaltıldı) "
-                f"→ yeni swap dosyası: {sw_mb}MB")
+            log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB) → swap: {sw_mb}MB")
         else:
             log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB)")
 
     return archived, freed_mb
+
+
+def _pool_auto_optimize():
+    """
+    Periyodik bölge arşivleme.
+    _pool_health_watchdog KALDIRILDI → resource_pool.health_monitor() zaten çalışıyor.
+    """
+    time.sleep(120)
+    while True:
+        try:
+            _auto_archive_old_regions()
+            socketio.emit("pool_update", _pool_summary())
+        except Exception as e:
+            log(f"[Pool] ⚠️  Otomatik arşiv hatası: {e}")
+        time.sleep(600)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -435,8 +356,7 @@ def get_jvm_args():
     xms_mb = 32   # Düşük başla, ihtiyaç oldukça büyüsün
 
     # Agent pool varsa view-distance düşür → daha az chunk → daha az JVM
-    with _agents_lock:
-        agent_count = len([a for a in _agents.values() if a["healthy"]])
+    agent_count = _pool.agent_count()
     if agent_count >= 2:
         log(f"[Panel] 🔗 {agent_count} agent mevcut → Xmx artırılabilir")
         xmx_mb = min(xmx_mb + 32, 340)   # Agent varsa +32MB
@@ -659,7 +579,9 @@ def api_agent_register():
     node_id    = d.get("node_id", "")
     if not tunnel_url or not node_id:
         return jsonify({"ok": False, "error": "tunnel veya node_id eksik"})
-    is_new = _pool_register(tunnel_url, node_id, d)
+    _pool.set_logger(log)
+    is_new = node_id not in _pool.agents
+    _pool.register(tunnel_url, node_id, d)
     if is_new:
         log(f"[Pool] ✅ Yeni agent: {node_id} | "
             f"RAM:{d.get('ram',{}).get('free_mb',0)}MB | "
@@ -673,7 +595,8 @@ def api_agent_register():
 def api_agent_heartbeat():
     d = request.json or {}
     if d.get("node_id") and d.get("tunnel"):
-        _pool_register(d["tunnel"], d["node_id"], d)
+        _pool.set_logger(log)
+        _pool.register(d["tunnel"], d["node_id"], d)
     socketio.emit("pool_update", _pool_summary())
     return jsonify({"ok": True})
 
@@ -686,29 +609,22 @@ def api_pool_status():
 @app.route("/api/pool/cache/stats")
 def api_pool_cache_stats():
     stats = []
-    with _agents_lock:
-        agents = list(_agents.values())
-    for ag in agents:
-        r = _agent_json(ag, "GET", "/api/cache/stats")
+    for ag in _pool.get_agents(healthy_only=False):
+        r = ag.cache_stats()
         if r:
-            r["node_id"] = ag["node_id"]
+            r["node_id"] = ag.node_id
             stats.append(r)
     return jsonify({
         "agents":     stats,
-        "total_keys": sum(s.get("keys",   0) for s in stats),
-        "total_mb":   sum(s.get("used_mb",0) for s in stats),
+        "total_keys": sum(s.get("keys",    0) for s in stats),
+        "total_mb":   sum(s.get("used_mb", 0) for s in stats),
     })
 
 
 @app.route("/api/pool/cache/flush", methods=["POST"])
 def api_pool_cache_flush():
     prefix = (request.json or {}).get("prefix", "")
-    total  = 0
-    with _agents_lock:
-        agents = list(_agents.values())
-    for ag in agents:
-        r = _agent_json(ag, "POST", "/api/cache/flush", {"prefix": prefix})
-        total += (r or {}).get("flushed", 0)
+    total  = _pool.cache_flush_all(prefix)
     log(f"[Pool] 🗑️  {total} önbellek anahtarı temizlendi")
     return jsonify({"ok": True, "flushed": total})
 
@@ -716,12 +632,10 @@ def api_pool_cache_flush():
 @app.route("/api/pool/storage")
 def api_pool_storage():
     result = []
-    with _agents_lock:
-        agents = list(_agents.values())
-    for ag in agents:
-        r = _agent_json(ag, "GET", "/api/files/storage/stats")
+    for ag in _pool.get_agents(healthy_only=False):
+        r = ag.storage_stats()
         if r:
-            r["node_id"] = ag["node_id"]
+            r["node_id"] = ag.node_id
             result.append(r)
     return jsonify({"agents": result})
 
@@ -729,23 +643,13 @@ def api_pool_storage():
 @app.route("/api/pool/task", methods=["POST"])
 def api_pool_task():
     d = request.json or {}
-    with _agents_lock:
-        agents = [a for a in _agents.values() if a["healthy"]]
-    if not agents:
-        return jsonify({"ok": False, "error": "Aktif agent yok"})
-    import hashlib as _hlib
-    key = d.get("type","") + str(d.get("payload",""))
-    ag  = agents[int(_hlib.md5(key.encode()).hexdigest(),16) % len(agents)]
-    r   = _agent_json(ag, "POST", "/api/cpu/submit", d)
-    if not r:
-        return jsonify({"ok": False, "error": "Görev gönderilemedi"})
-    task_id = r.get("task_id")
-    for _ in range(30):
-        time.sleep(1)
-        res = _agent_json(ag, "GET", f"/api/cpu/result/{task_id}")
-        if res and res.get("status") == "done":
-            return jsonify({"ok": True, "result": res.get("result")})
-    return jsonify({"ok": True, "task_id": task_id, "status": "pending"})
+    result = _pool.run_task(
+        d.get("type", "echo"),
+        d.get("payload", {}),
+        wait=d.get("wait", True),
+        timeout=d.get("timeout", 30),
+    )
+    return jsonify({"ok": result is not None, "result": result})
 
 
 @app.route("/api/pool/proxy/start", methods=["POST"])
@@ -753,24 +657,14 @@ def api_pool_proxy_start():
     d    = request.json or {}
     host = d.get("host", "127.0.0.1")
     port = int(d.get("port", 25565))
-    with _agents_lock:
-        agents = list(_agents.values())
-    started = []
-    for ag in agents:
-        r = _agent_json(ag, "POST", "/api/proxy/start",
-                        {"host": host, "port": port, "listen_port": 25565})
-        if r and r.get("ok"):
-            started.append(ag["node_id"])
-            log(f"[Pool] 🔀 Proxy: {ag['node_id']} → {host}:{port}")
+    started = _pool.start_proxies(host, port)
+    log(f"[Pool] 🔀 {len(started)} agent'ta proxy başlatıldı")
     return jsonify({"ok": True, "started": started})
 
 
 @app.route("/api/pool/proxy/stop", methods=["POST"])
 def api_pool_proxy_stop():
-    with _agents_lock:
-        agents = list(_agents.values())
-    for ag in agents:
-        _agent_json(ag, "POST", "/api/proxy/stop")
+    _pool.stop_proxies()
     return jsonify({"ok": True})
 
 
@@ -1042,8 +936,8 @@ def api_performance():
                 }
             except: pass
 
-        pool = _pool_summary()
-        res  = pool.get("resources", {})
+        pool_info = _pool_summary()
+        res  = pool_info.get("resources", {})
 
         # ── Birleşik (ana + tüm agentlar) hesaplama ─────────────
         main_ram_free_mb  = int(vm.available / 1024 / 1024)
@@ -1053,24 +947,23 @@ def api_performance():
         combined_ram_mb   = main_ram_free_mb  + agent_ram_mb
         combined_disk_gb  = round(main_disk_free_gb + agent_disk_gb, 1)
 
-        # Agent başına detay
+        # Agent başına detay — resource_pool.AgentClient kullanılır
         agents_detail = []
-        with _agents_lock:
-            for a in _agents.values():
-                r   = a["info"].get("ram",  {})
-                d_  = a["info"].get("disk", {})
-                c   = a["info"].get("cpu",  {})
-                agents_detail.append({
-                    "node_id":    a["node_id"],
-                    "healthy":    a["healthy"],
-                    "ram_free":   r.get("free_mb",  0),
-                    "ram_cache":  r.get("cache_mb", 0),
-                    "disk_free":  round(d_.get("free_gb",  0), 1),
-                    "disk_store": round(d_.get("store_gb", 0), 1),
-                    "cpu_load":   c.get("load1", 0),
-                    "cpu_cores":  c.get("cores", 0),
-                    "last_ping":  int(time.time() - a["last_ping"]),
-                })
+        for a in _pool.get_agents(healthy_only=False):
+            r   = a.info.get("ram",  {})
+            d_  = a.info.get("disk", {})
+            c   = a.info.get("cpu",  {})
+            agents_detail.append({
+                "node_id":    a.node_id,
+                "healthy":    a.healthy,
+                "ram_free":   r.get("free_mb",  0),
+                "ram_cache":  r.get("cache_mb", 0),
+                "disk_free":  round(d_.get("free_gb",  0), 1),
+                "disk_store": round(d_.get("store_gb", 0), 1),
+                "cpu_load":   c.get("load1", 0),
+                "cpu_cores":  c.get("cores", 0),
+                "last_ping":  int(time.time() - a.last_ok),
+            })
 
         return jsonify({
             # Ana sunucu
@@ -1094,7 +987,7 @@ def api_performance():
             "tps5":          server_state["tps5"],
             "tps15":         server_state["tps15"],
             # Pool (agentlar)
-            "pool_agents":   pool["healthy"],
+            "pool_agents":   pool_info["healthy"],
             "pool_ram_mb":   agent_ram_mb,
             "pool_disk_gb":  agent_disk_gb,
             "pool_cache_mb": res.get("cache_used_mb", 0),
@@ -2010,8 +1903,9 @@ init();
 
 threading.Thread(target=_ram_monitor,        daemon=True).start()
 threading.Thread(target=_ram_watchdog,       daemon=True).start()
-threading.Thread(target=_pool_health_watchdog, daemon=True).start()
+# _pool_health_watchdog KALDIRILDI: resource_pool.health_monitor() zaten arka planda çalışıyor
 threading.Thread(target=_pool_auto_optimize, daemon=True).start()
+_pool.set_logger(log)   # Panel log fonksiyonunu pool'a inject et
 
 if __name__ == "__main__":
     MC_DIR.mkdir(parents=True, exist_ok=True)

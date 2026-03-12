@@ -11,6 +11,10 @@ Akış:
   3. cloudflared TCP tüneli → URL al
   4. URL'i MAIN_URL'e bildir (/api/worker/register)
   5. Sağlık endpoint'i tut (Render uyku yapmaya devam etsin)
+
+⚠️  DEPRECATED (v10.0): Bu dosya artık kullanılmamaktadır.
+   Kullanılacak dosya: agent.py
+   NBD kaldırıldı → HTTP tabanlı Resource Pool kullanılıyor.
 """
 
 import os, sys, subprocess, time, re, threading, json

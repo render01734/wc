@@ -8,6 +8,6 @@ services:
       - key: PORT
         value: "5000"
       - key: MC_RAM
-        value: "2G"
+        value: "300M"  # JVM Xmx cap: 300MB (Render free 512MB limit)
     healthCheckPath: /
     numInstances: 1
