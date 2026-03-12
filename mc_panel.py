@@ -139,33 +139,50 @@ void* mmap(void *addr,size_t length,int prot,int flags,int fd,off_t offset){
 
 def _build_userswap():
     """
-    userswap.so derlenmemişse derle.
-    LD_PRELOAD ile JVM'in anonim mmap'lerini dosya destekli yapar → Userspace Swap.
+    userswap.so önce build-time konumunda arar (/usr/local/lib/).
+    Bulunamazsa runtime'da derlemeyi dener (fallback).
     """
     import shutil
+    # 1. Build-time derleme başarılıysa doğrudan kullan
     if Path(USERSWAP_SO).exists():
+        log(f"[UserSwap] ✅ {USERSWAP_SO} hazır")
         return True
+
+    log("[UserSwap] ⚠️  Build-time .so bulunamadı → runtime derleme deneniyor...")
+
+    # 2. gcc yoksa kur (libc6-dev de gerekli dlfcn.h için)
     if not shutil.which("gcc"):
-        # gcc yok → apt ile kur
-        r = subprocess.run("apt-get install -y gcc 2>/dev/null", shell=True, capture_output=True)
-        if not shutil.which("gcc"):
-            log("[UserSwap] ⚠️  gcc bulunamadı — userswap devre dışı")
-            return False
+        subprocess.run(
+            "apt-get install -y --no-install-recommends gcc libc6-dev 2>/dev/null",
+            shell=True, capture_output=True
+        )
+    if not shutil.which("gcc"):
+        log("[UserSwap] ❌ gcc yok — userswap devre dışı (LD_PRELOAD atlanacak)")
+        return False
+
     try:
         src_path = Path("/tmp/userswap.c")
-        src_path.write_text(_USERSWAP_C)
+        # Önce /app/userswap.c varsa onu kullan, yoksa gömülü kodu yaz
+        if Path("/app/userswap.c").exists():
+            import shutil as _sh
+            _sh.copy("/app/userswap.c", src_path)
+        else:
+            src_path.write_text(_USERSWAP_C)
+
+        os.makedirs("/usr/local/lib", exist_ok=True)
         r = subprocess.run(
             f"gcc -O2 -shared -fPIC -o {USERSWAP_SO} {src_path} -ldl -lpthread",
             shell=True, capture_output=True
         )
         if r.returncode == 0:
-            log(f"[UserSwap] ✅ userswap.so derlendi → {USERSWAP_SO}")
+            log(f"[UserSwap] ✅ Runtime derleme OK → {USERSWAP_SO}")
             return True
         else:
-            log(f"[UserSwap] ⚠️  Derleme hatası: {r.stderr.decode()[:120]}")
+            err = r.stderr.decode()[:200]
+            log(f"[UserSwap] ❌ Derleme hatası: {err}")
             return False
     except Exception as e:
-        log(f"[UserSwap] ⚠️  {e}")
+        log(f"[UserSwap] ❌ {e}")
         return False
 
 app = Flask(__name__)

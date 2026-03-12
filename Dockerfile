@@ -37,7 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ── ADIM 4: socat + gcc (ağ araçları + userswap derleyici) ─
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    socat gcc \
+    socat gcc libc6-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ── ADIM 5: Python paketleri ───────────────────────────────
