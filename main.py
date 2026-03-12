@@ -396,7 +396,34 @@ def support_create_disk():
     print(f"  [destek] ✅ Blok dosya hazır: {gb:.1f}GB")
 
 
+def support_install_tools():
+    """nbd-server ve socat kurulu değilse apt ile otomatik kur."""
+    import shutil as _shutil
+    missing = []
+    if not _shutil.which("nbd-server"): missing.append("nbd-server")
+    if not _shutil.which("socat"):      missing.append("socat")
+    if not _shutil.which("nbd-client"): missing.append("nbd-client")
+
+    if missing:
+        print(f"  [destek] 📦 Kurulum başlıyor: {', '.join(missing)}...")
+        ret = sh(
+            "apt-get update -qq 2>/dev/null && "
+            f"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+            f"{' '.join(missing)}"
+        )
+        if ret.returncode == 0:
+            print(f"  [destek] ✅ Kuruldu: {', '.join(missing)}")
+        else:
+            out = (ret.stdout.decode() + ret.stderr.decode())[-400:]
+            print(f"  [destek] ⚠️  Kurulum hatası: {out}")
+    else:
+        print("  [destek] ✅ nbd-server + socat zaten kurulu")
+
+
 def support_start_nbd():
+    # Araçları kur (kurulu değilse)
+    support_install_tools()
+
     sh("modprobe nbd max_part=0 2>/dev/null")
 
     # ── nbd-server dene ────────────────────────────────────────
