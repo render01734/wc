@@ -294,17 +294,17 @@ def _setup_swap():
 
 def get_jvm_args():
     import psutil
-    mem     = psutil.virtual_memory()
-    swp     = psutil.swap_memory()
-    ram_mb  = int(mem.total  / 1024 / 1024)
-    swap_mb = int(swp.total  / 1024 / 1024)
-    # RAM + Swap toplamının %75'ini JVM'e ver
-    pool_mb = ram_mb + swap_mb
-    xmx_mb  = max(256, int(pool_mb * 0.75))
-    xms_mb  = max(128, int(xmx_mb  * 0.40))
+    mem       = psutil.virtual_memory()
+    swp       = psutil.swap_memory()
+    total_mb  = int(mem.total / 1024 / 1024)
+    os_mb     = 100                                 # OS için sabit 100MB
+    ram_for_mc = max(0, total_mb - os_mb)           # RAM'den MC'ye kalan
+    swap_mb   = int(swp.free  / 1024 / 1024)       # boş swap
+    xmx_mb    = max(512, ram_for_mc + swap_mb)      # RAM artığı + swap
+    xms_mb    = max(256, int(xmx_mb * 0.40))
     xmx = f"{xmx_mb}M"
     xms = f"{xms_mb}M"
-    log(f"[Panel] 🧠 RAM={ram_mb}MB + Swap={swap_mb}MB = {pool_mb}MB havuz  →  Xms={xms}  Xmx={xmx}")
+    log(f"[Panel] 🧠 Toplam={total_mb}MB  OS=300MB  MC RAM={ram_for_mc}MB  Swap={swap_mb}MB  →  Xms={xms} Xmx={xmx}")
     return [
         "java",
         f"-Xms{xms}", f"-Xmx{xmx}",
