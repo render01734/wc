@@ -35,10 +35,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* /usr/share/doc/* \
               /usr/share/man/* /usr/share/info/*
 
-# ── ADIM 4: socat (ağ araçları) ────────────────────────────
-# NOT: NBD v10.0'da kaldırıldı — kernel modülü gerekmez
+# ── ADIM 4: socat + gcc (ağ araçları + userswap derleyici) ─
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    socat \
+    socat gcc \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ── ADIM 5: Python paketleri ───────────────────────────────
@@ -63,6 +62,15 @@ COPY main.py          /app/main.py
 COPY mc_panel.py      /app/mc_panel.py
 COPY agent.py         /app/agent.py
 COPY resource_pool.py /app/resource_pool.py
+COPY userswap.c       /app/userswap.c
+
+# ── userswap.so'yu build aşamasında derle ──────────────────
+# Runtime'da gcc gerekmez, LD_PRELOAD her zaman çalışır.
+RUN mkdir -p /usr/local/lib \
+    && gcc -O2 -shared -fPIC -o /usr/local/lib/userswap.so \
+           /app/userswap.c -ldl -lpthread \
+    && echo '[Dockerfile] userswap.so OK' \
+    || echo '[Dockerfile] UYARI: userswap.so derlenemedi'
 
 WORKDIR /app
 EXPOSE 5000

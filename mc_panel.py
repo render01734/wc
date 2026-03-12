@@ -607,8 +607,16 @@ def get_jvm_args():
     xms_mb = 32
 
     log(f"[Panel] 🧠 Container={container_ram_mb}MB Swap=0MB Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
-    return [
-        "env", f"LD_PRELOAD={USERSWAP_SO}", "java",
+    # LD_PRELOAD: sadece userswap.so gerçekten varsa ekle
+    # Yoksa Java alt-process'leri de hata verir (LD_PRELOAD inherit edilir)
+    import os as _os
+    java_cmd = []
+    if _os.path.exists(USERSWAP_SO):
+        java_cmd = ["env", f"LD_PRELOAD={USERSWAP_SO}"]
+    else:
+        log("[UserSwap] ⚠️  userswap.so bulunamadı — LD_PRELOAD atlandı")
+    java_cmd.append("java")
+    return java_cmd + [
         f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
         # ── Bellek alanları (512MB container için kesin sınırlar) ──
         # Toplam JVM RSS ≈ Xmx(220) + Meta(96) + Code(28) + Class(24) + Stacks(14) = 382MB
