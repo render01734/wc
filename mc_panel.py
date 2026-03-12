@@ -467,9 +467,7 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
         except:
             return False
 
-    # 1. Server JAR — ATLA: 47MB × N_agent = OOM (ana sunucu 512MB limit)
-    # JAR agentlarda cache'lenmez, MC sadece lokal diskten okur.
-    # (server.jar gönderilmiyor)
+    # 1. Server JAR — ATLA (47MB × N_agent = OOM, MC lokal diskten okur)
 
     # 2. Config dosyaları
     for cfg in ["paper.yml", "spigot.yml", "bukkit.yml", "server.properties",
@@ -523,7 +521,7 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
                 key = f"mc/region/{dim_name}/{rf.name}"
                 try:
                     if rf.stat().st_size > 8 * 1024 * 1024:
-                        continue  # 8MB üstü .mca dosyaları atla
+                        continue  # 8MB üstü atla
                     _send(key, rf.read_bytes())
                 except: pass
 
@@ -539,7 +537,7 @@ def _ram_cache_warm_loop():
     Tüm agent cache'lerini paralel doldur.
     Her 5 dakikada bir yeni region'ları ve yeni agentları güncelle.
     """
-    # MC JAR + en az 1 agent hazır olana kadar bekle (max 15 dk)
+    # ── Adım 1: JAR + en az 1 agent bekle ───────────────────────────────
     for _ in range(900):
         if MC_JAR.exists() and _pool.agent_count() > 0:
             break
@@ -548,23 +546,38 @@ def _ram_cache_warm_loop():
         log("[Pool] ⚠️  Cache warm: JAR veya agent 15dk içinde hazır olmadı")
         return
 
-    time.sleep(10)  # MC başlasın + world dosyaları oluşsun
+    # ── Adım 2: MC "running" durumuna geçene kadar bekle ──────────────
+    # MC başlangıç peak'i sırasında cache warm YAPMA — RAM dolup restart olur.
+    # "Done" mesajı geldiğinde server_state["status"] = "running" olur.
+    log("[Pool] 🕐 Cache warm: MC tam başlayana kadar bekliyor...")
+    for _ in range(600):  # max 10 dk
+        if server_state.get("status") == "running":
+            break
+        time.sleep(1)
+    else:
+        log("[Pool] ⚠️  Cache warm: MC 10dk içinde başlamadı, atlanıyor")
+        return
+
+    # ── Adım 3: World dosyaları diske yazılsın, RAM sakinleşsin ───────
+    # "Done"dan 90sn sonra region .mca dosyaları oluşmuş olur.
+    log("[Pool] 🕐 Cache warm: 90sn bekleniyor (world I/O + GC sakinleşsin)...")
+    time.sleep(90)
 
     def _fill_all_agents():
         agents = _pool.get_agents()
         if not agents:
             return 0
         total = 0
-        # SERİ işle — paralel değil! Paralel: N×47MB = OOM → restart
+        # SERİ: paralel çalıştırmak N×buffer = OOM yapar
         for a in agents:
             try:
                 n = _warm_single_agent(a, log_fn=log, fill_regions=True)
                 total += n
-                time.sleep(2)  # GC nefes al
+                time.sleep(2)  # GC nefes
             except Exception as _e:
                 log(f"[Pool] ⚠️  Cache warm {a.node_id}: {_e}")
         if total:
-            log(f"[Pool] 🧠 Cache tamamlandı: {len(agents)} agent, toplam {total} dosya")
+            log(f"[Pool] 🧠 Cache: {len(agents)} agent, {total} dosya gönderildi")
             socketio.emit("pool_update", _pool_summary())
         return total
 
@@ -895,18 +908,29 @@ def send_command(cmd: str) -> bool:
 def _ram_watchdog():
     import psutil
     _pressure_count = 0
+    _CONTAINER_RAM_MB = int(os.environ.get("CONTAINER_RAM_MB", "512"))
     while True:
         eventlet.sleep(8)
         try:
-            mem = psutil.virtual_memory()
+            # psutil.virtual_memory() RENDER'DA HOST'U okur (10-30GB) — YANLIŞ
+            # Kendi process RSS'ini ölç → gerçek container kullanımı
+            try:
+                _my_rss = int(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
+            except:
+                _my_rss = 200
             swp = psutil.swap_memory()
-            used_mb  = int(mem.used  / 1024 / 1024)
-            total_mb = int(mem.total / 1024 / 1024)
+            used_mb  = _my_rss
+            total_mb = _CONTAINER_RAM_MB
             swap_pct = swp.percent if swp.total > 0 else 0
 
-            # Render free = 512MB. Python ~150MB kullanıyor.
-            # MC 280MB kullanıyorsa toplam ~430MB → %84 → uyar
-            pressure = used_mb > (total_mb * 0.85) or swap_pct > 80
+            # MC JVM RSS'ini de ekle
+            if mc_process and mc_process.poll() is None:
+                try:
+                    mc_rss = int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
+                    used_mb = _my_rss + mc_rss
+                except: pass
+
+            pressure = used_mb > (total_mb * 0.88) or swap_pct > 80
 
             if pressure:
                 _pressure_count += 1
@@ -994,6 +1018,11 @@ def api_internal_tunnel():
     return jsonify({"ok": True})
 
 
+@app.route("/api/ping")
+def api_ping():
+    return {"ok": True, "t": int(time.time())}, 200
+
+
 @app.route("/api/internal/status_msg", methods=["POST"])
 def api_internal_status_msg():
     msg = (request.json or {}).get("msg", "")
@@ -1058,8 +1087,7 @@ def api_agent_register():
         mc_host = tunnel_info.get("host", "")
         if mc_host and mc_process and mc_process.poll() is None:
             def _new_agent_proxy():
-                # Cache warm (~30-60sn) bitene kadar bekle
-                time.sleep(60)
+                time.sleep(60)  # cache warm bitmesini bekle
                 ok = agent_client.proxy_start(mc_host, 25565, 25565)
                 if ok:
                     log(f"[Pool] 🔀 Yeni agent proxy: {node_id} → {mc_host}:25565")
