@@ -23,19 +23,8 @@ from pathlib import Path
 import eventlet
 eventlet.monkey_patch()
 
-# ── Render.com 512MB limiti — Python panel adres alanını sınırla ─────────────
-# Panel (Python) + JVM birlikte 512MB paylaşır.
-# Bu limit sadece Python process'e uygulanır (JVM ayrı subprocess).
-import resource as _resource
-try:
-    _PANEL_LIMIT = 480 * 1024 * 1024   # 480MB — 32MB buffer
-    _s, _h = _resource.getrlimit(_resource.RLIMIT_AS)
-    if _h == _resource.RLIM_INFINITY or _h > _PANEL_LIMIT:
-        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _PANEL_LIMIT))
-except Exception:
-    pass  # Bazı ortamlarda izin yok — devam et
-
 from flask import Flask, request, jsonify, send_file, abort, Response
+from resource_pool import pool, pool_api
 from flask_socketio import SocketIO, emit
 
 # ── Ayarlar ───────────────────────────────────────────────────
@@ -45,10 +34,6 @@ MC_PORT    = 25565
 PANEL_PORT = int(os.environ.get("PORT", "5000"))
 MC_VERSION = "1.21.1"
 MC_RAM     = os.environ.get("MC_RAM", "2G")
-
-# ── Render plan limitleri (psutil host değil, tahsis edilen kapasite) ─
-RENDER_RAM_LIMIT_MB  = int(os.environ.get("CONTAINER_RAM_MB",    "512"))
-RENDER_DISK_LIMIT_GB = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
 
 # ── Global durum ─────────────────────────────────────────────
 mc_process   = None
@@ -62,136 +47,16 @@ server_state = {
 }
 
 # ── Resource Pool ─────────────────────────────────────────────
-# resource_pool.py'deki ResourcePool singleton kullanılır.
-# _agents/_agents_lock KALDIRILDI → _pool.agents/_pool.lock kullanılıyor.
-from resource_pool import pool as _pool   # AgentClient + health monitor burada
-
-# ── Userspace Swap (LD_PRELOAD) ───────────────────────────────────
-USERSWAP_SO  = "/usr/local/lib/userswap.so"
-USERSWAP_SRC = "/app/userswap.c"
-
-_USERSWAP_C = r"""
-#define _GNU_SOURCE
-#include <dlfcn.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <errno.h>
-#include <stdint.h>
-#include <pthread.h>
-
-#define SWAP_FILE     "/swapfile_mmap"
-#define SWAP_SIZE     (4L*1024L*1024L*1024L)
-#define MIN_INTERCEPT (256L*1024)
-
-static int             swap_fd  = -1;
-static off_t           swap_pos = 0;
-static pthread_mutex_t swap_mx  = PTHREAD_MUTEX_INITIALIZER;
-static void* (*real_mmap)(void*,size_t,int,int,int,off_t) = NULL;
-static volatile long stat_ok=0,stat_mb=0,stat_fb=0;
-
-__attribute__((constructor))
-static void userswap_init(void){
-    real_mmap=dlsym(RTLD_NEXT,"mmap");
-    if(!real_mmap)return;
-    struct stat st;
-    if(stat(SWAP_FILE,&st)==0&&st.st_size>=SWAP_SIZE){
-        swap_fd=open(SWAP_FILE,O_RDWR);
-        if(swap_fd>=0){fprintf(stderr,"[UserSwap] Mevcut 4GB swap kullaniliyor
-");return;}
-    }
-    swap_fd=open(SWAP_FILE,O_RDWR|O_CREAT|O_TRUNC,0600);
-    if(swap_fd<0){fprintf(stderr,"[UserSwap] open errno=%d
-",errno);return;}
-    fprintf(stderr,"[UserSwap] 4GB dosya swap olusturuluyor...
-");
-    if(posix_fallocate(swap_fd,0,SWAP_SIZE)!=0)(void)ftruncate(swap_fd,SWAP_SIZE);
-    fprintf(stderr,"[UserSwap] Userspace Swap hazir (4GB file-backed)
-");
-}
-
-__attribute__((destructor))
-static void userswap_fini(void){
-    if(swap_fd>=0){
-        fprintf(stderr,"[UserSwap] %ld intercept %ldMB %ld fb
-",stat_ok,stat_mb,stat_fb);
-        close(swap_fd);
-    }
-}
-
-void* mmap(void *addr,size_t length,int prot,int flags,int fd,off_t offset){
-    if(swap_fd>=0&&(flags&MAP_ANONYMOUS)&&!(flags&MAP_FIXED)
-       &&length>=(size_t)MIN_INTERCEPT&&(prot&(PROT_READ|PROT_WRITE))){
-        size_t aligned=(length+4095UL)&~4095UL;
-        off_t swap_off;
-        pthread_mutex_lock(&swap_mx);
-        int ok=(swap_pos+(off_t)aligned<=SWAP_SIZE);
-        if(ok){swap_off=swap_pos;swap_pos+=(off_t)aligned;}
-        pthread_mutex_unlock(&swap_mx);
-        if(ok){
-            int nf=(flags&~MAP_ANONYMOUS&~MAP_PRIVATE)|MAP_SHARED;
-            void*p=real_mmap(addr,length,prot,nf,swap_fd,swap_off);
-            if(p!=MAP_FAILED){
-                __sync_fetch_and_add(&stat_ok,1L);
-                __sync_fetch_and_add(&stat_mb,(long)(length>>20));
-                return p;
-            }
-            pthread_mutex_lock(&swap_mx);
-            if(swap_pos==swap_off+(off_t)aligned)swap_pos=swap_off;
-            pthread_mutex_unlock(&swap_mx);
-            __sync_fetch_and_add(&stat_fb,1L);
-        }
-    }
-    return real_mmap(addr,length,prot,flags,fd,offset);
-}
-"""
-
-
-def _build_userswap():
-    """
-    userswap.so derlenmemişse derle.
-    LD_PRELOAD ile JVM'in anonim mmap'lerini dosya destekli yapar → Userspace Swap.
-    """
-    import shutil
-    if Path(USERSWAP_SO).exists():
-        return True
-    if not shutil.which("gcc"):
-        # gcc yok → apt ile kur
-        r = subprocess.run("apt-get install -y gcc 2>/dev/null", shell=True, capture_output=True)
-        if not shutil.which("gcc"):
-            return False  # gcc yok — sessiz
-            return False
-    try:
-        src_path = Path("/tmp/userswap.c")
-        src_path.write_text(_USERSWAP_C)
-        r = subprocess.run(
-            f"gcc -O2 -shared -fPIC -o {USERSWAP_SO} {src_path} -ldl -lpthread",
-            shell=True, capture_output=True
-        )
-        if r.returncode == 0:
-            log(f"[UserSwap] ✅ userswap.so derlendi → {USERSWAP_SO}")
-            return True
-        else:
-            pass  # userswap isteğe bağlı — JVM sadece jemalloc ile çalışır
-            return False
-    except Exception as e:
-        pass  # userswap isteğe bağlı
-        return False
-
-import gc as _gc_module
+# key: node_id  val: {url, node_id, healthy, last_ping, info:{ram,disk,cpu,proxy}}
+_agents: dict = {}
+_agents_lock  = threading.Lock()
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
                     ping_timeout=60, ping_interval=25)
-
-@app.after_request
-def _gc_after_req(resp):
-    """Her response sonrası gen0 GC — panel RAM sürünmesini önle."""
-    _gc_module.collect(0)
-    return resp
+app.register_blueprint(pool_api)
+pool.set_socketio(socketio)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -287,399 +152,193 @@ def _ram_monitor():
 
 
 # ══════════════════════════════════════════════════════════════
-#  RESOURCE POOL — Agent yönetimi  (resource_pool.py'e delege edilir)
+#  RESOURCE POOL — Agent yönetimi
 # ══════════════════════════════════════════════════════════════
-# Tüm agent kaydı, heartbeat, sağlık izleme ve dosya işlemleri
-# resource_pool.ResourcePool (singleton: _pool) tarafından yönetilir.
-# mc_panel.py yalnızca Flask route'larını barındırır.
+
+def _pool_register(tunnel_url: str, node_id: str, info: dict):
+    with _agents_lock:
+        is_new = node_id not in _agents
+        _agents[node_id] = {
+            "url":       tunnel_url.rstrip("/"),
+            "node_id":   node_id,
+            "healthy":   True,
+            "last_ping": time.time(),
+            "connected_at": _agents.get(node_id, {}).get("connected_at", time.time()),
+            "info":      info,
+        }
+    return is_new
+
 
 def _pool_summary() -> dict:
-    """resource_pool.pool.summary() biçimini mc_panel uyumlu hale getirir."""
-    s = _pool.summary()
-    res = s.get("resources", {})
+    with _agents_lock:
+        agents = list(_agents.values())
+    healthy = [a for a in agents if a["healthy"]]
+    total_ram_mb   = sum(a["info"].get("ram",  {}).get("free_mb",   0) for a in healthy)
+    total_disk_gb  = sum(a["info"].get("disk", {}).get("free_gb",   0) for a in healthy)
+    total_cache_mb = sum(a["info"].get("ram",  {}).get("cache_mb",  0) for a in healthy)
+    total_cpu      = sum(a["info"].get("cpu",  {}).get("cores",     0) for a in healthy)
     return {
-        "total":   s["total"],
-        "healthy": s["healthy"],
+        "total":    len(agents),
+        "healthy":  len(healthy),
         "resources": {
-            "ram_free_mb":   res.get("ram_free_mb",  0),
-            "disk_free_gb":  round(res.get("disk_free_gb", 0), 1),
-            "cache_used_mb": res.get("ram_cache_mb", 0),
-            "cpu_cores":     res.get("cpu_cores",    0),
+            "ram_free_mb":   total_ram_mb,
+            "disk_free_gb":  round(total_disk_gb, 1),
+            "cache_used_mb": total_cache_mb,
+            "cpu_cores":     total_cpu,
         },
         "agents": [
             {
                 "node_id":      a["node_id"],
                 "url":          a["url"],
                 "healthy":      a["healthy"],
-                "connected_at": a.get("last_ok", 0),
-                "last_ping":    a.get("last_ok", 0),
-                "ram":          a.get("ram",   {}),
-                "disk":         a.get("disk",  {}),
-                "cpu":          a.get("cpu",   {}),
-                "proxy":        a.get("proxy", {}),
+                "connected_at": a["connected_at"],
+                "last_ping":    a["last_ping"],
+                "ram":          a["info"].get("ram",   {}),
+                "disk":         a["info"].get("disk",  {}),
+                "cpu":          a["info"].get("cpu",   {}),
+                "proxy":        a["info"].get("proxy", {}),
             }
-            for a in s["agents"]
+            for a in agents
         ],
     }
 
 
-def _auto_archive_old_regions(older_than_days: int = 0):
-    """
-    Ana sunucudaki eski region dosyalarını en fazla boş diski olan
-    agent'a yükler. Ardından açılan disk alanını swap'a dönüştürür.
-    resource_pool._most_disk() + store_region() kullanır.
-    """
-    import shutil as _sh
-    best_agent = _pool._most_disk()
-    if not best_agent:
-        return 0, 0.0
-    # Disk boş olsa bile arşivle — Agent diskini kullanmak Swap için yer açar
+def _agent_req(agent: dict, method: str, path: str,
+               data: bytes = None, headers: dict = None, timeout: int = 15):
+    try:
+        req = _urllib_req.Request(
+            agent["url"] + path,
+            data=data,
+            headers={"Content-Type": "application/octet-stream", **(headers or {})},
+            method=method,
+        )
+        with _urllib_req.urlopen(req, timeout=timeout) as r:
+            agent["healthy"]   = True
+            agent["last_ping"] = time.time()
+            return r.read()
+    except Exception as e:
+        agent["healthy"] = False
+        return None
 
-    archived = 0
-    freed_mb = 0
-    now      = time.time()
+
+def _agent_json(agent: dict, method: str, path: str,
+                body: dict = None, timeout: int = 15):
+    raw = _agent_req(
+        agent, method, path,
+        data=json.dumps(body).encode() if body else None,
+        headers={"Content-Type": "application/json"},
+        timeout=timeout,
+    )
+    if raw:
+        try: return json.loads(raw)
+        except: pass
+    return None
+
+
+def _best_agent_by_disk() -> dict | None:
+    with _agents_lock:
+        agents = [a for a in _agents.values() if a["healthy"]]
+    if not agents:
+        return None
+    return max(agents, key=lambda a: a["info"].get("disk", {}).get("free_gb", 0))
+
+
+def _best_agent_by_ram() -> dict | None:
+    with _agents_lock:
+        agents = [a for a in _agents.values() if a["healthy"]]
+    if not agents:
+        return None
+    return min(agents, key=lambda a: a["info"].get("ram", {}).get("cache_mb", 9999))
+
+
+def _pool_health_watchdog():
+    """Arka planda agent sağlığını izle."""
+    while True:
+        time.sleep(35)
+        with _agents_lock:
+            agents = list(_agents.values())
+        for ag in agents:
+            r = _agent_json(ag, "GET", "/api/status", timeout=8)
+            if r:
+                ag["info"]      = r
+                ag["healthy"]   = True
+                ag["last_ping"] = time.time()
+            else:
+                # 90sn yanıt yoksa unhealthy
+                if time.time() - ag["last_ping"] > 90:
+                    ag["healthy"] = False
+        socketio.emit("pool_update", _pool_summary())
+
+
+def _pool_auto_optimize():
+    """
+    Periyodik olarak:
+    1. Eski region'ları agent'a taşı → ana sunucuda disk aç → swap büyüt
+    2. Düşük RAM'de JVM dışı cache devreye girer
+    """
+    time.sleep(120)   # Sunucu stabil olana kadar bekle
+    while True:
+        try:
+            _auto_archive_old_regions()
+        except Exception as e:
+            log(f"[Pool] ⚠️  Otomatik arşiv hatası: {e}")
+        time.sleep(600)   # 10 dakikada bir
+
+
+def _auto_archive_old_regions(older_than_days: int = 5):
+    import shutil as _sh
+    best = _best_agent_by_disk()
+    if not best:
+        return
+    free_gb = _sh.disk_usage("/").free / 1e9
+    if free_gb > 8.0:
+        return   # Yeterli yer var, gerek yok
+
+    archived  = 0
+    freed_mb  = 0
+    now       = time.time()
 
     for dim_dir in [MC_DIR / "world" / "region",
                     MC_DIR / "world_nether" / "DIM-1" / "region",
                     MC_DIR / "world_the_end" / "DIM1" / "region"]:
         if not dim_dir.exists():
             continue
-        dim = dim_dir.parts[-3]
-
-        # ÖNEMLİ: shutil.disk_usage("/") HOST diskini okur (örn: 68GB).
-        # Render 18GB limiti cgroup ile uygulanır — gerçek kullanıma bakıyoruz.
-        # Hesap: agent diskleri zaten bu iş için var, her zaman arşivle.
-        import shutil as _shu2
-        # Render limitini baz al (18GB) - ana sunucu gerçek kullanımı
-        render_limit_gb  = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
-        # Gerçek disk kullanımı — df ile ölç
-        import shutil as _shu
-        try:
-            _du = _shu.disk_usage("/")
-            total_used_gb = _du.used / 1e9
-            free_gb = _du.free / 1e9
-        except:
-            total_used_gb = 10.0
-            free_gb = 8.0
-        force_all = free_gb < 4.0  # 4GB altındaysa zorla arşivle
+        dim = dim_dir.parts[-3]   # world / world_nether / world_the_end
 
         for rf in sorted(dim_dir.glob("*.mca"), key=lambda f: f.stat().st_mtime):
-            age_days = (now - rf.stat().st_mtime) / 86400
-            if not force_all and age_days < older_than_days:
+            if (now - rf.stat().st_mtime) / 86400 < older_than_days:
                 continue
-            if _pool.region_exists_remote(dim, rf.name):
-                continue   # Zaten uzakta
             try:
-                ok = _pool.store_region(dim, rf)
-                if ok:
-                    freed_mb += rf.stat().st_size / 1e6
-                    rf.unlink()
-                    archived += 1
-            except Exception:
-                continue
+                data = rf.read_bytes()
+                url  = best["url"] + f"/api/files/regions/{dim}/{rf.name}"
+                req  = _urllib_req.Request(url, data=data, method="PUT",
+                                           headers={"Content-Type": "application/octet-stream"})
+                _urllib_req.urlopen(req, timeout=120)
+                rf.unlink()
+                freed_mb += len(data) / 1e6
+                archived  += 1
+            except Exception as e:
+                continue   # sessiz hata
 
     if archived > 0:
+        # Swap dosyası büyüt
         new_free_gb = _sh.disk_usage("/").free / 1e9
-        log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB) → Ana disk:{new_free_gb:.1f}GB boş")
+        sw_mb       = min(6144, int(new_free_gb * 0.7 * 1024))
+        sf2         = "/swapfile2"
+        subprocess.run(f"swapoff {sf2} 2>/dev/null", shell=True)
+        try:
+            if Path(sf2).exists(): Path(sf2).unlink()
+        except: pass
+        r = subprocess.run(f"fallocate -l {sw_mb}M {sf2} && chmod 600 {sf2} && "
+                           f"mkswap -f {sf2} && swapon -p 1 {sf2}",
+                           shell=True, capture_output=True)
+        if r.returncode == 0:
+            log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB boşaltıldı) "
+                f"→ yeni swap dosyası: {sw_mb}MB")
+        else:
+            log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB)")
 
     return archived, freed_mb
-
-
-
-def _world_backup_loop():
-    """
-    Her 3 dakikada MC world/*.mca dosyalarını agent diskine YEDEK olarak gönder.
-    Silmez — sadece kopyalar. Agent'ların 140GB Disk Deposunu doldurur.
-    """
-    import hashlib as _hlib
-    _sent_hashes: dict = {}   # path → md5 — sadece değişenleri gönder
-
-    def _file_md5(path):
-        try:
-            return _hlib.md5(open(path, "rb").read(256*1024)).hexdigest()
-        except: return ""
-
-    # İlk bekleme: MC + agent'lar hazır olsun
-    time.sleep(60)
-
-    while True:
-        try:
-            if not (mc_process and mc_process.poll() is None):
-                time.sleep(30); continue
-            if _pool.agent_count() == 0:
-                time.sleep(30); continue
-
-            sent = 0
-            for dim_dir in [
-                MC_DIR / "world" / "region",
-                MC_DIR / "world_nether" / "DIM-1" / "region",
-                MC_DIR / "world_the_end" / "DIM1" / "region",
-            ]:
-                if not dim_dir.exists():
-                    continue
-                dim = dim_dir.parts[-3]
-                for rf in dim_dir.glob("*.mca"):
-                    try:
-                        md5 = _file_md5(rf)
-                        cache_key = f"{dim}/{rf.name}"
-                        if _sent_hashes.get(cache_key) == md5:
-                            continue   # Değişmemiş — atla
-                        ok = _pool.store_region_backup(dim, rf)
-                        if ok:
-                            _sent_hashes[cache_key] = md5
-                            sent += 1
-                    except Exception:
-                        continue
-
-            if sent:
-                log(f"[Pool] 💾 Dünya yedeklendi: {sent} region → agent disk")
-                socketio.emit("pool_update", _pool_summary())
-        except Exception as e:
-            log(f"[Pool] ⚠️  Yedek hatası: {e}")
-        time.sleep(180)   # 3 dakika
-
-
-# ── Agent başına kaç MB cache dolduralım ──────────────────────────────────
-# Her agent 382MB free RAM var, RamCache limiti agent'ta RAM_CACHE_MB env ile ayarlanır.
-# Ana sunucu bu değeri bilmez — agent'ın cache/stats endpoint'inden okur.
-# Güvenli hedef: cache limitinin %90'ı
-AGENT_CACHE_FILL_TARGET = 0.90   # Her agentin cache'ini %90 doldur
-
-
-def _get_agent_cache_limit_mb(agent_client) -> int:
-    """Agent'ın gerçek RAM_CACHE_MB limitini öğren (API'den)."""
-    try:
-        stats = agent_client.cache_stats()
-        return stats.get("limit_mb", 256)
-    except:
-        return 256
-
-
-def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
-    """
-    Tek bir agent'ı cache limitinin %90'ına kadar doldur:
-      1. server.jar   (~47MB)
-      2. Config dosyaları (~1MB)
-      3. Plugin JARlar  (değişken)
-      4. World region dosyaları (.mca) — ASIL DOLDURMA KAYNAGI
-         Her agent farklı region'ları alır → tüm harita dağıtılmış şekilde önbelleğe girer.
-
-    5 agent × 256MB = 1280MB toplam cache kapasitesi.
-    """
-    _log = log_fn or print
-    pushed_bytes = 0
-    pushed_count = 0
-
-    limit_mb    = _get_agent_cache_limit_mb(agent_client)
-    target_mb   = int(limit_mb * AGENT_CACHE_FILL_TARGET)
-    target_bytes= target_mb * 1024 * 1024
-
-    def _send(key: str, data: bytes) -> bool:
-        nonlocal pushed_bytes, pushed_count
-        if pushed_bytes >= target_bytes:
-            return False  # Bu agent dolu
-        try:
-            ok = agent_client.cache_set(key, data)
-            if ok:
-                pushed_bytes += len(data)
-                pushed_count += 1
-            return ok
-        except:
-            return False
-
-    # 1. Server JAR (tüm agentlara — sık erişilen)
-    if MC_JAR.exists():
-        try:
-            _send("mc/server.jar", MC_JAR.read_bytes())
-        except: pass
-
-    # 2. Config dosyaları
-    for cfg in ["paper.yml", "spigot.yml", "bukkit.yml", "server.properties",
-                "paper-world-defaults.yml", "config/paper-global.yml"]:
-        p = MC_DIR / cfg
-        if p.exists():
-            try: _send(f"mc/config/{cfg}", p.read_bytes())
-            except: pass
-
-    # 3. Plugin JARlar
-    plugins_dir = MC_DIR / "plugins"
-    if plugins_dir.exists():
-        for pjar in sorted(plugins_dir.glob("*.jar"))[:20]:
-            try: _send(f"mc/plugins/{pjar.name}", pjar.read_bytes())
-            except: pass
-
-    # 4. World region dosyaları — ASIL DOLDURMA ─────────────────────────────
-    # Her .mca dosyası ~2-8MB. 5 agent dağılımı: dosya hash'i % agent_index
-    # Böylece her agent farklı region'ları önbelleğe alır → toplam harita kapsamı artar.
-    if fill_regions and pushed_bytes < target_bytes:
-        agents     = _pool.get_agents()
-        n_agents   = max(1, len(agents))
-        # Bu agent'ın index'i (kararlı sıralama)
-        try:
-            sorted_ids = sorted(a.node_id for a in agents)
-            my_idx     = sorted_ids.index(agent_client.node_id)
-        except:
-            my_idx = 0
-
-        dim_dirs = [
-            (MC_DIR / "world"          / "region",          "world"),
-            (MC_DIR / "world_nether"   / "DIM-1" / "region","world_nether"),
-            (MC_DIR / "world_the_end"  / "DIM1"  / "region","world_the_end"),
-        ]
-        for region_dir, dim_name in dim_dirs:
-            if not region_dir.exists():
-                continue
-            # En son erişilen region'lar önce (aktif bölgeler daha değerli)
-            mca_files = sorted(region_dir.glob("*.mca"),
-                               key=lambda f: f.stat().st_mtime, reverse=True)
-            for rf in mca_files:
-                if pushed_bytes >= target_bytes:
-                    break
-                # Dosya hash'i % n_agents == my_idx → bu agent bu dosyayı alır
-                import hashlib as _hl
-                file_idx = int(_hl.md5(rf.name.encode()).hexdigest(), 16) % n_agents
-                if file_idx != my_idx:
-                    continue  # Başka agent'ın payı
-                key = f"mc/region/{dim_name}/{rf.name}"
-                try:
-                    _send(key, rf.read_bytes())
-                except: pass
-
-    used_mb = pushed_bytes // 1024 // 1024
-    if pushed_count:
-        _log(f"[Pool] 🧠 {agent_client.node_id}: {pushed_count} dosya, "
-             f"{used_mb}MB/{target_mb}MB hedef → cache doldu")
-    return pushed_count
-
-
-def _ram_cache_warm_loop():
-    """
-    Tüm agent cache'lerini paralel doldur.
-    Her 5 dakikada bir yeni region'ları ve yeni agentları güncelle.
-    """
-    # MC JAR + world dosyaları + en az 1 agent hazır olana kadar bekle (max 20 dk)
-    for _ in range(1200):
-        world_ready = (MC_DIR / "world" / "level.dat").exists()
-        if MC_JAR.exists() and _pool.agent_count() > 0 and world_ready:
-            break
-        time.sleep(1)
-    else:
-        log("[Pool] ⚠️  Cache warm: JAR/world/agent 20dk içinde hazır olmadı")
-        return
-
-    time.sleep(30)  # MC tam stabil olsun
-
-    def _fill_all_agents():
-        agents = _pool.get_agents()
-        if not agents:
-            return 0
-        threads, results = [], []
-
-        def _t(a):
-            n = _warm_single_agent(a, log_fn=log, fill_regions=True)
-            results.append(n)
-
-        for a in agents:
-            t = threading.Thread(target=_t, args=(a,), daemon=True)
-            threads.append(t)
-            t.start()
-        for t in threads:
-            t.join(timeout=180)
-        total = sum(results)
-        if total:
-            log(f"[Pool] 🧠 Cache tamamlandı: {len(agents)} agent, toplam {total} dosya gönderildi")
-            socketio.emit("pool_update", _pool_summary())
-        return total
-
-    _fill_all_agents()
-
-    # Periyodik: yeni agentları ısıt + tüm havuzu tazele
-    _warmed_agents: set = set(a.node_id for a in _pool.get_agents())
-
-    while True:
-        time.sleep(300)  # 5 dakika
-        try:
-            if _pool.agent_count() == 0:
-                continue
-
-            current = set(a.node_id for a in _pool.get_agents())
-            new_ids = current - _warmed_agents
-            if new_ids:
-                log(f"[Pool] 🧠 Yeni agent ısınıyor: {new_ids}")
-                for nid in new_ids:
-                    a = _pool.agents.get(nid)
-                    if a:
-                        threading.Thread(
-                            target=_warm_single_agent,
-                            args=(a, log, True), daemon=True
-                        ).start()
-                _warmed_agents.update(current)
-
-            # World yeni region'ları çıktıysa tazele (oyun genişledi)
-            _fill_all_agents()
-        except Exception as e:
-            log(f"[Pool] ⚠️  Cache warm döngü hatası: {e}")
-
-
-def _pool_auto_optimize():
-    """
-    1) Agent gelene kadar bekle (maks 90sn)
-    2) Hemen swap kur (modprobe loop + losetup --find --show)
-    3) Region arşivle
-    4) Her 300sn tekrar
-    """
-    for _ in range(90):
-        if _pool.agent_count() > 0:
-            log(f"[Pool] ✅ {_pool.agent_count()} agent hazır → Swap + arşiv başlıyor")
-            break
-        time.sleep(1)
-
-    # Render.com'da swapon çalışmaz (EPERM) — swap denemesi atlandı
-    log("[Pool] ℹ️  Render: swapon izin verilmiyor → swap yok, overcommit aktif")
-
-    # Render limiti tabanlı disk kontrolü (host FS değil)
-    render_limit_gb = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
-
-    def _render_disk_used_gb():
-        """Gerçek disk kullanımı — df ile ölç."""
-        import shutil as _shu2
-        try:
-            return _shu2.disk_usage("/").used / 1e9
-        except:
-            return 10.0
-
-    # İlk arşiv
-    try:
-        import shutil as _shu4
-        used_gb = _shu4.disk_usage("/").used / 1e9
-        # Disk %70+ dolu = acil (days=0), değilse 3 günden eski regionları arşivle
-        # (7 gün çok uzun — agentlar boşta kalır)
-        import shutil as _shu3
-        _real_free_gb = _shu3.disk_usage("/").free / 1e9
-        days = 0 if _real_free_gb < 3.0 else 3
-        log(f"[Pool] 📊 Disk: {_real_free_gb:.1f}GB boş → eşik:{days}gün")
-        result = _auto_archive_old_regions(older_than_days=days)
-        if result and result[0]:
-            log(f"[Pool] 📦 İlk arşiv: {result[0]} region, {result[1]:.0f}MB (≥{days}gün)")
-        else:
-            _shu5_free = __import__("shutil").disk_usage("/").free / 1e9
-        if _shu5_free > 5.0:
-            log(f"[Pool] ✅ Arşiv gerekmez: {_shu5_free:.1f}GB disk boş")
-        else:
-            log(f"[Pool] ℹ️  Arşiv: yeni regionlar bekleniyor (eşik:{days}gün, boş:{_shu5_free:.1f}GB)")
-        socketio.emit("pool_update", _pool_summary())
-    except Exception as e:
-        log(f"[Pool] ⚠️  İlk arşiv hatası: {e}")
-
-    while True:
-        time.sleep(180)  # 3 dakika (300 yerine — daha agresif)
-        try:
-            used_gb2 = _render_disk_used_gb()
-            days2    = 0 if used_gb2 > render_limit_gb * 0.70 else 3
-            _auto_archive_old_regions(older_than_days=days2)
-            socketio.emit("pool_update", _pool_summary())
-        except Exception as e:
-            log(f"[Pool] ⚠️  Arşiv hatası: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -722,423 +381,62 @@ def download_paper():
 
 
 def write_server_config():
-    """
-    Render.com 512MB container için optimize edilmiş Minecraft konfigürasyonu.
-    server.properties + paper-world-defaults + paper-global-config + spigot.yml + bukkit.yml
-    """
     (MC_DIR / "eula.txt").write_text("eula=true\n")
-
-    # ── server.properties ─────────────────────────────────────────────────────
-    (MC_DIR / "server.properties").write_text(
-        f"server-port={MC_PORT}\n"
-        "max-players=20\n"
-        "online-mode=false\n"
-        "gamemode=survival\n"
-        "difficulty=normal\n"
-        "level-name=world\n"
-        "motd=\\u00A7a\\u00A7lRender MC Server\n"
-        # ── Görüş/simülasyon mesafesi: en kritik TPS parametresi ─────────
-        "view-distance=4\n"            # chunk görüş alanı (4=minimum işlevsel)
-        "simulation-distance=3\n"      # entity/redstone tick menzili
-        # ── Ağ ─────────────────────────────────────────────────────────────
-        "network-compression-threshold=64\n"  # 64 byte altı paketleri sıkıştırma
-        "use-native-transport=true\n"          # Linux Netty (epoll) → düşük gecikme
-        "max-tick-time=30000\n"               # 30sn watchdog (60sn çok fazla)
-        # ── Spawn / Dünya ──────────────────────────────────────────────────
-        "spawn-protection=0\n"
-        "allow-flight=true\n"
-        "generate-structures=true\n"
-        "allow-nether=true\n"
-        "max-world-size=5000\n"               # Dünya sınırı → sonsuz chunk yok
-        "max-chained-neighbor-updates=16\n"   # Zincir update saldırısı önleme
-        # ── Entity/Oyuncu ─────────────────────────────────────────────────
-        "entity-broadcast-range-percentage=50\n"
-        # ── I/O ────────────────────────────────────────────────────────────
-        "sync-chunk-writes=false\n"           # Async chunk yazımı → I/O bloklamaz
-        # ── Diğer ─────────────────────────────────────────────────────────
-        "enable-rcon=false\n"
-        "white-list=false\n"
-        "enable-command-block=true\n"
-        "pvp=true\n"
-        "rate-limit=0\n"
-    )
-
+    props = MC_DIR / "server.properties"
+    if not props.exists():
+        props.write_text(
+            f"server-port={MC_PORT}\nmax-players=20\nonline-mode=false\n"
+            "gamemode=survival\ndifficulty=normal\nlevel-name=world\n"
+            "motd=\\u00A7a\\u00A7lRender MC Server\nview-distance=8\n"
+            "simulation-distance=6\nspawn-protection=0\nallow-flight=true\n"
+            "enable-rcon=false\nmax-tick-time=60000\nwhite-list=false\n"
+            "enable-command-block=true\npvp=true\ngenerate-structures=true\n"
+            "allow-nether=true\nsync-chunk-writes=true\n"
+        )
     config = MC_DIR / "config"
     config.mkdir(exist_ok=True)
-
-    # ── paper-world-defaults.yml ─────────────────────────────────────────────
-    # Paper'ın en kritik performans konfigürasyonu
-    (config / "paper-world-defaults.yml").write_text(
-        "_version: 30\n"
-        "world-settings:\n"
-        "  default:\n"
-        # ── Spawn limitleri: düşük → daha az entity → daha iyi TPS ────────
-        "    spawn-limits:\n"
-        "      monsters: 35\n"
-        "      animals: 6\n"
-        "      water-animals: 2\n"
-        "      water-ambient: 5\n"
-        "      water-underground-creature: 3\n"
-        "      axolotls: 3\n"
-        "      ambient: 10\n"
-        # ── Chunk I/O ───────────────────────────────────────────────────────
-        "    chunks:\n"
-        "      auto-save-interval: 12000\n"     # 10dk'da bir kaydet
-        "      delay-chunk-unloads-by: 10s\n"   # Chunk unload geciktir → tekrar yüklenmesin
-        "      entity-per-chunk-save-limit:\n"
-        "        arrow: 8\n"
-        "        snowball: 8\n"
-        "        fireball: 8\n"
-        "        small-fireball: 8\n"
-        "        dragon-fireball: 3\n"
-        "        egg: 8\n"
-        "        eye-of-ender: 8\n"
-        "        ender-pearl: 8\n"
-        "        experience-bottle: 3\n"
-        "        llama-spit: 3\n"
-        "        shulker-bullet: 8\n"
-        "        spectral-arrow: 8\n"
-        "        potion: 8\n"
-        "        experience-orb: 16\n"
-        "      max-auto-save-chunks-per-tick: 6\n"
-        "      prevent-moving-into-unloaded-chunks: true\n"
-        # ── Entity aktivasyon menzili: uzaktaki entity'ler tick etmesin ───
-        "    entity-activation-range:\n"
-        "      animals: 12\n"
-        "      monsters: 20\n"
-        "      raiders: 48\n"
-        "      misc: 8\n"
-        "      water: 8\n"
-        "      villagers: 16\n"
-        "      flying-monsters: 32\n"
-        "      wake-up-inactive:\n"
-        "        animals-max-per-tick: 2\n"
-        "        animals-every: 60\n"
-        "        animals-for: 100\n"
-        "        monsters-max-per-tick: 4\n"
-        "        monsters-every: 20\n"
-        "        monsters-for: 100\n"
-        "        villagers-max-per-tick: 1\n"
-        "        villagers-every: 600\n"
-        "        villagers-for: 100\n"
-        "      tick-inactive-villagers: false\n"   # Görüş dışı villager tick etmez
-        "      ignore-spectators: true\n"
-        # ── Tick hızları: sık olmayan sensörler → CPU tasarrufu ──────────
-        "    tick-rates:\n"
-        "      sensor:\n"
-        "        villager:\n"
-        "          secondarypoisensor: 40\n"
-        "          nearestbedsensor: 80\n"
-        "          villagerbabiessensor: 40\n"
-        "          playersensor: 40\n"
-        "          nearestlivingentitysensor: 40\n"
-        "      behavior:\n"
-        "        villager:\n"
-        "          validatenearbypoi: 60\n"
-        "          acquirepoi: 120\n"
-        # ── Obje despawn hızlandırma (çöp temizliği) ──────────────────────
-        "    alt-item-despawn-rate:\n"
-        "      enabled: true\n"
-        "      items:\n"
-        "        COBBLESTONE: 300\n"
-        "        NETHERRACK: 300\n"
-        "        SAND: 300\n"
-        "        GRAVEL: 300\n"
-        "        DIRT: 300\n"
-        "        GRASS: 300\n"
-        "        ROTTEN_FLESH: 300\n"
-        "        WHEAT: 300\n"
-        # ── Çeşitli optimizasyonlar ────────────────────────────────────────
-        "    misc:\n"
-        "      update-pathfinding-on-block-update: false\n"  # Blok güncelleme → pathfind yok
-        "      fix-climbing-bypassing-cramming-rule: true\n"
-        "      show-sign-click-command-failure-msgs-to-player: false\n"
-        "      max-leash-distance: 10.0\n"
-    )
-
-    # ── paper-global-config.yml ───────────────────────────────────────────────
-    (config / "paper-global-config.yml").write_text(
-        "_version: 29\n"
-        "chunk-loading-basic:\n"
-        "  player-max-chunk-send-rate: 8.0\n"   # Saniyede max 8 chunk gönder
-        "  player-max-concurrent-loads: 6.0\n"
-        "  global-max-chunk-load-rate: -1.0\n"
-        "chunk-loading-advanced:\n"
-        "  player-loader-priority: 0.5\n"
-        "  loading-queue-sizes:\n"
-        "    player-ticket: 8\n"
-        "async-chunks:\n"
-        "  threads: 1\n"                         # 1 thread: Render 1 vCPU için optimal
-        "collisions:\n"
-        "  enable-player-collisions: true\n"
-        "  send-full-pos-for-hard-colliding-entities: true\n"
-        "console:\n"
-        "  has-all-permissions: false\n"
-        "item-validation:\n"
-        "  display-name: 8192\n"
-        "  lore-line: 8192\n"
-        "logging:\n"
-        "  deobfuscate-stacktraces: false\n"     # Production: stack trace obfuscated
-        "misc:\n"
-        "  lag-compensate-block-breaking: true\n"
-        "  use-dimension-type-for-custom-spawners: false\n"
-        "  strict-advancement-dimension-check: false\n"
-        "packet-limiter:\n"
-        "  all-packets:\n"
-        "    action: DROP\n"
-        "    interval: 7.0\n"
-        "    max-packet-rate: 500.0\n"           # Flood koruması
-        "  kick-for-illegal-packet: true\n"
-        "player-auto-save-rate: -1\n"            # Auto-save chunk I/O'suna bırak
-        "proxies:\n"
-        "  proxy-protocol: false\n"
-        "  bungee-cord:\n"
-        "    online-mode: true\n"
-        "  velocity:\n"
-        "    enabled: false\n"
-        "scoreboards:\n"
-        "  save-empty-scoreboard-teams: false\n"
-        "  track-plugin-scoreboards: false\n"   # Plugin scoreboard → CPU tasarrufu
-        "spam-limiter:\n"
-        "  tab-spam-increment: 1\n"
-        "  tab-spam-limit: 500\n"
-        "  recipe-spam-increment: 1\n"
-        "  recipe-spam-limit: 20\n"
-        "timings:\n"
-        "  enabled: false\n"                    # Timings kapat → CPU overhead yok
-        "  verbose: false\n"
-        "  history-interval: 300\n"
-        "  history-length: 3600\n"
-        "unsupported-settings:\n"
-        "  allow-headless-pistons: false\n"
-        "  allow-perm-block-break-exploits: false\n"
-        "  allow-tripwire-disarming-exploits: false\n"
-        "  skip-vanilla-damage-tick-when-shield-blocked: false\n"
-        "watchdog:\n"
-        "  early-warning-every: 5000\n"
-        "  early-warning-delay: 10000\n"
-    )
-
-    # ── spigot.yml ────────────────────────────────────────────────────────────
-    (MC_DIR / "spigot.yml").write_text(
-        "config-version: 12\n"
-        "settings:\n"
-        "  bungeecord: false\n"
-        "  timeout: 30000\n"
-        "  restart-on-crash: false\n"
-        "  restart-script: ./start.sh\n"
-        "  netty-threads: 2\n"           # 2 Netty I/O thread (1 vCPU için yeterli)
-        "  attribute:\n"
-        "    maxHealth:\n"
-        "      max: 2048.0\n"
-        "    movementSpeed:\n"
-        "      max: 2048.0\n"
-        "    attackDamage:\n"
-        "      max: 2048.0\n"
-        "messages:\n"
-        "  whitelist: You are not whitelisted on this server!\n"
-        "  unknown-command: Unknown command. Type '/help' for help.\n"
-        "  server-full: The server is full!\n"
-        "  outdated-client: 'Outdated client! Please use {0}'\n"
-        "  outdated-server: 'Outdated server! I''m still on {0}'\n"
-        "  restart: Server is restarting\n"
-        "world-settings:\n"
-        "  default:\n"
-        "    below-zero-generation-in-existing-chunks: false\n"
-        "    end-portal-sound-radius: 0\n"
-        "    verbose: false\n"
-        # ── Mob spawn range: düşük → daha az hesap ───────────────────────
-        "    mob-spawn-range: 4\n"
-        # ── Entity limit: chunk başına entity cap ─────────────────────────
-        "    entity-activation-range:\n"
-        "      animals: 12\n"
-        "      monsters: 20\n"
-        "      misc: 8\n"
-        "      water: 8\n"
-        "      raiders: 48\n"
-        "      villagers: 16\n"
-        "      flying-monsters: 32\n"
-        "      villagers-work-immunity-after: 100\n"
-        "      villagers-work-immunity-for: 20\n"
-        "      villagers-active-for-panic: true\n"
-        "      tick-inactive-villagers: false\n"
-        "      ignore-spectators: true\n"
-        "    entity-tracking-range:\n"
-        "      players: 48\n"
-        "      animals: 40\n"
-        "      monsters: 44\n"
-        "      misc: 32\n"
-        "      display: 128\n"
-        "      other: 40\n"
-        "    merge-radius:\n"          # Yakın item/exp stack → tek entity
-        "      item: 3.5\n"
-        "      exp: 4.0\n"
-        "    item-despawn-rate: 6000\n"  # 5dk (vanilla 5dk = 6000 tick)
-        "    arrow-despawn-rate: 300\n"  # Ok 15sn'de kaybolur
-        "    trident-despawn-rate: 1200\n"
-        "    nerf-spawner-mobs: true\n"  # Spawner mob'ları AI'sız → CPU tasarrufu
-        "    max-tnt-per-tick: 8\n"
-        "    max-bulk-chunks: 10\n"
-        "    view-distance: default\n"
-        "    simulation-distance: default\n"
-        "    thunder-chance: 100000\n"
-        "    zombie-aggressive-towards-villager: false\n"  # AI hesabı azalt
-        "    enable-zombie-pigmen-portal-spawns: false\n"
-        "    max-entity-collisions: 4\n"   # Collision hesabı sınırla
-        "players:\n"
-        "  disable-saving: false\n"
-    )
-
-    # ── bukkit.yml ────────────────────────────────────────────────────────────
-    (MC_DIR / "bukkit.yml").write_text(
-        "settings:\n"
-        "  allow-end: true\n"
-        "  warn-on-overload: true\n"
-        "  permissions-file: permissions.yml\n"
-        "  update-folder: update\n"
-        "  plugin-profiling: false\n"
-        "  connection-throttle: 4000\n"
-        "  query-plugins: false\n"
-        "  deprecated-verbose: default\n"
-        "  shutdown-message: Server closed\n"
-        "  minimum-api: none\n"
-        "  use-map-color-cache: true\n"
-        "spawn-limits:\n"
-        "  monsters: 35\n"
-        "  animals: 6\n"
-        "  water-animals: 2\n"
-        "  water-ambient: 5\n"
-        "  water-underground-creature: 3\n"
-        "  axolotls: 3\n"
-        "  ambient: 10\n"
-        "chunk-gc:\n"
-        "  period-in-ticks: 600\n"      # Her 30sn chunk GC
-        "ticks-per:\n"
-        "  animal-spawns: 400\n"        # 20sn'de bir animal spawn check
-        "  monster-spawns: 1\n"         # Her tick monster spawn (normal)
-        "  water-spawns: 1\n"
-        "  water-ambient-spawns: 1\n"
-        "  water-underground-creature-spawns: 1\n"
-        "  axolotl-spawns: 1\n"
-        "  ambient-spawns: 1\n"
-        "  autosave: 6000\n"            # 5dk'da bir otomatik kayıt
-        "aliases: now-in-commands.yml\n"
-    )
-
-
-# _loop_swap_panel KALDIRILDI: Render.com'da swapon izni yok (EPERM)
+    pw = config / "paper-world-defaults.yml"
+    if not pw.exists():
+        pw.write_text(
+            "world-settings:\n  default:\n"
+            "    spawn-limits:\n      monsters: 70\n      animals: 10\n"
+            "      water-animals: 5\n      water-ambient: 20\n"
+            "    chunks:\n      auto-save-interval: 6000\n"
+        )
 
 
 def get_jvm_args():
-    """
-    Paper MC için optimize edilmiş JVM argümanları.
-    Temel: Aikar's Flags (mcflags.emc.gs) + 512MB container kısıtları.
-
-    RAM bütçesi:
-      Python panel  : ~75MB  (eventlet + flask + psutil, optimize edilmiş)
-      JVM heap      : 270MB  (Xmx — Aikar flags ile etkin GC)
-      JVM non-heap  : ~100MB (metaspace 80 + code cache 24 + class 16 + stacks ~30)
-      UserSwap peak : ~60MB  (bootstrap fazlası dosyaya)
-      ─────────────────────────────────────────────
-      Toplam        : ~505MB / 512MB  (7MB tampon)
-    """
+    import psutil as _ps
     container_ram_mb = int(os.environ.get("CONTAINER_RAM_MB", "512"))
     for path in ["/sys/fs/cgroup/memory.max",
                  "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
         try:
             val = open(path).read().strip()
             if val not in ("max", "-1"):
-                mb = min(512, int(val) // 1024 // 1024)
+                mb = int(val) // 1024 // 1024
                 if 64 < mb < 65536:
                     container_ram_mb = mb; break
         except: pass
 
-    agent_count  = _pool.agent_count()
-    userswap_ok  = os.path.exists(USERSWAP_SO)
-
-    # UserSwap varsa bootstrap fazlası (maks ~60MB) dosyaya gider → 270MB güvenli
-    # UserSwap yoksa 240MB → 512-75(python)-100(non-heap)-240(heap) = 97MB tampon
-    # userswap kaldırıldı → güvenli heap
-    xmx_mb = 256
-    xms_mb = 32   # Küçük başla, GC gerektiğinde büyüt
-    userswap_ok = False   # devre dışı
-
-    swap_label = f"Swap({psutil.swap_memory().total//1024//1024}MB)"
-    log(f"[Panel] 🧠 Container={container_ram_mb}MB {swap_label} Agents={agent_count} "
-        f"→ Xms={xms_mb}M Xmx={xmx_mb}M [Aikar+jemalloc]")
-
-    # ── LD_PRELOAD zincirleme: userswap + jemalloc ────────────────────────
-    # jemalloc: bellek parçalanmasını önler → uzun süreli çalışmada RSS büyümez
-    # userswap: anonim mmap'leri dosya destekli yapar → fiziksel OOM önler
-    preloads = []
-    if userswap_ok:
-        preloads.append(USERSWAP_SO)
-
-    # jemalloc: Dockerfile'da libjemalloc2 kuruldu, symlink /usr/local/lib/libjemalloc.so
-    jemalloc_paths = [
-        "/usr/local/lib/libjemalloc.so",
-        "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
-        "/usr/lib/aarch64-linux-gnu/libjemalloc.so.2",
-    ]
-    for jp in jemalloc_paths:
-        if os.path.exists(jp):
-            preloads.append(jp)
-            log(f"[Panel] ✅ jemalloc aktif: {jp}")
-            break
-
-    # Sadece jemalloc LD_PRELOAD — userswap.so JVM startup'ı çökertiyor
-    jemalloc = next((p for p in preloads if "jemalloc" in p), None)
-    java_cmd = []
-    if jemalloc:
-        java_cmd = ["env", f"LD_PRELOAD={jemalloc}"]
-    java_cmd.append("java")
-
-    return java_cmd + [
-        f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
-
-        # ── Bellek alanları ──────────────────────────────────────────────
-        "-XX:MaxMetaspaceSize=80m",
-        "-XX:CompressedClassSpaceSize=16m",
-        "-XX:ReservedCodeCacheSize=24m",
-        "-Xss192k",                      # Thread stack: 192k yeterli (vanilla 512k)
-
-        # ── Aikar's Flags — Paper MC için endüstri standardı GC ─────────
-        # Kaynak: https://mcflags.emc.gs
-        # G1GC: 512MB altında SerialGC'ye kıyasla daha az GC pause süresi
-        # → TPS spike'larını önler (oyuncu deneyimi için kritik)
-        "-XX:+UseG1GC",
-        "-XX:+ParallelRefProcEnabled",
-        "-XX:MaxGCPauseMillis=200",
-        "-XX:+UnlockExperimentalVMOptions",
-        "-XX:+DisableExplicitGC",        # System.gc() çağrılarını yoksay
-        # AlwaysPreTouch KALDIRILDI → 512MB container'da OOM crash yapıyor
-        "-XX:G1NewSizePercent=30",
-        "-XX:G1MaxNewSizePercent=40",
-        "-XX:G1HeapRegionSize=4m",       # 270MB heap için optimal (67 region)
-        "-XX:G1ReservePercent=20",
-        "-XX:G1HeapWastePercent=5",
-        "-XX:G1MixedGCCountTarget=4",
-        "-XX:InitiatingHeapOccupancyPercent=15",
-        "-XX:G1MixedGCLiveThresholdPercent=90",
-        "-XX:G1RSetUpdatingPauseTimePercent=5",
-        "-XX:SurvivorRatio=32",
-        "-XX:+PerfDisableSharedMem",     # /tmp/hsperfdata dosyası oluşturma (I/O azalt)
-        "-XX:MaxTenuringThreshold=1",    # Nesneleri hızlı Old gen'e taşı → GC pause azalt
-        "-Dusing.aikars.flags=https://mcflags.emc.gs",
-        "-Daikars.new.flags=true",
-
-        # ── String optimizasyonu ─────────────────────────────────────────
-        "-XX:+UseStringDeduplication",  # G1GC ile çalışır → duplicate String heap kullanımı azalt
-        "-XX:+UseCompressedOops",
-        "-XX:+OptimizeStringConcat",
-
-        # ── Diğer ────────────────────────────────────────────────────────
-        "-Djava.net.preferIPv4Stack=true",
-        "-Dfile.encoding=UTF-8",
-        "-Dcom.mojang.eula.agree=true",
-        "-Xlog:disable",                 # GC log yok → I/O ve CPU tasarrufu
-        # Netty native transport — Dockerfile'da JRE var, epoll destekleniyor
-        "-Dio.netty.tryReflectionSetAccessible=true",
+    swp    = _ps.swap_memory()
+    sw_mb  = int(swp.total / 1024 / 1024)
+    xmx_mb = min(384, container_ram_mb - 128)
+    xmx_mb = max(256, xmx_mb)
+    if sw_mb > 512:
+        xmx_mb = min(xmx_mb + min(sw_mb // 4, 512), 2048)
+    xms_mb = 32
+    log(f"[Panel] 🧠 Container RAM={container_ram_mb}MB Swap={sw_mb}MB → Xms={xms_mb}M Xmx={xmx_mb}M")
+    return [
+        "java", f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
+        "-XX:CompressedClassSpaceSize=64m", "-XX:MaxMetaspaceSize=128m",
+        "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled", "-XX:MaxGCPauseMillis=200",
+        "-XX:+UnlockExperimentalVMOptions", "-XX:+DisableExplicitGC",
+        "-XX:G1PeriodicGCInterval=15000", "-XX:+G1PeriodicGCInvokesConcurrent",
+        "-XX:G1NewSizePercent=20", "-XX:G1MaxNewSizePercent=30",
+        "-XX:G1HeapRegionSize=4m", "-XX:G1ReservePercent=20",
+        "-XX:InitiatingHeapOccupancyPercent=15", "-XX:SoftRefLRUPolicyMSPerMB=0",
+        "-XX:+UseStringDeduplication", "-Djava.net.preferIPv4Stack=true",
+        "-Dfile.encoding=UTF-8", "-Dcom.mojang.eula.agree=true",
         "-jar", str(MC_JAR), "--nogui",
     ]
 
@@ -1148,8 +446,6 @@ def start_server():
     if mc_process and mc_process.poll() is None:
         return False, "Server zaten çalışıyor"
     MC_DIR.mkdir(parents=True, exist_ok=True)
-    # Userspace swap kütüphanesini derle (yoksa)
-    _build_userswap()
     if not MC_JAR.exists():
         server_state["status"] = "downloading"
         socketio.emit("server_status", server_state)
@@ -1175,52 +471,6 @@ def start_server():
         socketio.emit("server_status", server_state)
         return False, str(e)
     threading.Thread(target=_stdout_reader, daemon=True).start()
-
-    # MC process'ini yüksek CPU önceliğine al (nice -5)
-    # Python panel nice=0, MC nice=-5 → MC daha fazla CPU slice alır → daha iyi TPS
-    def _set_mc_priority():
-        time.sleep(3)
-        if mc_process and mc_process.poll() is None:
-            try:
-                os.setpriority(os.PRIO_PROCESS, mc_process.pid, -5)
-                log("[Panel] ✅ MC process önceliği: nice=-5")
-            except Exception:
-                pass
-            # I/O scheduler: MC process'ini best-effort sınıfına al
-            try:
-                subprocess.run(
-                    f"ionice -c 2 -n 2 -p {mc_process.pid}",
-                    shell=True, capture_output=True
-                )
-            except Exception:
-                pass
-    threading.Thread(target=_set_mc_priority, daemon=True).start()
-    # MC başlatılınca mevcut tüm agent'lara proxy aç
-    def _start_all_proxies():
-        # MC tünel URL'si hazır olana kadar bekle (max 5 dk)
-        for _ in range(300):
-            mc_host = tunnel_info.get("host", "")
-            if mc_host:
-                break
-            time.sleep(1)
-        else:
-            log("[Pool] ⚠️  Proxy: 5dk içinde MC tüneli gelmedi — proxy atlandı")
-            return
-
-        agents = _pool.get_agents()
-        if not agents:
-            log("[Pool] ℹ️  Proxy: agent yok — proxy atlandı")
-            return
-
-        # Her agent kendi cloudflare tünelinden proxy kurar
-        # → ana MC tünel host'una TCP relay (oyuncu yük dağıtımı)
-        started = _pool.start_proxies(mc_host, mc_port=25565)
-        if started:
-            log(f"[Pool] 🔀 Proxy başlatıldı: {len(started)}/{len(agents)} agent → {mc_host}:25565")
-        else:
-            log(f"[Pool] ⚠️  Proxy başlatılamadı ({len(agents)} agent bağlı)")
-
-    threading.Thread(target=_start_all_proxies, daemon=True).start()
     return True, "Başlatılıyor..."
 
 
@@ -1249,42 +499,18 @@ def send_command(cmd: str) -> bool:
 
 def _ram_watchdog():
     import psutil
-    _pressure_count = 0
     while True:
-        eventlet.sleep(8)
+        eventlet.sleep(5)
         try:
             mem = psutil.virtual_memory()
             swp = psutil.swap_memory()
-            used_mb  = int(mem.used  / 1024 / 1024)
-            total_mb = int(mem.total / 1024 / 1024)
-            swap_pct = swp.percent if swp.total > 0 else 0
-
-            # Render free = 512MB. Python ~150MB kullanıyor.
-            # MC 280MB kullanıyorsa toplam ~430MB → %84 → uyar
-            pressure = used_mb > (total_mb * 0.85) or swap_pct > 80
-
-            if pressure:
-                _pressure_count += 1
+            avail_mb = int((mem.available + swp.free) / 1024 / 1024)
+            if avail_mb < 512:
                 try: open("/proc/sys/vm/drop_caches","w").write("3")
                 except: pass
-
-                if _pressure_count >= 2:
-                    # Hafif MC temizliği
-                    send_command("kill @e[type=item]")
-                    send_command("kill @e[type=experience_orb]")
-
-                if _pressure_count >= 3:
-                    # Ağır baskı: kaydet + agent'a region offload tetikle
-                    send_command("save-all")
-                    log(f"[Panel] ⚠️  RAM Baskısı! Kullanılan={used_mb}MB/{total_mb}MB Swap=%{swap_pct:.0f}")
-                    # Agent'a eski region'ları taşı
-                    threading.Thread(
-                        target=lambda: _auto_archive_old_regions(older_than_days=2),
-                        daemon=True
-                    ).start()
-                    _pressure_count = 0
-            else:
-                _pressure_count = max(0, _pressure_count - 1)
+                send_command("kill @e[type=item]")
+                send_command("kill @e[type=experience_orb]")
+                send_command("save-all")
         except: pass
 
 
@@ -1332,20 +558,8 @@ def api_console_history():
 @app.route("/api/internal/tunnel", methods=["POST"])
 def api_internal_tunnel():
     d = request.json or {}
-    new_host = d.get("host", "")
-    old_host = tunnel_info.get("host", "")
-    tunnel_info.update({"url": d.get("url",""), "host": new_host})
+    tunnel_info.update({"url": d.get("url",""), "host": d.get("host","")})
     socketio.emit("tunnel_update", tunnel_info)
-    # Tünel yeni geldiyse proxy'leri güncelle
-    if new_host and new_host != old_host and _pool.agent_count() > 0:
-        def _update_proxies():
-            time.sleep(2)
-            _pool.stop_proxies()
-            time.sleep(1)
-            started = _pool.start_proxies(new_host, mc_port=25565)
-            if started:
-                log(f"[Pool] 🔀 Tünel güncellendi → {len(started)} proxy yeniden başlatıldı")
-        threading.Thread(target=_update_proxies, daemon=True).start()
     return jsonify({"ok": True})
 
 
@@ -1393,31 +607,12 @@ def api_agent_register():
     node_id    = d.get("node_id", "")
     if not tunnel_url or not node_id:
         return jsonify({"ok": False, "error": "tunnel veya node_id eksik"})
-    _pool.set_logger(log)
-    is_new = node_id not in _pool.agents
-    _pool.register(tunnel_url, node_id, d)
+    is_new = _pool_register(tunnel_url, node_id, d)
     if is_new:
         log(f"[Pool] ✅ Yeni agent: {node_id} | "
             f"RAM:{d.get('ram',{}).get('free_mb',0)}MB | "
             f"Disk:{d.get('disk',{}).get('free_gb',0):.1f}GB | "
             f"CPU:{d.get('cpu',{}).get('cores',0)} core")
-        # Yeni agent'ı hemen ısıt (warm loop'u bekleme)
-        agent_client = _pool.agents.get(node_id)
-        if agent_client and MC_JAR.exists():
-            threading.Thread(
-                target=_warm_single_agent,
-                args=(agent_client, log),
-                daemon=True
-            ).start()
-        # Proxy: MC tüneli varsa başlat
-        mc_host = tunnel_info.get("host", "")
-        if mc_host and mc_process and mc_process.poll() is None:
-            def _new_agent_proxy():
-                time.sleep(3)
-                ok = agent_client.proxy_start(mc_host, 25565, 25565)
-                if ok:
-                    log(f"[Pool] 🔀 Yeni agent proxy: {node_id} → {mc_host}:25565")
-            threading.Thread(target=_new_agent_proxy, daemon=True).start()
     socketio.emit("pool_update", _pool_summary())
     return jsonify({"ok": True})
 
@@ -1426,8 +621,7 @@ def api_agent_register():
 def api_agent_heartbeat():
     d = request.json or {}
     if d.get("node_id") and d.get("tunnel"):
-        _pool.set_logger(log)
-        _pool.register(d["tunnel"], d["node_id"], d)
+        _pool_register(d["tunnel"], d["node_id"], d)
     socketio.emit("pool_update", _pool_summary())
     return jsonify({"ok": True})
 
@@ -1440,22 +634,29 @@ def api_pool_status():
 @app.route("/api/pool/cache/stats")
 def api_pool_cache_stats():
     stats = []
-    for ag in _pool.get_agents(healthy_only=False):
-        r = ag.cache_stats()
+    with _agents_lock:
+        agents = list(_agents.values())
+    for ag in agents:
+        r = _agent_json(ag, "GET", "/api/cache/stats")
         if r:
-            r["node_id"] = ag.node_id
+            r["node_id"] = ag["node_id"]
             stats.append(r)
     return jsonify({
         "agents":     stats,
-        "total_keys": sum(s.get("keys",    0) for s in stats),
-        "total_mb":   sum(s.get("used_mb", 0) for s in stats),
+        "total_keys": sum(s.get("keys",   0) for s in stats),
+        "total_mb":   sum(s.get("used_mb",0) for s in stats),
     })
 
 
 @app.route("/api/pool/cache/flush", methods=["POST"])
 def api_pool_cache_flush():
     prefix = (request.json or {}).get("prefix", "")
-    total  = _pool.cache_flush_all(prefix)
+    total  = 0
+    with _agents_lock:
+        agents = list(_agents.values())
+    for ag in agents:
+        r = _agent_json(ag, "POST", "/api/cache/flush", {"prefix": prefix})
+        total += (r or {}).get("flushed", 0)
     log(f"[Pool] 🗑️  {total} önbellek anahtarı temizlendi")
     return jsonify({"ok": True, "flushed": total})
 
@@ -1463,10 +664,12 @@ def api_pool_cache_flush():
 @app.route("/api/pool/storage")
 def api_pool_storage():
     result = []
-    for ag in _pool.get_agents(healthy_only=False):
-        r = ag.storage_stats()
+    with _agents_lock:
+        agents = list(_agents.values())
+    for ag in agents:
+        r = _agent_json(ag, "GET", "/api/files/storage/stats")
         if r:
-            r["node_id"] = ag.node_id
+            r["node_id"] = ag["node_id"]
             result.append(r)
     return jsonify({"agents": result})
 
@@ -1474,13 +677,23 @@ def api_pool_storage():
 @app.route("/api/pool/task", methods=["POST"])
 def api_pool_task():
     d = request.json or {}
-    result = _pool.run_task(
-        d.get("type", "echo"),
-        d.get("payload", {}),
-        wait=d.get("wait", True),
-        timeout=d.get("timeout", 30),
-    )
-    return jsonify({"ok": result is not None, "result": result})
+    with _agents_lock:
+        agents = [a for a in _agents.values() if a["healthy"]]
+    if not agents:
+        return jsonify({"ok": False, "error": "Aktif agent yok"})
+    import hashlib as _hlib
+    key = d.get("type","") + str(d.get("payload",""))
+    ag  = agents[int(_hlib.md5(key.encode()).hexdigest(),16) % len(agents)]
+    r   = _agent_json(ag, "POST", "/api/cpu/submit", d)
+    if not r:
+        return jsonify({"ok": False, "error": "Görev gönderilemedi"})
+    task_id = r.get("task_id")
+    for _ in range(30):
+        time.sleep(1)
+        res = _agent_json(ag, "GET", f"/api/cpu/result/{task_id}")
+        if res and res.get("status") == "done":
+            return jsonify({"ok": True, "result": res.get("result")})
+    return jsonify({"ok": True, "task_id": task_id, "status": "pending"})
 
 
 @app.route("/api/pool/proxy/start", methods=["POST"])
@@ -1488,14 +701,24 @@ def api_pool_proxy_start():
     d    = request.json or {}
     host = d.get("host", "127.0.0.1")
     port = int(d.get("port", 25565))
-    started = _pool.start_proxies(host, port)
-    log(f"[Pool] 🔀 {len(started)} agent'ta proxy başlatıldı")
+    with _agents_lock:
+        agents = list(_agents.values())
+    started = []
+    for ag in agents:
+        r = _agent_json(ag, "POST", "/api/proxy/start",
+                        {"host": host, "port": port, "listen_port": 25565})
+        if r and r.get("ok"):
+            started.append(ag["node_id"])
+            log(f"[Pool] 🔀 Proxy: {ag['node_id']} → {host}:{port}")
     return jsonify({"ok": True, "started": started})
 
 
 @app.route("/api/pool/proxy/stop", methods=["POST"])
 def api_pool_proxy_stop():
-    _pool.stop_proxies()
+    with _agents_lock:
+        agents = list(_agents.values())
+    for ag in agents:
+        _agent_json(ag, "POST", "/api/proxy/stop")
     return jsonify({"ok": True})
 
 
@@ -1752,112 +975,29 @@ def api_backups():
 def api_performance():
     try:
         import psutil
-        cpu  = psutil.cpu_percent(0.2)
-        vm   = psutil.virtual_memory()
-        swp  = psutil.swap_memory()
-        dk   = psutil.disk_usage("/")
-        mc_info = {}
+        cpu=psutil.cpu_percent(0.2); vm=psutil.virtual_memory(); swp=psutil.swap_memory(); dk=psutil.disk_usage("/")
+        procs=[]
         if mc_process and mc_process.poll() is None:
             try:
-                proc = psutil.Process(mc_process.pid)
-                mc_info = {
-                    "cpu":     round(proc.cpu_percent(), 1),
-                    "ram":     int(proc.memory_info().rss / 1024 / 1024),
-                    "threads": proc.num_threads(),
-                }
+                proc=psutil.Process(mc_process.pid)
+                procs=[{"cpu":round(proc.cpu_percent(),1),"ram":int(proc.memory_info().rss/1024/1024),"threads":proc.num_threads()}]
             except: pass
-
-        pool_info = _pool_summary()
-        res  = pool_info.get("resources", {})
-
-        # ── Ana sunucu — Render sınırlı kaynak hesabı ────────────
-        # psutil host makinesini okur (10-30GB RAM, 400GB+ disk) — yanlış.
-        # Render free: 512MB RAM, 18GB disk tahsis eder.
-
-        # RAM: kendi process RSS üzerinden hesapla
-        try:
-            import psutil as _ps2
-            my_rss_mb = int(_ps2.Process(os.getpid()).memory_info().rss / 1024 / 1024)
-        except:
-            my_rss_mb = 200
-        _ram_cap_mb       = RENDER_RAM_LIMIT_MB
-        ram_used_capped_mb = max(my_rss_mb, 150)
-        main_ram_free_mb   = max(0, _ram_cap_mb - ram_used_capped_mb)
-        ram_pct_capped     = round(ram_used_capped_mb / _ram_cap_mb * 100, 1)
-
-        # Disk: MC dizini + swap dosyaları gerçek kullanımı
-        try:
-            _mc_used = sum(
-                f.stat().st_size for f in MC_DIR.rglob("*") if f.is_file()
-            ) / 1e9 if MC_DIR.exists() else 0
-        except:
-            _mc_used = 0
-        _swap_used = sum(
-            os.path.getsize(f) for f in ["/swapfile", "/swapfile2", "/swapfile_mc"]
-            if os.path.exists(f)
-        ) / 1e9
-        disk_used_capped_gb = round(min(_mc_used + _swap_used + 3.5, RENDER_DISK_LIMIT_GB), 1)
-        main_disk_free_gb   = round(max(0.0, RENDER_DISK_LIMIT_GB - disk_used_capped_gb), 1)
-        disk_pct_capped     = round(disk_used_capped_gb / RENDER_DISK_LIMIT_GB * 100, 1)
-
-        agent_ram_mb      = res.get("ram_free_mb",  0)
-        agent_disk_gb     = res.get("disk_free_gb", 0)
-        combined_ram_mb   = main_ram_free_mb + agent_ram_mb
-        combined_disk_gb  = round(main_disk_free_gb + agent_disk_gb, 1)
-
-        # Agent başına detay — resource_pool.AgentClient kullanılır
-        agents_detail = []
-        for a in _pool.get_agents(healthy_only=False):
-            r   = a.info.get("ram",  {})
-            d_  = a.info.get("disk", {})
-            c   = a.info.get("cpu",  {})
-            agents_detail.append({
-                "node_id":    a.node_id,
-                "healthy":    a.healthy,
-                "ram_free":   r.get("free_mb",  0),
-                "ram_cache":  r.get("cache_mb", 0),
-                "disk_free":  round(d_.get("free_gb",  0), 1),
-                "disk_store": round(d_.get("store_gb", 0), 1),
-                "cpu_load":   c.get("load1", 0),
-                "cpu_cores":  c.get("cores", 0),
-                "last_ping":  int(time.time() - a.last_ok),
-            })
-
+        pool=_pool_summary()
         return jsonify({
-            # Ana sunucu
-            "cpu":           round(cpu, 1),
-            "ram_pct":       ram_pct_capped,
-            "ram_used_mb":   ram_used_capped_mb,
-            "ram_total_mb":  _ram_cap_mb,
-            "ram_free_mb":   main_ram_free_mb,
-            "swap_total_mb": int(swp.total  / 1024 / 1024),
-            "swap_used_mb":  int(swp.used   / 1024 / 1024),
-            "swap_free_mb":  int(swp.free   / 1024 / 1024),
-            "swap_pct":      round(swp.percent, 1),
-            "disk_pct":      disk_pct_capped,
-            "disk_used_gb":  disk_used_capped_gb,
-            "disk_total_gb": RENDER_DISK_LIMIT_GB,
-            "disk_free_gb":  main_disk_free_gb,
-            "cpu_count":     psutil.cpu_count(),
-            "mc":            mc_info,
-            # MC server
-            "tps":           server_state["tps"],
-            "tps5":          server_state["tps5"],
-            "tps15":         server_state["tps15"],
-            # Pool (agentlar)
-            "pool_agents":   pool_info["healthy"],
-            "pool_ram_mb":   agent_ram_mb,
-            "pool_disk_gb":  agent_disk_gb,
-            "pool_cache_mb": res.get("cache_used_mb", 0),
-            "pool_cpu":      res.get("cpu_cores", 0),
-            # Birleşik
-            "combined_ram_free_mb":  combined_ram_mb,
-            "combined_disk_free_gb": combined_disk_gb,
-            # Agent detayları
-            "agents": agents_detail,
+            "cpu":round(cpu,1),"ram_pct":round(vm.percent,1),
+            "ram_used_mb":int(vm.used/1024/1024),"ram_total_mb":int(vm.total/1024/1024),
+            "ram_free_mb":int(vm.available/1024/1024),
+            "swap_total_mb":int(swp.total/1024/1024),"swap_free_mb":int(swp.free/1024/1024),
+            "disk_pct":round(dk.percent,1),"disk_used_gb":round(dk.used/1e9,1),"disk_total_gb":round(dk.total/1e9,1),
+            "cpu_count":psutil.cpu_count(),"mc":procs[0] if procs else {},
+            "tps":server_state["tps"],"tps5":server_state["tps5"],"tps15":server_state["tps15"],
+            "pool_agents":pool["healthy"],
+            "pool_ram_mb":pool["resources"]["ram_free_mb"],
+            "pool_disk_gb":pool["resources"]["disk_free_gb"],
+            "pool_cache_mb":pool["resources"]["cache_used_mb"],
         })
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return jsonify({"error":str(e)})
 
 
 # ── SocketIO ──────────────────────────────────────────────────
@@ -2312,87 +1452,32 @@ select.set-inp option{background:#1e1e1e}
 
   <!-- PERFORMANS -->
   <div class="page" id="page-perf">
-    <!-- Birleşik özet kartlar -->
-    <div class="g4" style="margin-bottom:14px">
-      <div class="sc">
-        <div class="sc-val" id="p-comb-ram">—</div>
-        <div class="sc-lbl">🧠 Toplam Boş RAM</div>
-        <div style="font-size:9px;color:var(--t3);margin-top:3px">Ana + Agentlar</div>
-      </div>
-      <div class="sc">
-        <div class="sc-val" id="p-comb-disk">—</div>
-        <div class="sc-lbl">💾 Toplam Boş Disk</div>
-        <div style="font-size:9px;color:var(--t3);margin-top:3px">Ana + Agentlar</div>
-      </div>
-      <div class="sc">
-        <div class="sc-val" id="p-tps-big">20.0</div>
-        <div class="sc-lbl">⚡ TPS</div>
-        <div style="font-size:9px;color:var(--t3);margin-top:3px">1m / 5m / 15m</div>
-      </div>
-      <div class="sc">
-        <div class="sc-val" id="p-mcram-big">—</div>
-        <div class="sc-lbl">☕ MC JVM RAM</div>
-        <div style="font-size:9px;color:var(--t3);margin-top:3px">Heap kullanımı</div>
-      </div>
-    </div>
-
     <div class="g2" style="margin-bottom:14px">
-      <!-- Ana sunucu -->
       <div class="card">
-        <div class="card-hd">💻 Ana Sunucu (Render Free)</div>
+        <div class="card-hd">💻 Sistem</div>
         <div style="margin-bottom:10px">
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px">
-            <span>CPU</span><span id="p-cpu">—</span>
-          </div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px"><span>CPU</span><span id="p-cpu">—</span></div>
           <div class="prog"><div class="prog-f pf-cpu" id="pb-cpu" style="width:0%"></div></div>
         </div>
         <div style="margin-bottom:10px">
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px">
-            <span>RAM <span style="font-size:9px;color:var(--red)">(512MB limit!)</span></span>
-            <span id="p-ram">—</span>
-          </div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px"><span>RAM</span><span id="p-ram">—</span></div>
           <div class="prog"><div class="prog-f pf-ram" id="pb-ram" style="width:0%"></div></div>
         </div>
-        <div style="margin-bottom:10px">
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px">
-            <span>Disk <span style="font-size:9px">(18GB limit)</span></span>
-            <span id="p-disk">—</span>
-          </div>
+        <div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px"><span>Disk</span><span id="p-disk">—</span></div>
           <div class="prog"><div class="prog-f pf-disk" id="pb-disk" style="width:0%"></div></div>
         </div>
-        <div>
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px">
-            <span>Swap</span><span id="p-swap-bar-lbl">—</span>
-          </div>
-          <div class="prog"><div class="prog-f" id="pb-swap" style="width:0%;background:linear-gradient(90deg,var(--yellow),var(--a4))"></div></div>
-        </div>
       </div>
-
-      <!-- MC + Pool özet -->
       <div class="card">
-        <div class="card-hd">⛏️ MC + Pool Özeti</div>
+        <div class="card-hd">⛏️ MC + Pool</div>
         <table class="tbl">
-          <tr><td style="color:var(--t2)">MC JVM RAM</td><td id="p-mcram" style="font-family:var(--mono);color:var(--a1)">—</td></tr>
-          <tr><td style="color:var(--t2)">TPS (1m/5m/15m)</td><td id="p-tps1" style="font-family:var(--mono)">—</td></tr>
-          <tr><td style="color:var(--t2)">Swap (Ana)</td><td id="p-swap" style="font-family:var(--mono)">—</td></tr>
-          <tr><td style="color:var(--t2)">Agent Sayısı</td><td id="p-agents" style="font-family:var(--mono);color:var(--a2)">—</td></tr>
-          <tr><td style="color:var(--t2)">Pool RAM Cache</td><td id="p-pcache" style="font-family:var(--mono);color:var(--a3)">—</td></tr>
-          <tr><td style="color:var(--t2)">Pool Disk Deposu</td><td id="p-pdisk" style="font-family:var(--mono);color:var(--a3)">—</td></tr>
-          <tr><td style="color:var(--t2)">Pool CPU Core</td><td id="p-pcpu" style="font-family:var(--mono)">—</td></tr>
+          <tr><td style="color:var(--t2)">MC RAM</td><td id="p-mcram">—</td></tr>
+          <tr><td style="color:var(--t2)">TPS (1m/5m/15m)</td><td id="p-tps1">—</td></tr>
+          <tr><td style="color:var(--t2)">Swap</td><td id="p-swap">—</td></tr>
+          <tr><td style="color:var(--t2)">Pool Agentlar</td><td id="p-agents">—</td></tr>
+          <tr><td style="color:var(--t2)">Pool RAM Cache</td><td id="p-pcache">—</td></tr>
+          <tr><td style="color:var(--t2)">Pool Disk Deposu</td><td id="p-pdisk">—</td></tr>
         </table>
-      </div>
-    </div>
-
-    <!-- Destek Düğümleri detay tablosu -->
-    <div class="card" id="perf-agents-card">
-      <div class="card-hd" style="justify-content:space-between">
-        <span>🔗 Destek Düğümleri — Birleşik Kapasite</span>
-        <button class="btn btn-sm b-ghost" onclick="loadPerf()">↺ Yenile</button>
-      </div>
-      <div id="perf-agents-table">
-        <div style="text-align:center;padding:20px;color:var(--t2);font-size:12px">
-          Bağlı agent yok — diğer Render hesabına agent.Dockerfile yükleyin
-        </div>
       </div>
     </div>
   </div>
@@ -2645,97 +1730,7 @@ const SET_LABELS={'server-port':'Port','max-players':'Max Oyuncu','online-mode':
 async function loadSettings(){const d=await fetch('/api/settings').then(r=>r.json());const el=document.getElementById('settings-grid');el.innerHTML=Object.entries(d).map(([k,v])=>`<div class="set-item"><div class="set-lbl">${SET_LABELS[k]||k}</div>${v==='true'||v==='false'?`<select class="set-inp" id="s-${k}"><option value="true" ${v==='true'?'selected':''}>true</option><option value="false" ${v==='false'?'selected':''}>false</option></select>`:`<input class="set-inp" id="s-${k}" value="${v.replace(/</g,'&lt;')}">`}</div>`).join('');}
 async function saveSettings(){const d=await fetch('/api/settings').then(r=>r.json());const u={};for(const k of Object.keys(d)){const el=document.getElementById('s-'+k);if(el)u[k]=el.value;}const r=await api('/api/settings',u);notify(r.msg||'Kaydedildi','ok');setTimeout(()=>srvAction('restart'),1500);}
 
-async function loadPerf(){
-  const d=await fetch('/api/performance').then(r=>r.json()).catch(()=>({}));
-  if(d.cpu!==undefined){
-    document.getElementById('p-cpu').textContent=d.cpu+'%';
-    document.getElementById('pb-cpu').style.width=d.cpu+'%';
-  }
-  if(d.ram_pct!==undefined){
-    const pct=d.ram_pct;
-    document.getElementById('p-ram').textContent=`${d.ram_used_mb}/${d.ram_total_mb}MB`;
-    document.getElementById('pb-ram').style.width=pct+'%';
-    document.getElementById('pb-ram').style.background=pct>85?'linear-gradient(90deg,#ff4757,#ff6b35)':pct>70?'linear-gradient(90deg,#ffa502,var(--a1))':'linear-gradient(90deg,var(--a3),var(--a1))';
-  }
-  if(d.disk_pct!==undefined){
-    document.getElementById('p-disk').textContent=`${d.disk_used_gb}/${d.disk_total_gb}GB`;
-    document.getElementById('pb-disk').style.width=d.disk_pct+'%';
-  }
-  if(d.swap_pct!==undefined){
-    document.getElementById('p-swap-bar-lbl').textContent=`${d.swap_used_mb||0}/${d.swap_total_mb||0}MB (%${d.swap_pct||0})`;
-    document.getElementById('pb-swap').style.width=(d.swap_pct||0)+'%';
-    document.getElementById('p-swap').textContent=`${d.swap_total_mb||0}MB / ${d.swap_free_mb||0}MB boş`;
-  }
-  // MC
-  if(d.mc&&d.mc.ram){
-    document.getElementById('p-mcram').textContent=d.mc.ram+' MB';
-    document.getElementById('p-mcram-big').textContent=d.mc.ram+'MB';
-  }
-  // TPS
-  const tpsVal=d.tps||'—';
-  document.getElementById('p-tps1').textContent=`${d.tps||'—'} / ${d.tps5||'—'} / ${d.tps15||'—'}`;
-  document.getElementById('p-tps-big').textContent=tpsVal;
-  // Pool
-  document.getElementById('p-agents').textContent=`${d.pool_agents||0} aktif`;
-  document.getElementById('p-pcache').textContent=`${d.pool_cache_mb||0} MB`;
-  document.getElementById('p-pdisk').textContent=`${d.pool_disk_gb||0} GB`;
-  document.getElementById('p-pcpu').textContent=`${d.pool_cpu||0} core`;
-  // Birleşik
-  document.getElementById('p-comb-ram').textContent=(d.combined_ram_free_mb||0)+'MB';
-  document.getElementById('p-comb-disk').textContent=(d.combined_disk_free_gb||0)+'GB';
-  // Agent tablosu
-  const agents=d.agents||[];
-  const tbl=document.getElementById('perf-agents-table');
-  if(!agents.length){
-    tbl.innerHTML='<div style="text-align:center;padding:20px;color:var(--t2);font-size:12px">Bağlı agent yok — diğer Render hesabına agent.Dockerfile yükleyin</div>';
-  } else {
-    // Toplam satırı
-    const totRamFree=agents.reduce((s,a)=>s+(a.ram_free||0),0);
-    const totRamCache=agents.reduce((s,a)=>s+(a.ram_cache||0),0);
-    const totDiskFree=agents.reduce((s,a)=>s+(a.disk_free||0),0).toFixed(1);
-    const totDiskStore=agents.reduce((s,a)=>s+(a.disk_store||0),0).toFixed(1);
-    const totCores=agents.reduce((s,a)=>s+(a.cpu_cores||0),0);
-    tbl.innerHTML=`
-    <table class="tbl">
-      <thead>
-        <tr>
-          <th>Düğüm</th><th>Durum</th>
-          <th>RAM Boş</th><th>RAM Cache</th>
-          <th>Disk Boş</th><th>Disk Depo</th>
-          <th>CPU</th><th>Son Ping</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${agents.map(a=>`
-        <tr>
-          <td><strong style="font-family:var(--mono);font-size:11px">${a.node_id}</strong></td>
-          <td><span class="badge ${a.healthy?'bg':'br'}">${a.healthy?'✅ Sağlıklı':'❌ Erişilemiyor'}</span></td>
-          <td style="font-family:var(--mono);color:var(--a1)">${a.ram_free}MB</td>
-          <td style="font-family:var(--mono);color:var(--a3)">${a.ram_cache}MB</td>
-          <td style="font-family:var(--mono);color:var(--a2)">${a.disk_free}GB</td>
-          <td style="font-family:var(--mono)">${a.disk_store}GB</td>
-          <td style="font-family:var(--mono)">${a.cpu_cores}c / ${a.cpu_load}</td>
-          <td style="font-size:10px;color:var(--t3)">${a.last_ping}s</td>
-        </tr>`).join('')}
-        <tr style="background:rgba(124,106,255,.06);font-weight:700">
-          <td colspan="2" style="color:var(--a2)">📊 TOPLAM (${agents.length} agent)</td>
-          <td style="font-family:var(--mono);color:var(--a1)">${totRamFree}MB</td>
-          <td style="font-family:var(--mono);color:var(--a3)">${totRamCache}MB</td>
-          <td style="font-family:var(--mono);color:var(--a2)">${totDiskFree}GB</td>
-          <td style="font-family:var(--mono)">${totDiskStore}GB</td>
-          <td style="font-family:var(--mono)">${totCores} core</td>
-          <td></td>
-        </tr>
-        <tr style="background:rgba(0,229,255,.04)">
-          <td colspan="2" style="color:var(--a1);font-weight:700">🌐 BİRLEŞİK (Ana+Agentlar)</td>
-          <td colspan="2" style="font-family:var(--mono);color:var(--a1);font-weight:700">${d.combined_ram_free_mb}MB boş RAM</td>
-          <td colspan="2" style="font-family:var(--mono);color:var(--a2);font-weight:700">${d.combined_disk_free_gb}GB boş Disk</td>
-          <td colspan="2"></td>
-        </tr>
-      </tbody>
-    </table>`;
-  }
-}
+async function loadPerf(){const d=await fetch('/api/performance').then(r=>r.json());if(d.cpu!==undefined){document.getElementById('p-cpu').textContent=d.cpu+'%';document.getElementById('pb-cpu').style.width=d.cpu+'%';}if(d.ram_pct!==undefined){document.getElementById('p-ram').textContent=`${d.ram_used_mb}/${d.ram_total_mb}MB`;document.getElementById('pb-ram').style.width=d.ram_pct+'%';}if(d.disk_pct!==undefined){document.getElementById('p-disk').textContent=`${d.disk_used_gb}/${d.disk_total_gb}GB`;document.getElementById('pb-disk').style.width=d.disk_pct+'%';}if(d.mc&&d.mc.ram)document.getElementById('p-mcram').textContent=d.mc.ram+' MB';document.getElementById('p-tps1').textContent=`${d.tps||'—'} / ${d.tps5||'—'} / ${d.tps15||'—'}`;document.getElementById('p-swap').textContent=`${d.swap_total_mb||0}MB / ${d.swap_free_mb||0}MB boş`;document.getElementById('p-agents').textContent=`${d.pool_agents||0} agent`;document.getElementById('p-pcache').textContent=`${d.pool_cache_mb||0}MB`;document.getElementById('p-pdisk').textContent=`${d.pool_disk_gb||0}GB`;}
 setInterval(()=>{if(curPage==='perf')loadPerf();},5000);
 
 function cmd(c){socket.emit('send_command',{cmd:c});notify('→ '+c,'info');}
@@ -2761,11 +1756,8 @@ init();
 
 threading.Thread(target=_ram_monitor,        daemon=True).start()
 threading.Thread(target=_ram_watchdog,       daemon=True).start()
-# _pool_health_watchdog KALDIRILDI: resource_pool.health_monitor() zaten arka planda çalışıyor
-threading.Thread(target=_pool_auto_optimize,  daemon=True).start()
-threading.Thread(target=_world_backup_loop,   daemon=True).start()  # Agent disk doldur
-threading.Thread(target=_ram_cache_warm_loop, daemon=True).start()  # Agent RAM doldur
-_pool.set_logger(log)   # Panel log fonksiyonunu pool'a inject et
+threading.Thread(target=_pool_health_watchdog, daemon=True).start()
+threading.Thread(target=_pool_auto_optimize, daemon=True).start()
 
 if __name__ == "__main__":
     MC_DIR.mkdir(parents=True, exist_ok=True)

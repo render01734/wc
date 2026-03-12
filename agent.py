@@ -1,906 +1,584 @@
 """
-⚙️  RESOURCE AGENT v1.0  —  Destek Sunucusu
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Kernel modülü gerektirmez. Saf Python/userspace.
+⚙️  Resource Agent — v11.0  (Her zaman aktif)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MC sunucusunun açık/kapalı olması FARK ETMEZ.
+Agent, ana sunucuya sürekli şunları sağlar:
 
-Sağlanan kaynaklar:
-  1. RAM Cache    → Minecraft chunk/entity verilerini bellekte tutar
-  2. File Store   → Dünya region dosyalarını disk'te saklar (HTTP API)
-  3. TCP Proxy    → Oyuncu bağlantılarını ana sunucuya iletir
-  4. CPU Worker   → Chunk ön üretimi, sıkıştırma görevleri
+  🧠 RAM Cache     → chunk/entity/data önbelleği
+  💾 Disk Store    → region arşiv, yedek, plugin deposu
+  🔀 TCP Proxy     → oyuncu bağlantı relay
+  ⚡ CPU Worker    → sıkıştırma, hash, istatistik
 
-Ana sunucu bu agent'leri otomatik keşfeder (cloudflare tunnel URL kaydı).
+Başlangıçta ana sunucuya kayıt olur.
+Sonra her 20 saniyede bir heartbeat atar.
+Ana sunucu cevap vermese bile bekler, tekrar dener.
 """
 
-import os, sys, time, json, threading, subprocess, re, hashlib
-import struct, socket, ssl, resource, glob, shutil, gzip, io
+import os, sys, time, json, gzip, threading, hashlib, subprocess
+import socket, queue, struct, shutil
 from pathlib import Path
 from collections import OrderedDict
+from datetime import datetime
 import urllib.request as _ur
-import urllib.parse as _up
 
-# ── 512MB process limiti ────────────────────────────────────────────────────
-# Render free: 512MB. Cache peak (set sırasında) = compressed + ham aynı anda.
-# RLIMIT_AS ile adres alanını sınırla → limit aşımında MemoryError → graceful fail
-try:
-    _AGENT_AS_LIMIT = 500 * 1024 * 1024   # 500MB — 12MB buffer
-    _s, _h = resource.getrlimit(resource.RLIMIT_AS)
-    if _h == resource.RLIM_INFINITY or _h > _AGENT_AS_LIMIT:
-        resource.setrlimit(resource.RLIMIT_AS, (_AGENT_AS_LIMIT, _AGENT_AS_LIMIT))
-except Exception:
-    pass
+from flask import Flask, request, jsonify, Response
+import eventlet
+eventlet.monkey_patch()
 
-from flask import Flask, request, jsonify, send_file, Response, abort
+# ─── Konfigürasyon ────────────────────────────────────────────
+PORT          = int(os.environ.get("PORT",          "8080"))
+MAIN_URL      = os.environ.get("MAIN_URL",          "https://wc-tsgd.onrender.com").rstrip("/")
+RAM_CACHE_MB  = int(os.environ.get("RAM_CACHE_MB",  "300"))
+DISK_LIMIT_GB = float(os.environ.get("DISK_LIMIT_GB","10.0"))
+MY_URL        = os.environ.get("RENDER_EXTERNAL_URL","").rstrip("/")
+NODE_ID       = MY_URL.replace("https://","").replace(".onrender.com","") or f"agent-{PORT}"
+AGENT_DATA    = Path(os.environ.get("AGENT_DATA", "/agent_data"))
 
-# ─────────────────────────────────────────────
-PORT         = int(os.environ.get("PORT", "5000"))
-MAIN_URL     = os.environ.get("MAIN_URL", "https://wc-tsgd.onrender.com")
+AGENT_DATA.mkdir(parents=True, exist_ok=True)
+for sub in ["regions/world","regions/world_nether","regions/world_the_end",
+            "backups","plugins","configs","chunks"]:
+    (AGENT_DATA / sub).mkdir(parents=True, exist_ok=True)
 
-# DÜZELTİLDİ: NODE_ID artık kararlı (her restart'ta aynı kalır).
-# Öncelik: NODE_ID env → RENDER_EXTERNAL_URL → URL hash (PID YOK)
-# Eski kod os.getpid() kullanıyordu → her restart'ta farklı ID → ana sunucu
-# aynı agent'ı yeni node sanıyordu.
-_render_url  = os.environ.get("RENDER_EXTERNAL_URL", "")
-_url_slug    = _render_url.replace("https://", "").replace(".onrender.com", "")
-NODE_ID      = (
-    os.environ.get("NODE_ID")          # Manuel override
-    or _url_slug                       # Render URL'den slug (kararlı)
-    or ("agent-" + hashlib.md5(_render_url.encode() or b"local").hexdigest()[:8])
-)
+print(f"""
+{'━'*52}
+  ⚙️   Resource Agent v11.0
+  NODE_ID  : {NODE_ID}
+  MAIN_URL : {MAIN_URL}
+  RAM Cache: {RAM_CACHE_MB}MB
+  Disk     : {DISK_LIMIT_GB}GB
+  Port     : {PORT}
+{'━'*52}
+""")
 
-DATA_DIR     = Path("/agent_data")          # Dosya deposu
-# Agent 382MB free RAM'e sahip. Cache için 350MB ayır (32MB Flask/OS büyümesi için bırak).
-# Ana sunucu bu limiti agent'ın /api/cache/stats endpoint'inden okur.
-RAM_CACHE_MB  = int(os.environ.get("RAM_CACHE_MB",   "380"))  # RAM önbelleği boyutu
-# 512MB bütçe: Flask/OS=80MB + cache=380MB + peak_geçici=16MB + buffer=36MB = 512MB
-RAM_LIMIT_MB  = int(os.environ.get("RAM_LIMIT_MB",   "512"))  # Render plan RAM kotası
-DISK_LIMIT_GB = float(os.environ.get("DISK_LIMIT_GB", "17.5")) # Render plan Disk kotası
-AGENT_OVERHEAD_MB = 130  # Flask + psutil + OS taban kullanımı (~130MB)
-# ─────────────────────────────────────────────
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-(DATA_DIR / "regions").mkdir(exist_ok=True)
-(DATA_DIR / "chunks").mkdir(exist_ok=True)
-(DATA_DIR / "backups").mkdir(exist_ok=True)
-
-app   = Flask(__name__)
-state = {
-    "node_id":   NODE_ID,
-    "tunnel":    "",
-    "ram_cache": {"used_mb": 0, "limit_mb": RAM_CACHE_MB, "keys": 0},
-    "file_store":{"used_gb": 0.0, "files": 0},
-    "proxy":     {"active": False, "port": 0, "connections": 0},
-    "cpu_queue": [],
-}
 
 # ══════════════════════════════════════════════════════════════
-#  1. RAM CACHE  (LRU, sıkıştırılmış)
+#  1.  RAM CACHE  (LRU, gzip sıkıştırmalı)
 # ══════════════════════════════════════════════════════════════
 
-class RamCache:
-    """
-    LRU RAM önbelleği.
-    Veriyi gzip ile sıkıştırarak bellekte saklar.
-    Limit aşılınca en eski anahtarları atar.
-    """
-    def __init__(self, limit_mb: int):
-        self.limit   = limit_mb * 1024 * 1024
-        self.store   = OrderedDict()   # key → compressed_bytes
-        self.size    = 0
-        self.lock    = threading.Lock()
-        self.hits    = 0
-        self.misses  = 0
+class RAMCache:
+    def __init__(self, max_mb: int):
+        self.max_bytes = max_mb * 1024 * 1024
+        self._data: OrderedDict[str, bytes] = OrderedDict()
+        self._size = 0
+        self._lock = threading.Lock()
+        self.hits = self.misses = self.evictions = 0
 
-    def set(self, key: str, data: bytes) -> bool:
-        # Ham veri referansını hemen serbest bırak: sıkıştır → orijinali del
-        try:
-            compressed = gzip.compress(data, compresslevel=1)
-        except MemoryError:
-            return False  # Peak bellek yetersiz — reddet, crash etme
-        finally:
-            del data  # Ham veriyi hemen serbest bırak
-        sz = len(compressed)
-        with self.lock:
-            if key in self.store:
-                self.size -= len(self.store[key])
-                del self.store[key]
-            # Yer açmak için en eski girdileri sil
-            while self.size + sz > self.limit and self.store:
-                _, old = self.store.popitem(last=False)
-                self.size -= len(old)
-                del old
-            if sz > self.limit:
+    def set(self, key: str, value: bytes) -> bool:
+        compressed = gzip.compress(value, compresslevel=1)
+        with self._lock:
+            if key in self._data:
+                self._size -= len(self._data[key])
+                del self._data[key]
+            while self._size + len(compressed) > self.max_bytes and self._data:
+                _, evicted = self._data.popitem(last=False)
+                self._size -= len(evicted)
+                self.evictions += 1
+            if len(compressed) > self.max_bytes:
                 return False
-            self.store[key] = compressed
-            self.store.move_to_end(key)
-            self.size += sz
-        self._update_state()
-        return True
+            self._data[key] = compressed
+            self._size += len(compressed)
+            self._data.move_to_end(key)
+            return True
 
-    def get(self, key: str):
-        with self.lock:
-            if key not in self.store:
+    def get(self, key: str) -> bytes | None:
+        with self._lock:
+            if key not in self._data:
                 self.misses += 1
                 return None
-            self.store.move_to_end(key)
-            compressed = self.store[key]
+            self._data.move_to_end(key)
             self.hits += 1
-        return gzip.decompress(compressed)
+            return gzip.decompress(self._data[key])
 
-    def delete(self, key: str) -> bool:
-        with self.lock:
-            if key not in self.store:
-                return False
-            self.size -= len(self.store.pop(key))
-        self._update_state()
-        return True
+    def delete(self, key: str):
+        with self._lock:
+            if key in self._data:
+                self._size -= len(self._data[key])
+                del self._data[key]
+
+    def flush(self, prefix: str = "") -> int:
+        with self._lock:
+            if not prefix:
+                n = len(self._data)
+                self._data.clear(); self._size = 0
+                return n
+            keys = [k for k in self._data if k.startswith(prefix)]
+            for k in keys:
+                self._size -= len(self._data[k])
+                del self._data[k]
+            return len(keys)
 
     def keys_with_prefix(self, prefix: str) -> list:
-        with self.lock:
-            return [k for k in self.store if k.startswith(prefix)]
+        with self._lock:
+            return [k for k in self._data if k.startswith(prefix)]
 
-    def _update_state(self):
-        with self.lock:
-            state["ram_cache"]["used_mb"]  = self.size // 1024 // 1024
-            state["ram_cache"]["keys"]     = len(self.store)
-
-    @property
-    def stats(self):
-        with self.lock:
-            total = self.hits + self.misses
-            return {
-                "used_mb":   self.size // 1024 // 1024,
-                "limit_mb":  self.limit // 1024 // 1024,
-                "keys":      len(self.store),
-                "hits":      self.hits,
-                "misses":    self.misses,
-                "hit_rate":  round(self.hits / total * 100, 1) if total else 0,
-            }
+    def stats(self) -> dict:
+        total = self.hits + self.misses
+        return {
+            "keys":      len(self._data),
+            "used_mb":   round(self._size / 1024 / 1024, 2),
+            "max_mb":    RAM_CACHE_MB,
+            "hit_rate":  round(self.hits / total * 100, 1) if total else 0,
+            "hits":      self.hits,
+            "misses":    self.misses,
+            "evictions": self.evictions,
+        }
 
 
-ram_cache = RamCache(RAM_CACHE_MB)
-
-
-@app.route("/api/cache/set", methods=["POST"])
-def cache_set():
-    key  = request.args.get("key", "")
-    data = request.get_data()
-    if not key or not data:
-        return jsonify({"ok": False, "error": "key veya data eksik"}), 400
-    if len(data) > 8 * 1024 * 1024:
-        return jsonify({"ok": False, "error": "8MB üstü desteklenmiyor"}), 413
-    try:
-        ok = ram_cache.set(key, data)
-    except MemoryError:
-        import gc; gc.collect()
-        return jsonify({"ok": False, "error": "RAM dolu"}), 507
-    return jsonify({"ok": ok, "size": len(data), "compressed": ok})
-
-
-@app.route("/api/cache/get/<path:key>")
-def cache_get(key):
-    data = ram_cache.get(key)
-    if data is None:
-        return jsonify({"ok": False, "error": "miss"}), 404
-    return Response(data, mimetype="application/octet-stream")
-
-
-@app.route("/api/cache/delete/<path:key>", methods=["DELETE", "POST"])
-def cache_delete(key):
-    ok = ram_cache.delete(key)
-    return jsonify({"ok": ok})
-
-
-@app.route("/api/cache/keys")
-def cache_keys():
-    prefix = request.args.get("prefix", "")
-    keys = ram_cache.keys_with_prefix(prefix) if prefix else list(ram_cache.store.keys())
-    return jsonify({"keys": keys, "count": len(keys)})
-
-
-@app.route("/api/cache/stats")
-def cache_stats():
-    return jsonify(ram_cache.stats)
-
-
-@app.route("/api/cache/flush", methods=["POST"])
-def cache_flush():
-    prefix = (request.json or {}).get("prefix", "")
-    with ram_cache.lock:
-        if prefix:
-            to_del = [k for k in list(ram_cache.store) if k.startswith(prefix)]
-            for k in to_del:
-                ram_cache.size -= len(ram_cache.store.pop(k))
-            count = len(to_del)
-        else:
-            count = len(ram_cache.store)
-            ram_cache.store.clear()
-            ram_cache.size = 0
-    ram_cache._update_state()
-    return jsonify({"ok": True, "flushed": count})
+cache = RAMCache(RAM_CACHE_MB)
 
 
 # ══════════════════════════════════════════════════════════════
-#  2. FILE STORE  (HTTP — bölge dosyaları, yedekler)
+#  2.  FILE STORE
 # ══════════════════════════════════════════════════════════════
 
-def _safe_path(category: str, filename: str) -> Path:
-    allowed = {"regions", "chunks", "backups", "plugins", "configs"}
-    if category not in allowed:
-        abort(403)
-    p = (DATA_DIR / category / filename).resolve()
-    if not str(p).startswith(str((DATA_DIR / category).resolve())):
-        abort(403)
-    return p
+CATEGORIES = {"regions", "chunks", "backups", "plugins", "configs"}
 
+def _store_path(category: str, *parts) -> Path:
+    cat = category if category in CATEGORIES else "configs"
+    return AGENT_DATA / cat / Path(*parts)
 
-def _disk_used_gb() -> float:
-    total = sum(f.stat().st_size for f in DATA_DIR.rglob("*") if f.is_file())
-    state["file_store"]["used_gb"] = round(total / 1e9, 2)
-    state["file_store"]["files"]   = sum(1 for _ in DATA_DIR.rglob("*") if _.is_file())
-    return total / 1e9
+def store_used_gb() -> float:
+    total = sum(f.stat().st_size for f in AGENT_DATA.rglob("*") if f.is_file())
+    return round(total / 1e9, 3)
 
+def store_free_gb() -> float:
+    return round(DISK_LIMIT_GB - store_used_gb(), 3)
 
-@app.route("/api/files/<category>", methods=["GET"])
-def file_list(category):
-    d = DATA_DIR / category
-    d.mkdir(exist_ok=True)
-    files = []
-    for f in sorted(d.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-        if f.is_file():
-            files.append({
-                "name":     f.name,
-                "size":     f.stat().st_size,
-                "modified": int(f.stat().st_mtime),
-                "md5":      None,
-            })
-    return jsonify({"files": files, "count": len(files)})
-
-
-@app.route("/api/files/<category>/<path:filename>", methods=["PUT", "POST"])
-def file_upload(category, filename):
-    p = _safe_path(category, filename)
-    if _disk_used_gb() > DISK_LIMIT_GB - 0.5:
-        return jsonify({"ok": False, "error": "Disk dolu"}), 507
-    p.parent.mkdir(parents=True, exist_ok=True)
-    # Stream olarak yaz — büyük dosyayı RAM'e yükleme
-    written = 0
-    try:
-        with open(p, "wb") as f:
-            while True:
-                chunk = request.stream.read(256 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                written += len(chunk)
-    except MemoryError:
-        import gc; gc.collect()
-        return jsonify({"ok": False, "error": "RAM dolu"}), 507
-    return jsonify({"ok": True, "size": written, "path": str(p.relative_to(DATA_DIR))})
-
-
-@app.route("/api/files/<category>/<path:filename>", methods=["GET"])
-def file_download(category, filename):
-    p = _safe_path(category, filename)
-    if not p.exists():
-        return jsonify({"ok": False, "error": "Dosya bulunamadı"}), 404
-    return send_file(str(p), as_attachment=True, download_name=p.name)
-
-
-@app.route("/api/files/<category>/<path:filename>", methods=["DELETE"])
-def file_delete(category, filename):
-    p = _safe_path(category, filename)
-    if p.exists():
-        p.unlink()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/files/<category>/<path:filename>/exists")
-def file_exists(category, filename):
-    p = _safe_path(category, filename)
-    exists = p.exists()
-    size   = p.stat().st_size if exists else 0
-    return jsonify({"exists": exists, "size": size})
-
-
-@app.route("/api/files/storage/stats")
-def storage_stats():
-    used = _disk_used_gb()
+def store_stats() -> dict:
     cats = {}
-    for cat in ["regions", "chunks", "backups", "plugins", "configs"]:
-        d = DATA_DIR / cat
-        if d.exists():
-            s = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
-            cats[cat] = {"files": sum(1 for _ in d.rglob("*") if _.is_file()), "size_mb": round(s/1e6, 1)}
-    return jsonify({
-        "used_gb":  round(used, 2),
-        "limit_gb": DISK_LIMIT_GB,
-        "free_gb":  round(DISK_LIMIT_GB - used, 2),
-        "categories": cats,
-    })
-
-
-# ══════════════════════════════════════════════════════════════
-#  3. TCP PROXY  (oyuncu bağlantı iletici)
-# ══════════════════════════════════════════════════════════════
-
-_proxy_state = {
-    "active":      False,
-    "listen_port": 0,
-    "target_host": "",
-    "target_port": 25565,
-    "connections": 0,
-    "bytes_fwd":   0,
-}
-_proxy_stop = threading.Event()
-
-
-def _relay(src, dst, label, byte_counter):
-    try:
-        while True:
-            data = src.recv(32768)
-            if not data:
-                break
-            dst.sendall(data)
-            byte_counter[0] += len(data)
-    except Exception:
-        pass
-    finally:
-        try: src.close()
-        except: pass
-        try: dst.close()
-        except: pass
-
-
-def _handle_proxy_conn(client_sock):
-    host = _proxy_state["target_host"]
-    port = _proxy_state["target_port"]
-    try:
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.settimeout(10)
-        srv.connect((host, port))
-        srv.settimeout(None)
-    except Exception:
-        client_sock.close()
-        return
-    _proxy_state["connections"] += 1
-    bc = [0]
-    t1 = threading.Thread(target=_relay, args=(client_sock, srv,   "c→s", bc), daemon=True)
-    t2 = threading.Thread(target=_relay, args=(srv,   client_sock, "s→c", bc), daemon=True)
-    t1.start(); t2.start()
-    t1.join(); t2.join()
-    _proxy_state["connections"] -= 1
-    _proxy_state["bytes_fwd"] += bc[0]
-
-
-def _proxy_server_loop(listen_port, target_host, target_port):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", listen_port))
-    srv.listen(32)
-    srv.settimeout(1.0)
-    _proxy_state.update({"active": True, "listen_port": listen_port,
-                          "target_host": target_host, "target_port": target_port})
-    state["proxy"]["active"] = True
-    state["proxy"]["port"]   = listen_port
-    print(f"  [proxy] ✅ TCP relay :{listen_port} → {target_host}:{target_port}")
-    while not _proxy_stop.is_set():
-        try:
-            conn, _ = srv.accept()
-            threading.Thread(target=_handle_proxy_conn, args=(conn,), daemon=True).start()
-        except socket.timeout:
-            continue
-        except Exception:
-            break
-    srv.close()
-    _proxy_state["active"] = False
-
-
-@app.route("/api/proxy/start", methods=["POST"])
-def proxy_start():
-    d = request.json or {}
-    target_host = d.get("host", "")
-    target_port = int(d.get("port", 25565))
-    listen_port = int(d.get("listen_port", 25565))
-    if not target_host:
-        return jsonify({"ok": False, "error": "host gerekli"})
-    if _proxy_state["active"]:
-        return jsonify({"ok": False, "error": "Proxy zaten aktif"})
-    _proxy_stop.clear()
-    t = threading.Thread(target=_proxy_server_loop,
-                         args=(listen_port, target_host, target_port), daemon=True)
-    t.start()
-    return jsonify({"ok": True, "listen_port": listen_port,
-                    "target": f"{target_host}:{target_port}"})
-
-
-@app.route("/api/proxy/stop", methods=["POST"])
-def proxy_stop():
-    _proxy_stop.set()
-    _proxy_state["active"] = False
-    return jsonify({"ok": True})
-
-
-@app.route("/api/proxy/status")
-def proxy_status():
-    return jsonify({**_proxy_state,
-                    "bytes_fwd_mb": round(_proxy_state["bytes_fwd"] / 1e6, 2)})
-
-
-# ══════════════════════════════════════════════════════════════
-#  4. CPU WORKER  (görev kuyruğu)
-# ══════════════════════════════════════════════════════════════
-
-_task_queue   = []
-_task_results = {}
-_task_lock    = threading.Lock()
-_task_counter = 0
-
-ALLOWED_COMMANDS = {
-    "du", "df", "ls", "find", "wc", "md5sum", "sha256sum",
-    "gzip", "gunzip", "tar", "zip", "unzip",
-}
-
-
-def _run_task(task_id: str, task: dict):
-    t_type  = task.get("type", "")
-    payload = task.get("payload", {})
-    result  = {"ok": False, "error": "Bilinmeyen görev türü"}
-
-    try:
-        if t_type == "compress_file":
-            src  = DATA_DIR / payload["path"]
-            dst  = DATA_DIR / (payload.get("dest") or payload["path"] + ".gz")
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            with open(src, "rb") as f_in, gzip.open(dst, "wb", compresslevel=6) as f_out:
-                shutil.copyfileobj(f_in, f_out)
-            result = {"ok": True, "src": str(src), "dst": str(dst), "size": dst.stat().st_size}
-
-        elif t_type == "decompress_file":
-            src = DATA_DIR / payload["path"]
-            dst = DATA_DIR / payload.get("dest", str(payload["path"]).replace(".gz", ""))
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            with gzip.open(src, "rb") as f_in, open(dst, "wb") as f_out:
-                shutil.copyfileobj(f_in, f_out)
-            result = {"ok": True, "dst": str(dst), "size": dst.stat().st_size}
-
-        elif t_type == "hash_files":
-            directory = DATA_DIR / payload.get("dir", ".")
-            hashes = {}
-            for f in sorted(directory.rglob("*")):
-                if f.is_file():
-                    md5 = hashlib.md5(f.read_bytes()).hexdigest()
-                    hashes[str(f.relative_to(DATA_DIR))] = md5
-            result = {"ok": True, "hashes": hashes, "count": len(hashes)}
-
-        elif t_type == "run_command":
-            # DÜZELTİLDİ: shell=True + whitelist birlikte güvensizdi.
-            # Artık whitelist geçtikten sonra da shell=False ile çalıştırılıyor.
-            cmd_str   = payload.get("cmd", "")
-            cmd_parts = cmd_str.split()
-            if not cmd_parts or cmd_parts[0] not in ALLOWED_COMMANDS:
-                result = {"ok": False, "error": f"Komut izin verilmiyor: {cmd_parts[0] if cmd_parts else '?'}"}
-            else:
-                r = subprocess.run(cmd_parts, capture_output=True,
-                                   timeout=30, cwd=str(DATA_DIR))
-                result = {
-                    "ok":     r.returncode == 0,
-                    "stdout": r.stdout.decode()[:4096],
-                    "stderr": r.stderr.decode()[:1024],
-                    "code":   r.returncode,
-                }
-
-        elif t_type == "chunk_stats":
-            region_dir = DATA_DIR / "regions" / payload.get("dimension", "overworld")
-            stats = {"regions": 0, "total_size_mb": 0}
-            if region_dir.exists():
-                files = list(region_dir.glob("*.mca"))
-                stats["regions"]        = len(files)
-                stats["total_size_mb"]  = round(sum(f.stat().st_size for f in files) / 1e6, 1)
-                stats["largest_region"] = max((f.name for f in files),
-                                               key=lambda n: (region_dir / n).stat().st_size,
-                                               default=None)
-            result = {"ok": True, **stats}
-
-        elif t_type == "echo":
-            result = {"ok": True, "echo": payload}
-
-    except Exception as e:
-        result = {"ok": False, "error": str(e)}
-
-    with _task_lock:
-        _task_results[task_id] = result
-        state["cpu_queue"] = [t for t in _task_queue if t["id"] not in _task_results]
-
-
-@app.route("/api/cpu/submit", methods=["POST"])
-def cpu_submit():
-    global _task_counter
-    task = request.json or {}
-    if not task.get("type"):
-        return jsonify({"ok": False, "error": "type gerekli"})
-    with _task_lock:
-        _task_counter += 1
-        task_id = f"task_{_task_counter}_{int(time.time())}"
-        task["id"] = task_id
-        _task_queue.append(task)
-    threading.Thread(target=_run_task, args=(task_id, task), daemon=True).start()
-    return jsonify({"ok": True, "task_id": task_id})
-
-
-@app.route("/api/cpu/result/<task_id>")
-def cpu_result(task_id):
-    with _task_lock:
-        r = _task_results.get(task_id)
-    if r is None:
-        return jsonify({"ok": False, "status": "pending"})
-    return jsonify({"ok": True, "status": "done", "result": r})
-
-
-@app.route("/api/cpu/queue")
-def cpu_queue():
-    with _task_lock:
-        pending   = [t["id"] for t in _task_queue if t["id"] not in _task_results]
-        completed = list(_task_results.keys())
-    return jsonify({"pending": pending, "completed": completed[-20:]})
-
-
-# ══════════════════════════════════════════════════════════════
-#  5. KAYNAK BİLDİRGE  (heartbeat + register)
-# ══════════════════════════════════════════════════════════════
-
-def _get_resource_info() -> dict:
-    import psutil, gc as _gcr
-    _gcr.collect(0)  # RAM sürünmesini önle
-    cpu  = psutil.cpu_count(logical=True)
-    try:
-        load1, load5, _ = os.getloadavg()
-    except:
-        load1 = load5 = 0.0
-
-    # ── Render sınırlı RAM ──────────────────────────────────
-    # psutil.virtual_memory() host RAM'ini okur (10-30GB) — yanıltıcı.
-    # Kendi process RSS + ram_cache kullanımı üzerinden hesapla.
-    try:
-        my_rss_mb = int(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
-    except:
-        my_rss_mb = AGENT_OVERHEAD_MB
-    cache_mb     = ram_cache.stats["used_mb"]
-    cache_mb      = ram_cache.size // 1024 // 1024
-    agent_used_mb = max(my_rss_mb, AGENT_OVERHEAD_MB + cache_mb)
-    ram_free_mb   = max(0, RAM_LIMIT_MB - agent_used_mb)
-
-    # ── Render sınırlı Disk ─────────────────────────────────
-    # Sadece /agent_data kullanımını ölç — host FS değil.
-    disk_store_gb = round(_disk_used_gb(), 2)
-    disk_free_gb  = round(max(0.0, DISK_LIMIT_GB - disk_store_gb), 2)
-
+    for cat in CATEGORIES:
+        d = AGENT_DATA / cat
+        files = list(d.rglob("*.mca")) + list(d.rglob("*")) if d.exists() else []
+        files = [f for f in files if f.is_file()]
+        cats[cat] = {"count": len(files),
+                     "size_mb": round(sum(f.stat().st_size for f in files)/1e6, 1)}
     return {
-        "node_id":      NODE_ID,
-        "tunnel":       state["tunnel"],
-        "ram": {
-            "total_mb":   RAM_LIMIT_MB,
-            "free_mb":    ram_free_mb,
-            "used_mb":    agent_used_mb,
-            "cache_mb":   cache_mb,
-            "cache_keys": ram_cache.stats["keys"],
-        },
-        "disk": {
-            "total_gb": DISK_LIMIT_GB,
-            "free_gb":  disk_free_gb,
-            "store_gb": disk_store_gb,
-        },
-        "cpu": {
-            "cores":  cpu,
-            "load1":  round(load1, 2),
-            "load5":  round(load5, 2),
-        },
-        "proxy":   _proxy_state.copy(),
-        "uptime":  int(time.time() - _start_time),
-        "version": "agent-1.0",
+        "used_gb":  store_used_gb(),
+        "free_gb":  store_free_gb(),
+        "limit_gb": DISK_LIMIT_GB,
+        "categories": cats,
     }
 
 
-_start_time = time.time()
-
-
 # ══════════════════════════════════════════════════════════════
-#  CLOUDFLARE TÜNELİ  (yeniden deneme döngüsü)
+#  3.  TCP PROXY
 # ══════════════════════════════════════════════════════════════
 
-# cloudflared çıktısında URL'i bulmak için birden fazla pattern dene.
-# Farklı cloudflared sürümleri farklı format kullanır.
-_CF_URL_PATTERNS = [
-    r"https://[a-z0-9][a-z0-9\-]+\.trycloudflare\.com",  # standart
-    r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com",        # büyük harf toleranslı
-    r"(https?://[^\s]+trycloudflare\.com[^\s]*)",          # geniş eşleşme
-]
+class TCPProxy:
+    def __init__(self):
+        self.active       = False
+        self.target_host  = ""
+        self.target_port  = 0
+        self.listen_port  = 25565
+        self._server_sock = None
+        self._thread      = None
+        self.connections  = 0
+        self._lock        = threading.Lock()
 
-_cf_proc = None  # global cloudflared process referansı
-
-
-def _extract_tunnel_url(log_path: str):
-    """Log dosyasından cloudflare tunnel URL'ini çıkar."""
-    try:
-        content = open(log_path, errors="replace").read()
-        for pattern in _CF_URL_PATTERNS:
-            found = re.findall(pattern, content)
-            if found:
-                url = found[0].strip().rstrip("/")
-                if "trycloudflare.com" in url:
-                    return url
-    except Exception:
-        pass
-    return ""
-
-
-def _start_tunnel():
-    """
-    Cloudflare HTTP tüneli başlat.
-    120sn içinde URL gelmezse cloudflared'i yeniden başlat (sonsuz döngü).
-    """
-    global _cf_proc
-    log = "/tmp/cf_agent.log"
-    attempt = 0
-
-    while True:
-        attempt += 1
-        print(f"  [agent] 🌐 Cloudflare tünel girişimi #{attempt}...")
-
-        # Önceki process varsa öldür
-        if _cf_proc and _cf_proc.poll() is None:
+    def start(self, host: str, port: int, listen_port: int = 25565) -> bool:
+        with self._lock:
+            if self.active:
+                self.stop()
+            self.target_host = host
+            self.target_port = port
+            self.listen_port = listen_port
             try:
-                _cf_proc.terminate()
-                time.sleep(1)
-            except Exception:
-                pass
+                self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._server_sock.bind(("0.0.0.0", listen_port))
+                self._server_sock.listen(50)
+                self.active = True
+                self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+                self._thread.start()
+                return True
+            except Exception as e:
+                print(f"[Proxy] Başlatma hatası: {e}")
+                self.active = False
+                return False
 
-        # Log dosyasını sıfırla (önceki girişim kalıntısı olmasın)
+    def stop(self):
+        self.active = False
+        if self._server_sock:
+            try: self._server_sock.close()
+            except: pass
+            self._server_sock = None
+
+    def _accept_loop(self):
+        while self.active:
+            try:
+                conn, addr = self._server_sock.accept()
+                t = threading.Thread(target=self._handle, args=(conn,), daemon=True)
+                t.start()
+            except: break
+
+    def _handle(self, client: socket.socket):
         try:
-            open(log, "w").close()
-        except Exception:
-            pass
-
-        try:
-            _cf_proc = subprocess.Popen(
-                ["cloudflared", "tunnel",
-                 "--url", f"http://localhost:{PORT}",
-                 "--no-autoupdate",
-                 "--loglevel", "info"],
-                stdout=open(log, "w"),
-                stderr=subprocess.STDOUT,
-            )
-        except FileNotFoundError:
-            print("  [agent] ❌ cloudflared bulunamadı!")
-            time.sleep(30)
-            continue
-        except Exception as e:
-            print(f"  [agent] ❌ cloudflared başlatma hatası: {e}")
-            time.sleep(15)
-            continue
-
-        # 150 saniye URL'i bekle (0.5sn aralıkla = 300 deneme)
-        found = False
-        for tick in range(300):
-            url = _extract_tunnel_url(log)
-            if url:
-                host = url.replace("https://", "").replace("http://", "")
-                state["tunnel"] = url
-                print(f"\n  [agent] ✅ Tünel #{attempt}: {host}\n")
-                found = True
-                break
-
-            # Process çöktüyse erken çık
-            if _cf_proc.poll() is not None:
-                print(f"  [agent] ⚠️  cloudflared {tick*0.5:.0f}sn'de çıktı "
-                      f"(kod={_cf_proc.returncode}) — yeniden başlatılıyor...")
-                break
-
-            time.sleep(0.5)
-
-        if found:
-            # Tünel aktifken izle — kesilirse yeniden başlat
-            while True:
-                time.sleep(10)
-                if _cf_proc.poll() is not None:
-                    print("  [agent] ⚠️  Tünel kesildi → yeniden başlatılıyor...")
-                    state["tunnel"] = ""
-                    break
-                # Hâlâ URL var mı kontrol et (cloudflared bazen sessizce URL değiştirir)
-                new_url = _extract_tunnel_url(log)
-                if new_url and new_url != state["tunnel"]:
-                    state["tunnel"] = new_url
-                    print(f"  [agent] 🔄 Tünel URL güncellendi: {new_url}")
-        else:
-            print(f"  [agent] ⚠️  #{attempt} URL alınamadı (150sn) → 5sn sonra tekrar...")
-            time.sleep(5)
-
-
-def _register_loop():
-    """
-    Ana sunucuya kayıt ol + heartbeat gönder.
-    Tünel hazır olmadan MAX 60 saniye bekle, sonra RENDER_EXTERNAL_URL ile dene.
-    """
-    # Tünel için max 60 saniye bekle — sonra Render URL ile fallback yap
-    for _ in range(30):
-        if state["tunnel"]:
-            break
-        time.sleep(2)
-
-    # Fallback: tünel hâlâ yoksa Render'ın kendi external URL'ini kullan
-    # (cloudflared proxy yerine Render HTTPS doğrudan erişim — bazı durumlarda çalışır)
-    if not state["tunnel"] and _render_url:
-        print(f"  [agent] ⚠️  Tünel yok → Render URL ile fallback: {_render_url}")
-        state["tunnel"] = _render_url
-
-    if not state["tunnel"]:
-        print("  [agent] ⚠️  Tünel ve Render URL yok — kayıt için bekleniyor...")
-        while not state["tunnel"]:
-            time.sleep(5)
-
-    print(f"  [agent] ✅ Tünel hazır: {state['tunnel']} → kayıt başlıyor...")
-
-    # İlk kayıt — başarana kadar dene
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            info = _get_resource_info()
-            _ur.urlopen(
-                _ur.Request(
-                    f"{MAIN_URL.rstrip('/')}/api/agent/register",
-                    data=json.dumps(info).encode(),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                ),
-                timeout=15,
-            )
-            print(f"  [agent] ✅ Kayıt #{attempt} OK | "
-                  f"RAM:{info['ram']['free_mb']}MB | Disk:{info['disk']['free_gb']}GB")
-            break
-        except Exception as e:
-            wait = min(30 * attempt, 120)  # backoff: 30s, 60s, 90s, max 120s
-            print(f"  [agent] ⚠️  Kayıt #{attempt}: {e} — {wait}sn sonra...")
-            time.sleep(wait)
-
-    # Heartbeat döngüsü — her 20 saniyede bir
-    fail_streak = 0
-    while True:
-        time.sleep(20)
-        try:
-            # Tünel kaybolmuşsa bekle
-            if not state["tunnel"]:
-                continue
-            info = _get_resource_info()
-            _ur.urlopen(
-                _ur.Request(
-                    f"{MAIN_URL.rstrip('/')}/api/agent/heartbeat",
-                    data=json.dumps(info).encode(),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                ),
-                timeout=10,
-            )
-            fail_streak = 0
-        except Exception as e:
-            fail_streak += 1
-            # 5 ardışık başarısızlık → yeniden kayıt dene
-            if fail_streak >= 5:
-                print(f"  [agent] ⚠️  {fail_streak} heartbeat başarısız → yeniden kayıt...")
-                fail_streak = 0
+            server = socket.create_connection((self.target_host, self.target_port), timeout=10)
+            self.connections += 1
+            def fwd(src, dst):
                 try:
-                    info = _get_resource_info()
-                    _ur.urlopen(
-                        _ur.Request(
-                            f"{MAIN_URL.rstrip('/')}/api/agent/register",
-                            data=json.dumps(info).encode(),
-                            headers={"Content-Type": "application/json"},
-                            method="POST",
-                        ),
-                        timeout=15,
-                    )
-                    print("  [agent] ✅ Yeniden kayıt OK")
-                except Exception:
-                    pass
+                    while True:
+                        d = src.recv(4096)
+                        if not d: break
+                        dst.sendall(d)
+                except: pass
+                finally:
+                    try: src.close()
+                    except: pass
+                    try: dst.close()
+                    except: pass
+            threading.Thread(target=fwd, args=(client, server), daemon=True).start()
+            threading.Thread(target=fwd, args=(server, client), daemon=True).start()
+        except:
+            try: client.close()
+            except: pass
+        finally:
+            self.connections = max(0, self.connections - 1)
+
+    def status(self) -> dict:
+        return {
+            "active":      self.active,
+            "target":      f"{self.target_host}:{self.target_port}",
+            "listen_port": self.listen_port,
+            "connections": self.connections,
+        }
+
+
+proxy = TCPProxy()
 
 
 # ══════════════════════════════════════════════════════════════
-#  SAĞLIK + PANEL SAYFASI
+#  4.  CPU WORKER
 # ══════════════════════════════════════════════════════════════
+
+class CPUWorker:
+    ALLOWED_CMDS = {"gzip","zstd","sha256sum","md5sum","find","du","wc","sort","uniq"}
+
+    def __init__(self):
+        self._q:   queue.Queue           = queue.Queue()
+        self._res: dict[str, dict]       = {}
+        self._lock = threading.Lock()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def submit(self, task_type: str, payload: dict) -> str:
+        tid = hashlib.md5(f"{task_type}{payload}{time.time()}".encode()).hexdigest()[:12]
+        with self._lock:
+            self._res[tid] = {"status": "pending"}
+        self._q.put((tid, task_type, payload))
+        return tid
+
+    def result(self, tid: str) -> dict:
+        with self._lock:
+            return self._res.get(tid, {"status": "not_found"})
+
+    def _loop(self):
+        while True:
+            tid, task_type, payload = self._q.get()
+            try:
+                result = self._run(task_type, payload)
+                with self._lock:
+                    self._res[tid] = {"status": "done", "result": result}
+            except Exception as e:
+                with self._lock:
+                    self._res[tid] = {"status": "error", "error": str(e)}
+            # Sonuçları 5 dakika sonra temizle
+            threading.Timer(300, lambda t=tid: self._res.pop(t, None)).start()
+
+    def _run(self, task_type: str, payload: dict):
+        if task_type == "compress_file":
+            src  = Path(payload["path"])
+            dest = Path(payload.get("dest", str(src) + ".gz"))
+            with open(src,"rb") as f, gzip.open(dest,"wb",compresslevel=6) as g:
+                shutil.copyfileobj(f, g)
+            return {"dest": str(dest), "size": dest.stat().st_size}
+
+        elif task_type == "decompress_file":
+            src  = Path(payload["path"])
+            dest = Path(payload.get("dest", str(src).removesuffix(".gz")))
+            with gzip.open(src,"rb") as f, open(dest,"wb") as g:
+                shutil.copyfileobj(f, g)
+            return {"dest": str(dest)}
+
+        elif task_type == "hash_files":
+            root = Path(payload.get("path", str(AGENT_DATA)))
+            pat  = payload.get("pattern", "*.mca")
+            out  = {}
+            for f in root.rglob(pat):
+                if f.is_file():
+                    h = hashlib.md5(f.read_bytes()).hexdigest()
+                    out[str(f.relative_to(root))] = h
+            return out
+
+        elif task_type == "storage_stats":
+            return store_stats()
+
+        elif task_type == "cache_stats":
+            return cache.stats()
+
+        elif task_type == "disk_usage":
+            total = shutil.disk_usage("/")
+            return {"total_gb": round(total.total/1e9,2),
+                    "used_gb":  round(total.used/1e9,2),
+                    "free_gb":  round(total.free/1e9,2)}
+
+        elif task_type == "run_command":
+            cmd = payload.get("cmd","").split()[0]
+            if cmd not in self.ALLOWED_CMDS:
+                raise ValueError(f"İzin verilmeyen komut: {cmd}")
+            r = subprocess.run(payload["cmd"], shell=True, capture_output=True, timeout=30)
+            return {"stdout": r.stdout.decode()[:4096], "rc": r.returncode}
+
+        elif task_type == "echo":
+            return payload
+
+        else:
+            raise ValueError(f"Bilinmeyen görev: {task_type}")
+
+
+worker = CPUWorker()
+
+
+# ══════════════════════════════════════════════════════════════
+#  5.  HEARTBEAT  — Ana sunucuya sürekli bildir
+# ══════════════════════════════════════════════════════════════
+
+def _build_info() -> dict:
+    import psutil
+    mem  = psutil.virtual_memory()
+    swp  = psutil.swap_memory()
+    disk = shutil.disk_usage("/")
+    return {
+        "node_id": NODE_ID,
+        "tunnel":  MY_URL,
+        "ram": {
+            "free_mb":    int(mem.available / 1024 / 1024),
+            "total_mb":   int(mem.total     / 1024 / 1024),
+            "cache_mb":   cache.stats()["used_mb"],
+            "swap_free":  int(swp.free / 1024 / 1024),
+        },
+        "disk": {
+            "free_gb":    store_free_gb(),
+            "used_gb":    store_used_gb(),
+            "limit_gb":   DISK_LIMIT_GB,
+            "sys_free_gb": round(disk.free / 1e9, 2),
+        },
+        "cpu": {
+            "cores":  psutil.cpu_count(),
+            "load1":  round(psutil.getloadavg()[0], 2),
+            "load5":  round(psutil.getloadavg()[1], 2),
+        },
+        "proxy":    proxy.status(),
+        "cache":    cache.stats(),
+        "ts":       int(time.time()),
+        "version":  "11.0",
+    }
+
+
+def _heartbeat_loop():
+    """
+    Sürekli çalışır.
+    Ana sunucu kapalı olsa bile döngü durmaz — tekrar dener.
+    İlk kayıtta /api/agent/register, sonra /api/agent/heartbeat kullanır.
+    """
+    registered = False
+    fails      = 0
+
+    while True:
+        info     = _build_info()
+        endpoint = "/api/agent/register" if not registered else "/api/agent/heartbeat"
+        try:
+            req = _ur.Request(
+                MAIN_URL + endpoint,
+                data=json.dumps(info).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _ur.urlopen(req, timeout=15) as r:
+                resp = json.loads(r.read())
+            if resp.get("ok"):
+                if not registered:
+                    print(f"[Heartbeat] ✅ Ana sunucuya kayıt olundu: {MAIN_URL}")
+                registered = True
+                fails      = 0
+            else:
+                print(f"[Heartbeat] ⚠️  Sunucu red döndü: {resp}")
+        except Exception as e:
+            fails += 1
+            # İlk 3 başarısızlıkta kısa bekleme, sonra 60sn
+            wait = 10 if fails <= 3 else 60
+            if fails == 1 or fails % 5 == 0:
+                print(f"[Heartbeat] Ana sunucuya ulaşılamıyor ({fails}. deneme) — {wait}sn sonra tekrar. Hata: {e}")
+            # Kayıt başarısız olduysa her seferinde tekrar dene
+            if fails > 5:
+                registered = False   # Yeniden kayıt dene
+        # 20 saniyede bir heartbeat (MC açık/kapalı fark etmez)
+        time.sleep(20)
+
+
+# ══════════════════════════════════════════════════════════════
+#  FLASK API
+# ══════════════════════════════════════════════════════════════
+
+app = Flask(__name__)
+
+# ── Sağlık / Durum ────────────────────────────────────────────
 
 @app.route("/")
 @app.route("/health")
 def health():
-    info = _get_resource_info()
-    tunnel = state["tunnel"].replace("https://","") or "bekleniyor..."
-    ram_pct  = min(100, int(info["ram"]["cache_mb"] / max(1, RAM_CACHE_MB) * 100))
-    disk_pct = min(100, int(info["disk"]["store_gb"] / DISK_LIMIT_GB * 100))
-    rc = "#ff4757" if ram_pct  > 85 else "#00e5ff"
-    dc = "#ff4757" if disk_pct > 85 else "#00e5ff"
-    return f"""<!DOCTYPE html><html lang="tr"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="8">
-<title>Resource Agent v1.0</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#05060c;color:#eef0f8;font-family:'Segoe UI',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}}
-.card{{background:#0f1120;border:1px solid rgba(0,229,255,.2);border-radius:16px;padding:28px 32px;max-width:560px;width:92%}}
-h1{{font-size:18px;font-weight:700;color:#00e5ff;margin-bottom:4px}}
-.sub{{font-size:11px;color:#8892a4;margin-bottom:18px}}
-.grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}}
-.s{{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);border-radius:10px;padding:13px 12px}}
-.sv{{font-size:20px;font-weight:700;font-family:monospace}}
-.sl{{font-size:10px;color:#8892a4;margin-top:3px}}
-.bw{{background:rgba(255,255,255,.06);border-radius:3px;height:4px;margin-top:6px;overflow:hidden}}
-.b{{height:100%;border-radius:3px}}
-.badge{{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;background:rgba(0,229,255,.1);border:1px solid rgba(0,229,255,.25);color:#00e5ff;margin-bottom:14px}}
-.dot{{width:7px;height:7px;border-radius:50%;background:#00e5ff;box-shadow:0 0 5px #00e5ff;animation:blink 1.5s infinite}}
-@keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
-.services{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}}
-.svc{{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:8px;padding:10px 6px;text-align:center;font-size:11px}}
-.svc-ico{{font-size:20px;margin-bottom:4px}}
-.svc-lbl{{color:#8892a4;font-size:10px}}
-.svc-val{{font-family:monospace;color:#00e5ff;margin-top:2px}}
-.link{{display:inline-block;margin-top:8px;padding:8px 20px;background:linear-gradient(135deg,#00e5ff,#7c6aff);color:#000;border-radius:8px;font-weight:700;text-decoration:none;font-size:12px}}
-.tun{{font-family:monospace;font-size:11px;color:#7c6aff;background:rgba(124,106,255,.1);border-radius:6px;padding:6px 10px;margin-bottom:12px;word-break:break-all}}
-</style></head><body><div class="card">
-<div style="font-size:36px;margin-bottom:8px">⚙️</div>
-<div class="badge"><div class="dot"></div> RESOURCE AGENT v1.0 — AKTİF</div>
-<h1>Kaynak Ajansı</h1>
-<div class="sub">Node: {NODE_ID} — 8sn sonra yenilenir</div>
-<div class="tun">🌐 {tunnel}</div>
-<div class="grid">
-  <div class="s">
-    <div class="sv" style="color:{rc}">{info['ram']['cache_mb']}MB</div>
-    <div class="sl">RAM Önbelleği</div>
-    <div class="bw"><div class="b" style="width:{ram_pct}%;background:{rc}"></div></div>
-    <div style="display:flex;justify-content:space-between;font-size:10px;color:#8892a4;margin-top:3px"><span>%{ram_pct}</span><span>/{RAM_CACHE_MB}MB limit</span></div>
-  </div>
-  <div class="s">
-    <div class="sv" style="color:{dc}">{info['disk']['store_gb']}GB</div>
-    <div class="sl">Disk Deposu</div>
-    <div class="bw"><div class="b" style="width:{disk_pct}%;background:{dc}"></div></div>
-    <div style="display:flex;justify-content:space-between;font-size:10px;color:#8892a4;margin-top:3px"><span>%{disk_pct}</span><span>/{DISK_LIMIT_GB}GB limit</span></div>
-  </div>
-</div>
-<div class="services">
-  <div class="svc"><div class="svc-ico">🧠</div><div class="svc-lbl">Cache Keys</div><div class="svc-val">{info['ram']['cache_keys']}</div></div>
-  <div class="svc"><div class="svc-ico">📁</div><div class="svc-lbl">Dosyalar</div><div class="svc-val">{state['file_store']['files']}</div></div>
-  <div class="svc"><div class="svc-ico">🔀</div><div class="svc-lbl">Proxy</div><div class="svc-val">{'AKTİF' if _proxy_state['active'] else 'Kapalı'}</div></div>
-  <div class="svc"><div class="svc-ico">⚡</div><div class="svc-lbl">CPU Load</div><div class="svc-val">{info['cpu']['load1']}</div></div>
-</div>
-<a class="link" href="{MAIN_URL}" target="_blank">Ana Sunucuya Git</a>
-</div></body></html>"""
-
+    return jsonify({"status": "ok", "node": NODE_ID, "version": "11.0"})
 
 @app.route("/api/status")
 def api_status():
-    return jsonify(_get_resource_info())
+    return jsonify(_build_info())
+
+
+# ── RAM Cache ─────────────────────────────────────────────────
+
+@app.route("/api/cache/set", methods=["POST"])
+def cache_set():
+    key = request.args.get("key") or (request.json or {}).get("key","")
+    if not key:
+        return jsonify({"ok": False, "error": "key gerekli"}), 400
+    data = request.get_data() or json.dumps(request.json).encode()
+    ok   = cache.set(key, data)
+    return jsonify({"ok": ok, "key": key, "size": len(data)})
+
+@app.route("/api/cache/get/<path:key>")
+def cache_get(key):
+    val = cache.get(key)
+    if val is None:
+        return jsonify({"ok": False}), 404
+    return Response(val, mimetype="application/octet-stream")
+
+@app.route("/api/cache/delete/<path:key>", methods=["DELETE","POST"])
+def cache_delete(key):
+    cache.delete(key)
+    return jsonify({"ok": True})
+
+@app.route("/api/cache/flush", methods=["POST"])
+def cache_flush():
+    prefix = (request.json or {}).get("prefix","")
+    n = cache.flush(prefix)
+    return jsonify({"ok": True, "flushed": n})
+
+@app.route("/api/cache/stats")
+def cache_stats():
+    return jsonify(cache.stats())
+
+@app.route("/api/cache/keys")
+def cache_keys():
+    prefix = request.args.get("prefix","")
+    return jsonify({"keys": cache.keys_with_prefix(prefix)})
+
+
+# ── File Store ────────────────────────────────────────────────
+
+@app.route("/api/files/<category>/<path:filename>", methods=["PUT"])
+def file_put(category, filename):
+    if store_used_gb() >= DISK_LIMIT_GB * 0.95:
+        return jsonify({"ok": False, "error": "Disk dolmak üzere"}), 507
+    p = _store_path(category, filename)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(request.get_data())
+    return jsonify({"ok": True, "path": str(p.relative_to(AGENT_DATA)), "size": p.stat().st_size})
+
+@app.route("/api/files/<category>/<path:filename>", methods=["GET"])
+def file_get(category, filename):
+    p = _store_path(category, filename)
+    if not p.exists():
+        return jsonify({"ok": False, "error": "Bulunamadı"}), 404
+    return Response(p.read_bytes(), mimetype="application/octet-stream")
+
+@app.route("/api/files/<category>/<path:filename>/exists")
+def file_exists(category, filename):
+    p = _store_path(category, filename)
+    return jsonify({"exists": p.exists(), "size": p.stat().st_size if p.exists() else 0})
+
+@app.route("/api/files/<category>/<path:filename>", methods=["DELETE"])
+def file_delete(category, filename):
+    p = _store_path(category, filename)
+    if p.exists(): p.unlink()
+    return jsonify({"ok": True})
+
+@app.route("/api/files/<category>")
+def file_list(category):
+    d = AGENT_DATA / (category if category in CATEGORIES else "configs")
+    if not d.exists():
+        return jsonify({"files": []})
+    files = [{"name": f.name,
+              "path": str(f.relative_to(AGENT_DATA)),
+              "size": f.stat().st_size,
+              "modified": int(f.stat().st_mtime)}
+             for f in sorted(d.rglob("*")) if f.is_file()]
+    return jsonify({"files": files, "count": len(files)})
+
+@app.route("/api/files/storage/stats")
+def file_storage_stats():
+    return jsonify(store_stats())
+
+
+# ── TCP Proxy ─────────────────────────────────────────────────
+
+@app.route("/api/proxy/start", methods=["POST"])
+def proxy_start():
+    d    = request.json or {}
+    host = d.get("host","127.0.0.1")
+    port = int(d.get("port", 25565))
+    lp   = int(d.get("listen_port", 25565))
+    ok   = proxy.start(host, port, lp)
+    return jsonify({"ok": ok, **proxy.status()})
+
+@app.route("/api/proxy/stop", methods=["POST"])
+def proxy_stop():
+    proxy.stop()
+    return jsonify({"ok": True})
+
+@app.route("/api/proxy/status")
+def proxy_status():
+    return jsonify(proxy.status())
+
+
+# ── CPU Worker ────────────────────────────────────────────────
+
+@app.route("/api/cpu/submit", methods=["POST"])
+def cpu_submit():
+    d    = request.json or {}
+    tid  = worker.submit(d.get("type","echo"), d.get("payload", {}))
+    return jsonify({"ok": True, "task_id": tid})
+
+@app.route("/api/cpu/result/<tid>")
+def cpu_result(tid):
+    return jsonify(worker.result(tid))
+
+
+# ── Toplu işlem (ana sunucu için) ─────────────────────────────
+
+@app.route("/api/bulk/cache_and_store", methods=["POST"])
+def bulk_cache_and_store():
+    """
+    Ana sunucu birden fazla key'i aynı anda gönderebilir.
+    body: {"items": [{"key": "...", "data_b64": "...base64..."}, ...]}
+    """
+    import base64
+    d     = request.json or {}
+    items = d.get("items", [])
+    ok    = 0
+    for item in items:
+        key  = item.get("key","")
+        data = base64.b64decode(item.get("data_b64",""))
+        if key and data and cache.set(key, data):
+            ok += 1
+    return jsonify({"ok": True, "stored": ok, "total": len(items)})
 
 
 # ══════════════════════════════════════════════════════════════
 #  BAŞLATMA
 # ══════════════════════════════════════════════════════════════
 
-for res, val in [
-    (resource.RLIMIT_NOFILE, (65536, 65536)),
-    (resource.RLIMIT_NPROC,  (resource.RLIM_INFINITY, resource.RLIM_INFINITY)),
-]:
-    try: resource.setrlimit(res, val)
-    except: pass
+# Heartbeat thread — hemen başlar, hiç durmaz
+threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
-print("\n" + "━"*54)
-print("  ⚙️   Resource Agent v1.0")
-print(f"      NODE_ID  : {NODE_ID}")
-print(f"      MAIN_URL : {MAIN_URL}")
-print(f"      RAM Cache: {RAM_CACHE_MB}MB")
-print(f"      Disk     : {DISK_LIMIT_GB}GB")
-print("━"*54)
-print(f"  Servisler: RAM Cache | File Store | TCP Proxy | CPU Worker")
-print("━"*54 + "\n")
-
-threading.Thread(target=_start_tunnel,  daemon=True).start()
-threading.Thread(target=_register_loop, daemon=True).start()
-
-print(f"[Agent] Flask :{PORT} başlatılıyor...")
-app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+if __name__ == "__main__":
+    print(f"[Agent] :{PORT} başlatılıyor...")
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
