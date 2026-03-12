@@ -305,26 +305,34 @@ def download_paper():
 def write_server_config():
     (MC_DIR / "eula.txt").write_text("eula=true\n")
     props = MC_DIR / "server.properties"
-    if not props.exists():
-        props.write_text(
-            f"server-port={MC_PORT}\nmax-players=20\nonline-mode=false\n"
-            "gamemode=survival\ndifficulty=normal\nlevel-name=world\n"
-            "motd=\\u00A7a\\u00A7lRender MC Server\nview-distance=8\n"
-            "simulation-distance=6\nspawn-protection=0\nallow-flight=true\n"
-            "enable-rcon=false\nmax-tick-time=60000\nwhite-list=false\n"
-            "enable-command-block=true\npvp=true\ngenerate-structures=true\n"
-            "allow-nether=true\nsync-chunk-writes=true\n"
-        )
+    # Her zaman yeniden yaz — view-distance gibi kritik ayarların güncel kalması için
+    props.write_text(
+        f"server-port={MC_PORT}\nmax-players=20\nonline-mode=false\n"
+        "gamemode=survival\ndifficulty=normal\nlevel-name=world\n"
+        "motd=\\u00A7a\\u00A7lRender MC Server\n"
+        # DÜZELTİLDİ: view-distance=4 (512MB RAM'de OOM'u önler)
+        # view-distance=8 ile başlangıçta 100+ chunk yükleniyor → heap doluyor
+        "view-distance=4\n"
+        "simulation-distance=3\n"
+        "spawn-protection=0\nallow-flight=true\n"
+        "enable-rcon=false\nmax-tick-time=60000\nwhite-list=false\n"
+        "enable-command-block=true\npvp=true\ngenerate-structures=true\n"
+        "allow-nether=true\nsync-chunk-writes=false\n"
+        "entity-broadcast-range-percentage=50\n"
+        "network-compression-threshold=256\n"
+    )
     config = MC_DIR / "config"
     config.mkdir(exist_ok=True)
     pw = config / "paper-world-defaults.yml"
-    if not pw.exists():
-        pw.write_text(
-            "world-settings:\n  default:\n"
-            "    spawn-limits:\n      monsters: 70\n      animals: 10\n"
-            "      water-animals: 5\n      water-ambient: 20\n"
-            "    chunks:\n      auto-save-interval: 6000\n"
-        )
+    pw.write_text(
+        "world-settings:\n  default:\n"
+        "    spawn-limits:\n"
+        "      monsters: 40\n      animals: 8\n"
+        "      water-animals: 3\n      water-ambient: 10\n"
+        "    chunks:\n      auto-save-interval: 12000\n"
+        "    max-auto-save-chunks-per-tick: 4\n"
+        "    prevent-moving-into-unloaded-chunks: true\n"
+    )
 
 
 def get_jvm_args():
@@ -342,52 +350,59 @@ def get_jvm_args():
 
     swp   = _ps.swap_memory()
     sw_mb = int(swp.total / 1024 / 1024)
-
-    # Render free: 512MB toplam. Python/Flask/SocketIO/OS ~160-180MB kullanır.
-    # Bu yüzden JVM'e MAX 300MB verebiliriz (güvenli sınır 280MB).
-    # Swap varsa biraz daha ekle ama 512MB'yi geçme (swap ile birlikte).
-    PYTHON_OVERHEAD_MB = 180   # Flask + eventlet + psutil + OS
-    safe_xmx = container_ram_mb - PYTHON_OVERHEAD_MB   # 512-180 = 332 → swap olmadan 280 kapat
-    safe_xmx = min(safe_xmx, 300)                       # Hard üst sınır: 300MB
-    safe_xmx = max(safe_xmx, 160)                       # Hard alt sınır: 160MB
-
-    # Swap varsa JVM biraz büyüyebilir ama Render OOM'a dikkat et
-    if sw_mb >= 512:
-        bonus = min(sw_mb // 8, 128)   # swap'ın 1/8'i, max +128MB
-        safe_xmx = min(safe_xmx + bonus, 512)
-
-    xmx_mb = safe_xmx
-    xms_mb = 32   # Düşük başla, ihtiyaç oldukça büyüsün
-
-    # Agent pool varsa view-distance düşür → daha az chunk → daha az JVM
     agent_count = _pool.agent_count()
+
+    # Gerçek Python+OS overhead: ~155MB (panelden ölçüldü, MC çalışmıyorken)
+    # JVM non-heap (G1GC, TieredStop=1, düşük metaspace): ~110MB
+    PYTHON_OVERHEAD_MB = 155
+    JVM_NONHEAP_MB     = 110   # meta64+code32+class24+threads+GC yapıları
+    OS_BUFFER_MB       = 12
+
+    # Kullanılabilir fiziksel bellek: toplam - python - non-heap - tampon
+    phys_budget = container_ram_mb - PYTHON_OVERHEAD_MB - JVM_NONHEAP_MB - OS_BUFFER_MB
+    phys_budget = max(phys_budget, 180)   # Minimum 180MB
+
+    # Swap varsa: heap için swap da kullanılabilir (JVM hot page'ler RAM'de kalır)
+    if sw_mb >= 512:
+        # Swap ile heap'i agresif büyüt — JVM lazy allocation yapar
+        xmx_mb = min(phys_budget + sw_mb // 2, 1200)
+        xmx_mb = max(xmx_mb, 400)   # Swap varken en az 400MB
+    else:
+        # Swap yoksa fiziksel bütçeye bağlıyız — overcommit ile biraz esneyebilir
+        xmx_mb = phys_budget
+        # Overcommit açık olduğundan %10 üzeri tolere edilebilir
+        xmx_mb = min(int(xmx_mb * 1.10), 320)
+        xmx_mb = max(xmx_mb, 200)
+
+    # Agent pool varsa: daha az chunk bellek baskısı (cache offload ileride)
     if agent_count >= 2:
-        log(f"[Panel] 🔗 {agent_count} agent mevcut → Xmx artırılabilir")
-        xmx_mb = min(xmx_mb + 32, 340)   # Agent varsa +32MB
+        xmx_mb = min(xmx_mb + 40, xmx_mb + 40)
+
+    xms_mb = 32   # Düşük başla, G1GC büyütsün
 
     log(f"[Panel] 🧠 Container={container_ram_mb}MB Swap={sw_mb}MB Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
     return [
         "java", f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
-        "-XX:CompressedClassSpaceSize=32m", "-XX:MaxMetaspaceSize=96m",
-        "-XX:ReservedCodeCacheSize=48m",
-        # G1GC — küçük heap için ayarlandı
+        "-Xss320k",                            # Thread stack: 512k→320k (~10MB tasarruf)
+        "-XX:CompressedClassSpaceSize=24m",
+        "-XX:MaxMetaspaceSize=64m",            # 96→64MB
+        "-XX:ReservedCodeCacheSize=32m",       # 48→32MB
         "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled",
-        "-XX:MaxGCPauseMillis=150",
+        "-XX:MaxGCPauseMillis=200",
+        "-XX:ConcGCThreads=1", "-XX:ParallelGCThreads=2",  # GC thread sayısını sınırla
         "-XX:+UnlockExperimentalVMOptions", "-XX:+DisableExplicitGC",
         "-XX:G1PeriodicGCInterval=10000", "-XX:+G1PeriodicGCInvokesConcurrent",
         "-XX:G1NewSizePercent=15", "-XX:G1MaxNewSizePercent=25",
-        "-XX:G1HeapRegionSize=2m",   # Küçük heap → küçük region
+        "-XX:G1HeapRegionSize=2m",
         "-XX:G1ReservePercent=15",
         "-XX:InitiatingHeapOccupancyPercent=20",
         "-XX:SoftRefLRUPolicyMSPerMB=0",
-        # Bellek baskısı azaltma
         "-XX:+UseStringDeduplication",
         "-XX:+UseCompressedOops",
         "-XX:+OptimizeStringConcat",
-        "-XX:+TieredCompilation", "-XX:TieredStopAtLevel=1",  # JIT hızlı, az kod önbelleği
+        "-XX:+TieredCompilation", "-XX:TieredStopAtLevel=1",
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8", "-Dcom.mojang.eula.agree=true",
-        # GC log sessiz
         "-Xlog:disable",
         "-jar", str(MC_JAR), "--nogui",
     ]
@@ -406,6 +421,19 @@ def start_server():
             socketio.emit("server_status", server_state)
             return False, "Jar indirilemedi"
     write_server_config()
+
+    # Agentları bekle — JVM args hesabına agent sayısı dahil edilsin
+    # ve proxy hazır olsun. Maks 75sn bekle.
+    if _pool.agent_count() == 0:
+        log("[Panel] ⏳ Agent bekleniyor (maks 75sn)...")
+        for _ in range(75):
+            eventlet.sleep(1)
+            if _pool.agent_count() >= 1:
+                log(f"[Panel] ✅ {_pool.agent_count()} agent hazır")
+                break
+        else:
+            log("[Panel] ⚠️  Agent bağlanamadı — swap olmadan düşük Xmx ile devam")
+
     server_state.update({"status": "starting", "online_players": 0})
     players.clear()
     socketio.emit("server_status", server_state)
