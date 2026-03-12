@@ -542,6 +542,18 @@ def send_command(cmd: str) -> bool:
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
+    data = request.json or {}
+    is_internal = data.get("_internal", False)
+
+    if not is_internal:
+        min_req = int(os.environ.get("MIN_SUPPORT_NODES", "3"))
+        nbd_cnt = nbd_connected_count()
+        if nbd_cnt < min_req:
+            msg = (f"⛔ {nbd_cnt}/{min_req} destek düğümü NBD bağlı. "
+                   f"Otomatik başlatma düğümler hazır olunca devreye girecek.")
+            log(f"[Panel] {msg}")
+            return jsonify({"ok": False, "msg": msg})
+
     ok, msg = start_server()
     return jsonify({"ok": ok, "msg": msg})
 

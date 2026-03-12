@@ -1,17 +1,18 @@
 """
-⛏️  Minecraft Server Boot — RENDER BYPASS v9.4
+⛏️  Minecraft Server Boot — RENDER BYPASS v9.5
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v9.4 Değişiklikler:
-  - wstunnel KALDIRILDI (binary kurulum güvenilmez)
-  - Python websockets köprüsü eklendi (pip, saf Python)
-  - Destek: nbd-server → ws_bridge_server(8080) → cloudflared HTTP
-  - Ana:    wss://host → ws_bridge_client → nbd-client(10810+) → swapon
-  - Min 3 NBD düğümü hazır olmadan MC başlamaz
-  - Daha fazla debug logu — sessiz hata yok
+v9.5 Değişiklikler:
+  - asyncio + websockets kütüphanesi KALDIRILDI (Render'da güvenilmez)
+  - SAF PYTHON SOCKET WebSocket köprüsü eklendi (sıfır dış bağımlılık)
+  - Her adım _panel_log ile web konsoluna yansıyor
+  - mc_panel.py: manuel Başlat 0 NBD varken reddedilir
+  Akış:
+    Destek: nbd-server → raw_ws_server(8080) → cloudflared HTTP
+    Ana:    wss://host → raw_ws_client → local TCP:1081x → nbd-client → swapon
 """
 
 import os, sys, subprocess, time, socket, resource, threading, re, glob, json
-import asyncio, ssl as _ssl
+import ssl as _ssl, hashlib as _hashlib, base64 as _base64, struct as _struct
 import psutil
 import urllib.request as _ur
 
@@ -83,12 +84,12 @@ base_env = {
 }
 
 print("\n" + "━"*56)
-print("  ⛏️   Minecraft Server — RENDER BYPASS v9.4")
+print("  ⛏️   Minecraft Server — RENDER BYPASS v9.5")
 print(f"      MOD       : {'🟢 ANA' if IS_MAIN else '🔵 DESTEK'}")
 print(f"      MY_URL    : {MY_URL or '(boş → ANA)'}")
 print(f"      RAM       : {CONTAINER_RAM_MB}MB")
 if IS_MAIN:
-    print(f"      MIN DESTEK: {MIN_SUPPORT_NODES} düğüm (Python WS köprü)")
+    print(f"      MIN DESTEK: {MIN_SUPPORT_NODES} düğüm (Raw Python WS)")
 print("━"*56 + "\n")
 
 
@@ -255,112 +256,279 @@ def _panel_log(msg):
         pass
 
 
-def _ensure_ws_deps():
-    """websockets pip paketi kurulu mu kontrol et, yoksa kur."""
+_WS_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_handshake_server(sock) -> bool:
+    """HTTP Upgrade isteğini al, 101 cevabı gönder."""
+    data = b""
     try:
-        import websockets  # noqa
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return False
+            data += chunk
+    except OSError:
+        return False
+    m = re.search(rb"Sec-WebSocket-Key:\s*(.+?)\r\n", data, re.IGNORECASE)
+    if not m:
+        return False
+    key = m.group(1).strip()
+    accept = _base64.b64encode(
+        _hashlib.sha1(key + _WS_MAGIC).digest()
+    ).decode()
+    resp = (
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+    ).encode()
+    sock.sendall(resp)
+    return True
+
+
+def _ws_handshake_client(sock, host: str, path: str = "/") -> bool:
+    """WebSocket client handshake gönder, 101 bekle."""
+    key = _base64.b64encode(os.urandom(16)).decode()
+    req = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode()
+    sock.sendall(req)
+    resp = b""
+    try:
+        while b"\r\n\r\n" not in resp:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return False
+            resp += chunk
+    except OSError:
+        return False
+    return b"101" in resp
+
+
+def _ws_recv(sock) -> bytes:
+    """Tek WebSocket frame al, payload döndür."""
+    def recv_exact(n: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("WS bağlantı kesildi")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    hdr = recv_exact(2)
+    opcode = hdr[0] & 0x0F
+    masked = bool(hdr[1] & 0x80)
+    length = hdr[1] & 0x7F
+
+    if opcode == 8:   # close
+        raise ConnectionError("WS close frame")
+    if opcode == 9:   # ping → pong
+        sock.sendall(bytes([0x8A, 0x00]))
+        return _ws_recv(sock)
+    if opcode == 10:  # pong
+        return _ws_recv(sock)
+
+    if length == 126:
+        length = _struct.unpack(">H", recv_exact(2))[0]
+    elif length == 127:
+        length = _struct.unpack(">Q", recv_exact(8))[0]
+
+    mask_key = recv_exact(4) if masked else b"\x00\x00\x00\x00"
+    payload  = bytearray(recv_exact(length))
+    if masked:
+        for i in range(length):
+            payload[i] ^= mask_key[i % 4]
+    return bytes(payload)
+
+
+def _ws_send(sock, data: bytes, masked: bool = False):
+    """Binary WebSocket frame gönder."""
+    length = len(data)
+    if length < 126:
+        hdr = bytes([0x82, (0x80 | length) if masked else length])
+    elif length < 65536:
+        hdr = bytes([0x82, 0xFE if masked else 126]) + _struct.pack(">H", length)
+    else:
+        hdr = bytes([0x82, 0xFF if masked else 127]) + _struct.pack(">Q", length)
+
+    if masked:
+        mask = os.urandom(4)
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        sock.sendall(hdr + mask + payload)
+    else:
+        sock.sendall(hdr + data)
+
+
+def _pipe_both(sock_a, sock_b,
+               a_recv, b_recv,
+               a_send, b_send,
+               label: str, stop_ev: threading.Event):
+    """İki socket arasında çift yönlü veri aktarımı (thread-per-direction)."""
+    def a_to_b():
+        try:
+            while not stop_ev.is_set():
+                data = a_recv(sock_a)
+                if not data:
+                    break
+                b_send(sock_b, data)
+        except Exception:
+            pass
+        finally:
+            stop_ev.set()
+
+    def b_to_a():
+        try:
+            while not stop_ev.is_set():
+                data = b_recv(sock_b)
+                if not data:
+                    break
+                a_send(sock_a, data)
+        except Exception:
+            pass
+        finally:
+            stop_ev.set()
+
+    t1 = threading.Thread(target=a_to_b, daemon=True)
+    t2 = threading.Thread(target=b_to_a, daemon=True)
+    t1.start(); t2.start()
+    stop_ev.wait()
+    t1.join(timeout=2); t2.join(timeout=2)
+
+
+# ─── Destek: WS sunucu köprüsü (raw socket) ──────────────────
+
+def support_start_ws_bridge():
+    """
+    Saf Python socket WS sunucu:
+      Gelen WS bağlantısını nbd-server TCP portuna (10809) köprüler.
+      cloudflared HTTP tüneli ile trycloudflare uyumlu.
+    """
+    def handle_client(ws_sock):
+        try:
+            if not _ws_handshake_server(ws_sock):
+                print("  [ws-srv] ❌ WS handshake başarısız")
+                return
+            # nbd-server'a bağlan
+            nbd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            nbd.settimeout(10)
+            nbd.connect(("127.0.0.1", NBD_SERVER_PORT))
+            nbd.settimeout(None)
+            print(f"  [ws-srv] ✅ WS→NBD köprüsü kuruldu")
+            stop_ev = threading.Event()
+            ws_sock.settimeout(None)
+            _pipe_both(
+                ws_sock, nbd,
+                a_recv=lambda s: _ws_recv(s),
+                b_recv=lambda s: s.recv(65536),
+                a_send=lambda s, d: _ws_send(s, d, masked=False),
+                b_send=lambda s, d: s.sendall(d),
+                label="ws-srv", stop_ev=stop_ev,
+            )
+        except Exception as e:
+            print(f"  [ws-srv] hata: {e}")
+        finally:
+            try: ws_sock.close()
+            except: pass
+
+    def server_loop():
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("0.0.0.0", WS_BRIDGE_PORT))
+            srv.listen(8)
+            srv.settimeout(1.0)
+            print(f"  [destek] ✅ WS köprü sunucusu :0.0.0.0:{WS_BRIDGE_PORT}")
+            while True:
+                try:
+                    ws_sock, addr = srv.accept()
+                    threading.Thread(
+                        target=handle_client, args=(ws_sock,), daemon=True
+                    ).start()
+                except socket.timeout:
+                    continue
+        except Exception as e:
+            print(f"  [ws-srv] sunucu hatası: {e}")
+        finally:
+            srv.close()
+
+    t = threading.Thread(target=server_loop, daemon=True)
+    t.start()
+    if wait_port(WS_BRIDGE_PORT, timeout=8):
+        print(f"  [destek] ✅ WS köprüsü :{WS_BRIDGE_PORT} hazır")
         return True
-    except ImportError:
-        pass
-    print("  [ws] websockets paketi kuruluyor...")
-    r = sh("pip install websockets --break-system-packages -q 2>&1")
-    if r.returncode == 0:
-        print("  [ws] ✅ websockets kuruldu")
-        return True
-    # fallback: pip3
-    r2 = sh("pip3 install websockets --break-system-packages -q 2>&1")
-    if r2.returncode == 0:
-        print("  [ws] ✅ websockets (pip3) kuruldu")
-        return True
-    print(f"  [ws] ❌ websockets kurulamadı: {r.stdout.decode()[:150]}")
+    print(f"  [destek] ❌ WS köprüsü :{WS_BRIDGE_PORT} başlamadı!")
     return False
 
 
-def _start_ws_tcp_bridge_client(local_port: int, remote_wss: str, stop_ev: threading.Event):
+# ─── Ana: WS istemci köprüsü (raw socket) ────────────────────
+
+def _ws_bridge_client_loop(local_port: int, remote_host: str, stop_ev: threading.Event):
     """
-    Python asyncio köprüsü:
-      TCP :local_port  ←→  WSS remote_wss
-    nbd-client local_port'a bağlanır, veriler WSS üzerinden geçer.
-    stop_ev set edilince durur.
+    Yerel TCP portunu dinler; her bağlantı için WSS köprüsü açar.
     """
-    import importlib
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        ws_mod = importlib.import_module("websockets")
-    except ImportError:
-        print(f"  [ws] ❌ websockets import başarısız")
+        srv.bind(("127.0.0.1", local_port))
+        srv.listen(4)
+        srv.settimeout(1.0)
+    except Exception as e:
+        print(f"  [ws-cli] ❌ Port {local_port} açılamadı: {e}")
         stop_ev.set()
         return
 
-    async def pipe(reader, writer):
-        while True:
-            d = await reader.read(65536)
-            if not d:
-                break
-            writer.write(d)
-            await writer.drain()
-
-    async def handle_client(tcp_r, tcp_w):
+    def handle_tcp(tcp_sock):
         try:
             ssl_ctx = _ssl.create_default_context()
-            async with ws_mod.connect(remote_wss, ssl=ssl_ctx,
-                                      ping_interval=20, ping_timeout=30,
-                                      max_size=2**24) as ws:
-                # WebSocket <-> TCP yönlendirme
-                async def tcp_to_ws():
-                    try:
-                        while True:
-                            data = await tcp_r.read(65536)
-                            if not data:
-                                break
-                            await ws.send(data)
-                    except Exception:
-                        pass
-                    finally:
-                        await ws.close()
-
-                async def ws_to_tcp():
-                    try:
-                        async for msg in ws:
-                            if isinstance(msg, str):
-                                msg = msg.encode()
-                            tcp_w.write(msg)
-                            await tcp_w.drain()
-                    except Exception:
-                        pass
-                    finally:
-                        tcp_w.close()
-
-                await asyncio.gather(tcp_to_ws(), ws_to_tcp(),
-                                     return_exceptions=True)
+            ws_raw  = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ws_raw.settimeout(20)
+            ws_raw  = ssl_ctx.wrap_socket(ws_raw, server_hostname=remote_host)
+            ws_raw.connect((remote_host, 443))
+            ws_raw.settimeout(None)
+            if not _ws_handshake_client(ws_raw, remote_host):
+                print(f"  [ws-cli] ❌ WS handshake başarısız: {remote_host}")
+                ws_raw.close(); tcp_sock.close()
+                return
+            conn_stop = threading.Event()
+            _pipe_both(
+                tcp_sock, ws_raw,
+                a_recv=lambda s: s.recv(65536),
+                b_recv=lambda s: _ws_recv(s),
+                a_send=lambda s, d: s.sendall(d),
+                b_send=lambda s, d: _ws_send(s, d, masked=True),
+                label="ws-cli", stop_ev=conn_stop,
+            )
         except Exception as e:
-            print(f"  [ws] ❌ WebSocket bağlantı hatası: {e}")
+            print(f"  [ws-cli] bağlantı hatası ({remote_host}): {e}")
+        finally:
+            try: tcp_sock.close()
+            except: pass
 
-    async def run_server():
-        server = await asyncio.start_server(
-            handle_client, "127.0.0.1", local_port
-        )
-        print(f"  [ws] ✅ TCP→WSS köprüsü :127.0.0.1:{local_port} → {remote_wss}")
-        async with server:
-            while not stop_ev.is_set():
-                await asyncio.sleep(0.5)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(run_server())
-    except Exception as e:
-        print(f"  [ws] köprü hata: {e}")
-    finally:
-        loop.close()
-        stop_ev.set()
+    while not stop_ev.is_set():
+        try:
+            tcp_sock, addr = srv.accept()
+            threading.Thread(target=handle_tcp, args=(tcp_sock,), daemon=True).start()
+        except socket.timeout:
+            continue
+        except Exception as e:
+            if not stop_ev.is_set():
+                print(f"  [ws-cli] accept hatası: {e}")
+                time.sleep(1)
+    srv.close()
 
 
 def connect_worker_nbd(host: str, node_id: str = "") -> bool:
     """
-    Python WebSocket köprüsü:
-      wss://host (cloudflared HTTPS tüneli)
-      → ws_bridge_server (WS_BRIDGE_PORT = 8080)
-      → nbd-server (NBD_SERVER_PORT = 10809)
+    Saf Python WS köprüsü:
+      wss://host:443 (cloudflared HTTPS tüneli)
+      → WS server (WS_BRIDGE_PORT=8080) → nbd-server (10809)
     Sonra nbd-client yerel porta bağlanır, disk swap olarak eklenir.
     """
     if not node_id:
@@ -370,59 +538,73 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
             return True
         port, dev = _next_free_slot()
         if not port:
-            print("  [nbd] ⚠️  Boş slot yok (max 16)")
+            _panel_log("  [nbd] ⚠️  Boş slot yok (max 16)")
             return False
         _nbd_nodes[node_id] = {"port": port, "dev": dev, "connected": False, "stop": None}
 
     cnt_before = nbd_connected_count()
-    print(f"\n  [nbd] 🔌 Bağlanılıyor: {node_id}")
-    print(f"        wss     : wss://{host}")
-    print(f"        local   : 127.0.0.1:{port} → {dev}")
+    msg = f"[nbd] 🔌 Bağlanılıyor: {node_id} | local:{port} → {dev}"
+    print(f"\n  {msg}")
+    _panel_log(f"[Panel] {msg}")
 
-    if not _ensure_ws_deps():
-        with _nbd_lock:
-            _nbd_nodes.pop(node_id, None)
-        return False
+    # nbd kernel modülü
+    r_mod = sh("modprobe nbd max_part=0 2>&1")
+    if r_mod.returncode != 0:
+        out = r_mod.stdout.decode()[:100]
+        _panel_log(f"[Panel] ⚠️  modprobe nbd: {out} (devam ediliyor)")
 
-    sh("modprobe nbd max_part=0 2>/dev/null")
+    # nbd-client kurulu mu?
+    import shutil as _s
+    if not _s.which("nbd-client"):
+        _panel_log("[Panel] ⚙️  nbd-client kuruluyor...")
+        sh("apt-get update -qq 2>/dev/null && "
+           "DEBIAN_FRONTEND=noninteractive apt-get install -y "
+           "--no-install-recommends nbd-client 2>/dev/null")
+        if not _s.which("nbd-client"):
+            _panel_log("[Panel] ❌ nbd-client kurulamadı!")
+            with _nbd_lock: _nbd_nodes.pop(node_id, None)
+            return False
 
-    # Python WS→TCP köprüsünü ayrı thread'de başlat
-    stop_ev  = threading.Event()
-    wss_url  = f"wss://{host}"
+    # WS istemci köprüsü başlat
+    stop_ev = threading.Event()
     bridge_t = threading.Thread(
-        target=_start_ws_tcp_bridge_client,
-        args=(port, wss_url, stop_ev),
+        target=_ws_bridge_client_loop,
+        args=(port, host, stop_ev),
         daemon=True
     )
     bridge_t.start()
 
-    # Köprü hazır olana kadar bekle
-    if not wait_port(port, timeout=15):
-        print(f"  [nbd] ❌ WS köprüsü {port} portu açılmadı (15sn)")
+    # Köprü TCP portu açılana kadar bekle (20sn)
+    if not wait_port(port, timeout=20):
+        _panel_log(f"[Panel] ❌ WS köprü portu {port} açılmadı (20sn) — "
+                   f"nbd-client atlanıyor")
         stop_ev.set()
-        with _nbd_lock:
-            _nbd_nodes.pop(node_id, None)
+        with _nbd_lock: _nbd_nodes.pop(node_id, None)
         return False
 
+    _panel_log(f"[Panel] ✅ WS köprüsü :127.0.0.1:{port} hazır, nbd-client bağlanıyor...")
+
     # nbd-client bağlan
-    r = sh(f"nbd-client 127.0.0.1 {port} {dev} -N disk -b 4096 -t 60 2>&1")
+    r = sh(f"nbd-client 127.0.0.1 {port} {dev} -N disk -b 4096 -t 30 2>&1")
     if r.returncode != 0:
-        print(f"  [nbd] ❌ nbd-client hatası: {r.stdout.decode()[:200]}")
+        out = r.stdout.decode()[:300]
+        _panel_log(f"[Panel] ❌ nbd-client hatası ({node_id}): {out}")
         stop_ev.set()
-        with _nbd_lock:
-            _nbd_nodes.pop(node_id, None)
+        with _nbd_lock: _nbd_nodes.pop(node_id, None)
         return False
+
+    _panel_log(f"[Panel] ✅ nbd-client bağlandı: {dev}")
 
     # mkswap + swapon
     sh(f"mkswap {dev} 2>/dev/null")
     prio = max(1, 10 - cnt_before)
-    r2 = sh(f"swapon -p {prio} {dev}")
+    r2 = sh(f"swapon -p {prio} {dev} 2>&1")
     if r2.returncode != 0:
-        print(f"  [nbd] ❌ swapon hatası: {r2.stderr.decode()[:100]}")
+        err = r2.stdout.decode()[:150]
+        _panel_log(f"[Panel] ❌ swapon {dev}: {err}")
         sh(f"nbd-client -d {dev} 2>/dev/null")
         stop_ev.set()
-        with _nbd_lock:
-            _nbd_nodes.pop(node_id, None)
+        with _nbd_lock: _nbd_nodes.pop(node_id, None)
         return False
 
     with _nbd_lock:
@@ -431,23 +613,18 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
 
     cnt = nbd_connected_count()
     swp = psutil.swap_memory()
-    print(f"  [nbd] ✅ {node_id}: {dev} (prio:{prio}) | "
-          f"Swap:{swp.total//1024//1024}MB | {cnt}/{MIN_SUPPORT_NODES} düğüm")
-    _panel_log(
-        f"[Panel] 🔗 NBD bağlandı: {node_id} ({dev}) | "
-        f"Swap:{swp.total//1024//1024}MB | {cnt}/{MIN_SUPPORT_NODES} düğüm"
-    )
+    msg2 = (f"🔗 NBD ✅ {node_id}: {dev} (prio:{prio}) | "
+            f"Swap:{swp.total//1024//1024}MB | {cnt}/{MIN_SUPPORT_NODES} düğüm")
+    print(f"  [nbd] {msg2}")
+    _panel_log(f"[Panel] {msg2}")
 
-    # Panel'e bildir
     try:
         _ur.urlopen(
             _ur.Request(
                 f"http://localhost:{PORT}/api/internal/nbd_status",
                 data=json.dumps({
-                    "nbd_connected": True,
-                    "host": host,
-                    "node_id": node_id,
-                    "dev": dev,
+                    "nbd_connected": True, "host": host,
+                    "node_id": node_id, "dev": dev,
                 }).encode(),
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -472,15 +649,15 @@ def _connect_node_loop(host: str, node_id: str):
 
 
 def _ensure_main_tools():
-    """Ana sunucuda nbd-client ve websockets kurulu olduğundan emin ol."""
+    """Ana sunucuda nbd-client kurulu olduğundan emin ol."""
     import shutil as _s
     missing = [t for t in ["nbd-client"] if not _s.which(t)]
     if missing:
-        print(f"  [ana] Eksik araçlar kuruluyor: {', '.join(missing)}")
+        print(f"  [ana] nbd-client kuruluyor...")
         sh("apt-get update -qq 2>/dev/null && "
            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
            f"--no-install-recommends {' '.join(missing)} 2>/dev/null")
-    _ensure_ws_deps()
+    _panel_log("[Panel] ⚙️  Ana sunucu araçları hazır (nbd-client, raw WS köprüsü)")
 
 
 def try_connect_all_workers():
@@ -593,12 +770,12 @@ def auto_start_sequence():
     # ❶ Bariyer: min 3 NBD bağlı olmadan devam etme
     _wait_for_support_nodes()
 
-    # ❷ MC başlat
+    # ❷ MC başlat (internal flag ile — bariyer zaten geçildi)
     try:
         _ur.urlopen(
             _ur.Request(
                 f"http://localhost:{PORT}/api/start",
-                data=b"{}",
+                data=json.dumps({"_internal": True}).encode(),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             ),
@@ -667,71 +844,6 @@ def support_install_tools():
             f"--no-install-recommends {' '.join(missing)} 2>/dev/null"
         )
         print(f"  [destek] ✅ Kuruldu: {', '.join(missing)}")
-    _ensure_ws_deps()
-
-
-def support_start_ws_bridge():
-    """
-    Python asyncio WebSocket server:
-      Gelen WS bağlantısını nbd-server TCP portuna (10809) köprüler.
-      cloudflared HTTP tüneli üzerinden erişilir — trycloudflare uyumlu!
-    """
-    _ensure_ws_deps()
-
-    async def ws_to_nbd(websocket):
-        try:
-            reader, writer = await asyncio.open_connection("127.0.0.1", NBD_SERVER_PORT)
-        except Exception as e:
-            print(f"  [ws-server] ❌ nbd-server bağlantısı kurulamadı: {e}")
-            return
-
-        async def nbd_to_ws():
-            try:
-                while True:
-                    data = await reader.read(65536)
-                    if not data:
-                        break
-                    await websocket.send(data)
-            except Exception:
-                pass
-            finally:
-                await websocket.close()
-
-        async def ws_to_nbd_inner():
-            try:
-                async for msg in websocket:
-                    if isinstance(msg, str):
-                        msg = msg.encode()
-                    writer.write(msg)
-                    await writer.drain()
-            except Exception:
-                pass
-            finally:
-                writer.close()
-
-        await asyncio.gather(nbd_to_ws(), ws_to_nbd_inner(), return_exceptions=True)
-
-    async def run_ws_server():
-        import importlib
-        ws_mod = importlib.import_module("websockets")
-        async with ws_mod.serve(ws_to_nbd, "0.0.0.0", WS_BRIDGE_PORT,
-                                max_size=2**24, ping_interval=20):
-            print(f"  [destek] ✅ WS köprü sunucusu :0.0.0.0:{WS_BRIDGE_PORT}")
-            await asyncio.Future()  # sonsuza kadar çalış
-
-    def _run():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(run_ws_server())
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    # Sunucunun ayağa kalkması için bekle
-    time.sleep(2)
-    if wait_port(WS_BRIDGE_PORT, timeout=10):
-        print(f"  [destek] ✅ WS köprüsü :{WS_BRIDGE_PORT} hazır")
-        return True
-    print(f"  [destek] ❌ WS köprüsü :{WS_BRIDGE_PORT} başlamadı")
     return False
 
 
