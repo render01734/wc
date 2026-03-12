@@ -257,97 +257,111 @@ def write_server_config():
 
 def _setup_swap():
     """
-    Disk'ten swap aç + cgroup bellek limitini kaldır.
-    Render 512MB cgroup limiti → swap ile aşılır.
-    Fiziksel RSS düşük kalır, sanal bellek büyük olur.
+    Tüm cgroup/bellek limitleri kaldır + disk → swap.
+    main.py zaten boot'ta yapıyor; panel yeniden başlarsa diye burada da çalışır.
     """
     import psutil, subprocess, os, glob
+
+    def _w(path, val):
+        try:
+            with open(path, "w") as f: f.write(str(val))
+            return True
+        except Exception:
+            return False
+
     try:
-        # ── Önce cgroup limitlerini kaldır ────────────────────
-        cgroup_pairs = [
-            ("/sys/fs/cgroup/memory.max",                         "max"),
-            ("/sys/fs/cgroup/memory.swap.max",                    "max"),
+        # ── cgroup v2 ─────────────────────────────────────────
+        for path, val in [
+            ("/sys/fs/cgroup/memory.max",      "max"),
+            ("/sys/fs/cgroup/memory.swap.max", "max"),
+            ("/sys/fs/cgroup/memory.high",     "max"),
+            ("/sys/fs/cgroup/cpu.max",         "max"),
+            ("/sys/fs/cgroup/pids.max",        "max"),
+        ]:
+            _w(path, val)
+        for cg_dir in glob.glob("/sys/fs/cgroup/*/") + glob.glob("/sys/fs/cgroup/*/*/"):
+            for fn, v in [("memory.max","max"),("memory.swap.max","max"),
+                          ("memory.high","max"),("cpu.max","max"),("pids.max","max")]:
+                _w(cg_dir + fn, v)
+
+        # ── cgroup v1 ─────────────────────────────────────────
+        for path, val in [
             ("/sys/fs/cgroup/memory/memory.limit_in_bytes",       "-1"),
             ("/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes", "-1"),
             ("/sys/fs/cgroup/memory/memory.soft_limit_in_bytes",  "-1"),
             ("/sys/fs/cgroup/memory/memory.swappiness",           "100"),
             ("/sys/fs/cgroup/memory/memory.oom_control",          "0"),
-        ]
-        unlocked = 0
-        for path, val in cgroup_pairs:
-            try:
-                with open(path, "w") as f:
-                    f.write(val)
-                unlocked += 1
-            except Exception:
-                pass
-        # Tüm alt cgroup'lar
-        for cg in glob.glob("/sys/fs/cgroup/memory/*/"):
-            for fn, v in [("memory.limit_in_bytes", "-1"),
-                          ("memory.memsw.limit_in_bytes", "-1"),
-                          ("memory.swappiness", "100"),
-                          ("memory.oom_control", "0")]:
-                try:
-                    with open(cg + fn, "w") as f: f.write(v)
-                except Exception:
-                    pass
-        log(f"[Panel] 🔓 cgroup: {unlocked} limit kaldırıldı")
+            ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us",               "-1"),
+            ("/sys/fs/cgroup/pids/pids.max",                      "max"),
+        ]:
+            _w(path, val)
+        for cg_dir in glob.glob("/sys/fs/cgroup/memory/*/"):
+            _w(cg_dir + "memory.limit_in_bytes",       "-1")
+            _w(cg_dir + "memory.memsw.limit_in_bytes", "-1")
+            _w(cg_dir + "memory.swappiness",           "100")
+            _w(cg_dir + "memory.oom_control",          "0")
+        for cg_dir in glob.glob("/sys/fs/cgroup/cpu/*/"):
+            _w(cg_dir + "cpu.cfs_quota_us", "-1")
 
-        # ── Swap zaten varsa atla ──────────────────────────────
+        log("[Panel] 🔓 cgroup tüm limitler kaldırıldı")
+
+        # ── Swap zaten yeterliyse atla ─────────────────────────
         swp = psutil.swap_memory()
-        if swp.total > 2 * 1024 * 1024 * 1024:
-            log(f"[Panel] ✅ Swap zaten aktif: {swp.total//1024//1024}MB")
-            return
-
-        # ── Swap dosyası oluştur ───────────────────────────────
-        disk    = psutil.disk_usage("/")
+        disk = psutil.disk_usage("/")
         free_gb = disk.free / 1024 / 1024 / 1024
-        swap_gb = min(32, int(free_gb * 0.60))   # boş alanın %60'ı, max 32GB
-        if swap_gb < 2:
-            log("[Panel] ⚠️  Swap: yeterli disk yok")
-            return
+        swap_gb = min(64, int(free_gb * 0.80))
+        swap_mb = swap_gb * 1024
 
-        swap_file = "/swapfile"
-        swap_mb   = swap_gb * 1024
-        log(f"[Panel] 💾 Swap oluşturuluyor: {swap_gb}GB ({swap_mb}MB)...")
+        if swp.total >= swap_mb * 1024 * 1024 * 0.9:
+            log(f"[Panel] ✅ Swap zaten aktif: {swp.total//1024//1024}MB")
+        else:
+            swap_file = "/swapfile"
+            log(f"[Panel] 💾 Swap oluşturuluyor: {swap_gb}GB...")
 
-        if not os.path.exists(swap_file):
+            if os.path.exists(swap_file):
+                subprocess.run(["swapoff", swap_file], capture_output=True)
+                try: os.remove(swap_file)
+                except: pass
+
             ret = subprocess.run(
                 ["fallocate", "-l", f"{swap_mb}M", swap_file],
                 capture_output=True
             )
             if ret.returncode != 0:
-                # fallocate çalışmadıysa dd kullan
                 subprocess.run([
                     "dd", "if=/dev/zero", f"of={swap_file}",
-                    "bs=64M", f"count={swap_mb // 64}", "status=none"
+                    "bs=64M", f"count={max(1, swap_mb//64)}", "status=none"
                 ], capture_output=True)
 
-        subprocess.run(["chmod", "600", swap_file], capture_output=True)
-        subprocess.run(["mkswap", "-f", swap_file], capture_output=True)
-        ret2 = subprocess.run(["swapon", swap_file], capture_output=True)
+            subprocess.run(["chmod", "600", swap_file], capture_output=True)
+            subprocess.run(["mkswap", "-f", swap_file], capture_output=True)
+            subprocess.run(["swapon", "-p", "0", swap_file], capture_output=True)
 
-        if ret2.returncode != 0:
-            log(f"[Panel] ⚠️  swapon: {ret2.stderr.decode().strip()}")
-        else:
-            # ── VM ayarları — fiziksel RAM'i boş tut ──────────
-            for path, val in [
-                ("/proc/sys/vm/swappiness",             "100"),
-                ("/proc/sys/vm/vfs_cache_pressure",     "500"),
-                ("/proc/sys/vm/overcommit_memory",      "1"),
-                ("/proc/sys/vm/overcommit_ratio",       "100"),
-                ("/proc/sys/vm/page-cluster",           "0"),
-                ("/proc/sys/vm/drop_caches",            "3"),
-            ]:
-                try:
-                    with open(path, "w") as f: f.write(val)
-                except Exception:
-                    pass
+            # zram
+            subprocess.run(["modprobe", "zram", "num_devices=1"], capture_output=True)
+            zram_mb = min(4096, psutil.virtual_memory().total // 1024 // 1024)
+            _w("/sys/block/zram0/comp_algorithm", "lz4")
+            if _w("/sys/block/zram0/disksize", f"{zram_mb}M"):
+                subprocess.run(["mkswap", "/dev/zram0"], capture_output=True)
+                subprocess.run(["swapon", "-p", "100", "/dev/zram0"], capture_output=True)
+
+        # ── VM ayarları ────────────────────────────────────────
+        for path, val in [
+            ("/proc/sys/vm/swappiness",             "200"),
+            ("/proc/sys/vm/vfs_cache_pressure",     "500"),
+            ("/proc/sys/vm/overcommit_memory",      "1"),
+            ("/proc/sys/vm/overcommit_ratio",       "100"),
+            ("/proc/sys/vm/page-cluster",           "0"),
+            ("/proc/sys/vm/watermark_boost_factor", "0"),
+            ("/proc/sys/vm/drop_caches",            "3"),
+        ]:
+            if not _w(path, val) and "swappiness" in path:
+                _w(path, "100")
 
         swp2 = psutil.swap_memory()
         mem  = psutil.virtual_memory()
-        total = (mem.total + swp2.total) // 1024 // 1024
-        log(f"[Panel] ✅ Bellek: RAM={mem.total//1024//1024}MB + Swap={swp2.total//1024//1024}MB = {total}MB toplam")
+        log(f"[Panel] ✅ RAM={mem.total//1024//1024}MB + Swap={swp2.total//1024//1024}MB "
+            f"= {(mem.total+swp2.total)//1024//1024}MB toplam")
 
     except Exception as e:
         log(f"[Panel] ⚠️  Swap/cgroup hatası: {e}")

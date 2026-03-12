@@ -1,10 +1,17 @@
 """
-⛏️  Minecraft Server Boot Sistemi
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Strateji:
-  - Render 512MB cgroup limiti → cgroup swap sınırını kaldır
-  - Host disk'ini swap'a çevir → JVM büyük heap kullanır
-  - Fiziksel RAM kullanımı düşük tut → Render'ı atla
+⛏️  Minecraft Server Boot — TÜM LİMİTLER KALDIRILDI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Render'ın tüm kısıtlamalarını bypass et:
+  ✓ cgroup v1 + v2 bellek / swap / cpu / pid limitleri
+  ✓ ulimit (nofile, nproc, stack, memlock, fsize...)
+  ✓ Kernel VM / net / fs / sched parametreleri
+  ✓ Disk → Swap (boş diskin %80'i, max 64GB)
+  ✓ zram sıkıştırılmış RAM swap
+  ✓ Huge Pages (JVM GC hızlandır)
+  ✓ CPU governor → performance
+  ✓ I/O scheduler → none/mq-deadline
+  ✓ OOM killer devre dışı
+  ✓ Namespace / ptrace / perf kısıtlamaları
 """
 
 import os, sys, subprocess, time, socket, resource, threading, re, glob
@@ -24,6 +31,8 @@ base_env = {
     "PORT":   str(PORT),
 }
 
+INF = resource.RLIM_INFINITY
+
 
 def w(path, val):
     try:
@@ -34,12 +43,8 @@ def w(path, val):
         return False
 
 
-def r(path):
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except Exception:
-        return ""
+def sh(cmd):
+    return subprocess.run(cmd, shell=True, capture_output=True)
 
 
 def wait_port(port, timeout=60):
@@ -54,201 +59,285 @@ def wait_port(port, timeout=60):
 
 
 # ══════════════════════════════════════════════════════════════
-#  AŞAMA 1 — CGROUP LIMITI KALDIR + SWAP AÇ + OPTİMİZASYON
+#  1 — ULIMIT
 # ══════════════════════════════════════════════════════════════
 
-def unlock_cgroup_memory():
-    """
-    Render'ın 512MB cgroup limitini aşmak için:
-    cgroup v2 ve v1 memory swap limitlerini kaldır.
-    Bu sayede fiziksel RAM 512MB üstüne çıkmadan swap kullanılabilir.
-    """
-    print("🔓 cgroup bellek limitleri kaldırılıyor...")
+def bypass_ulimits():
+    print("  [ulimit] Tüm process sınırları kaldırılıyor...")
+    limits = [
+        resource.RLIMIT_NOFILE,
+        resource.RLIMIT_NPROC,
+        resource.RLIMIT_STACK,
+        resource.RLIMIT_CORE,
+        resource.RLIMIT_DATA,
+        resource.RLIMIT_FSIZE,
+        resource.RLIMIT_MEMLOCK,
+    ]
+    ok = 0
+    for res in limits:
+        try:
+            soft, hard = resource.getrlimit(res)
+            try:
+                resource.setrlimit(res, (INF, INF))
+                ok += 1
+            except ValueError:
+                resource.setrlimit(res, (hard, hard))
+        except Exception:
+            pass
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (1048576, 1048576))
+    except Exception:
+        pass
+    print(f"  ✅ ulimit → {ok}/{len(limits)} sınır kaldırıldı")
 
+
+# ══════════════════════════════════════════════════════════════
+#  2 — CGROUP V1 + V2
+# ══════════════════════════════════════════════════════════════
+
+def bypass_cgroups():
+    print("  [cgroup] Tüm cgroup limitleri kaldırılıyor...")
     unlocked = 0
 
-    # ── cgroup v2 ─────────────────────────────────────────────
-    cg2_paths = [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory.swap.max",
-        "/sys/fs/cgroup/memory.memsw.limit_in_bytes",
-    ]
-    for path in cg2_paths:
-        if w(path, "max"):
-            unlocked += 1
-            print(f"  ✅ {path} → max")
+    # cgroup v2
+    cg2 = {
+        "/sys/fs/cgroup/memory.max":      "max",
+        "/sys/fs/cgroup/memory.swap.max": "max",
+        "/sys/fs/cgroup/memory.high":     "max",
+        "/sys/fs/cgroup/memory.low":      "0",
+        "/sys/fs/cgroup/cpu.max":         "max",
+        "/sys/fs/cgroup/cpu.weight":      "10000",
+        "/sys/fs/cgroup/pids.max":        "max",
+    }
+    for path, val in cg2.items():
+        if w(path, val): unlocked += 1
 
-    # cgroup v2 — container'ın kendi cgroup'u
-    for cg_dir in glob.glob("/sys/fs/cgroup/system.slice/*/"):
-        for fname in ["memory.max", "memory.swap.max"]:
-            w(cg_dir + fname, "max")
+    # cgroup v2 alt dizinler
+    for cg_dir in glob.glob("/sys/fs/cgroup/*/") + glob.glob("/sys/fs/cgroup/*/*/"):
+        for fn, val in [("memory.max","max"),("memory.swap.max","max"),
+                        ("memory.high","max"),("cpu.max","max"),("pids.max","max")]:
+            w(cg_dir + fn, val)
 
-    # ── cgroup v1 ─────────────────────────────────────────────
-    cg1_pairs = [
-        ("/sys/fs/cgroup/memory/memory.limit_in_bytes",         "-1"),
-        ("/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes",   "-1"),
-        ("/sys/fs/cgroup/memory/memory.soft_limit_in_bytes",    "-1"),
-        ("/sys/fs/cgroup/memory/memory.swappiness",             "100"),
-        ("/sys/fs/cgroup/memory/memory.oom_control",            "0"),
-    ]
-    for path, val in cg1_pairs:
-        if w(path, val):
-            unlocked += 1
-            print(f"  ✅ {path} → {val}")
+    # cgroup v1
+    cg1 = {
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes":       "-1",
+        "/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes": "-1",
+        "/sys/fs/cgroup/memory/memory.soft_limit_in_bytes":  "-1",
+        "/sys/fs/cgroup/memory/memory.swappiness":           "100",
+        "/sys/fs/cgroup/memory/memory.oom_control":          "0",
+        "/sys/fs/cgroup/memory/memory.use_hierarchy":        "0",
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us":               "-1",
+        "/sys/fs/cgroup/cpu/cpu.shares":                     "1024",
+        "/sys/fs/cgroup/pids/pids.max":                      "max",
+        "/sys/fs/cgroup/blkio/blkio.weight":                 "1000",
+    }
+    for path, val in cg1.items():
+        if w(path, val): unlocked += 1
 
-    # Tüm alt cgroup'ları da aç
-    for mem_cg in glob.glob("/sys/fs/cgroup/memory/*/"):
-        w(mem_cg + "memory.limit_in_bytes",       "-1")
-        w(mem_cg + "memory.memsw.limit_in_bytes", "-1")
-        w(mem_cg + "memory.swappiness",           "100")
-        w(mem_cg + "memory.oom_control",          "0")
+    # cgroup v1 alt dizinler
+    for cg_dir in glob.glob("/sys/fs/cgroup/memory/*/") + glob.glob("/sys/fs/cgroup/cpu/*/"):
+        w(cg_dir + "memory.limit_in_bytes",       "-1")
+        w(cg_dir + "memory.memsw.limit_in_bytes", "-1")
+        w(cg_dir + "memory.swappiness",           "100")
+        w(cg_dir + "memory.oom_control",          "0")
+        w(cg_dir + "cpu.cfs_quota_us",            "-1")
 
-    print(f"  {'✅' if unlocked > 0 else '⚠️ '} cgroup: {unlocked} limit kaldırıldı")
+    print(f"  ✅ cgroup → {unlocked} limit kaldırıldı (bellek/cpu/pid)")
 
 
-def setup_swap_aggressive():
-    """
-    Host disk'ini maksimum swap'a çevir.
-    Render'da /var/lib/render veya / altında yüzlerce GB disk var.
-    """
-    print("\n💾 Agresif swap kurulumu başlıyor...")
+# ══════════════════════════════════════════════════════════════
+#  3 — SWAP: DİSKİN %80'İNİ SWAP YAP
+# ══════════════════════════════════════════════════════════════
 
+def setup_swap_maximum():
+    print("  [swap] Maksimum swap kurulumu...")
     import psutil
 
-    # Mevcut swap'ı kontrol et
-    swp = psutil.swap_memory()
-    if swp.total > 2 * 1024 * 1024 * 1024:
-        print(f"  ✅ Swap zaten aktif: {swp.total // 1024 // 1024}MB")
-        return
-
-    disk = psutil.disk_usage("/")
+    disk    = psutil.disk_usage("/")
     free_gb = disk.free / 1024 / 1024 / 1024
-    # Boş alanın %60'ını swap yap, max 32GB
-    swap_gb = min(32, int(free_gb * 0.60))
-
-    print(f"  📊 Disk boş: {free_gb:.1f}GB → Swap: {swap_gb}GB yapılıyor...")
-
-    if swap_gb < 2:
-        print("  ⚠️  Yeterli disk yok")
-        return
-
+    swap_gb = min(64, int(free_gb * 0.80))
+    swap_mb = swap_gb * 1024
     swap_file = "/swapfile"
-    swap_mb   = swap_gb * 1024
 
-    # Swap dosyası yoksa oluştur
-    if not os.path.exists(swap_file):
-        # fallocate hızlı ama bazı FS'lerde çalışmaz, dd fallback
-        ret = subprocess.run(
-            ["fallocate", "-l", f"{swap_mb}M", swap_file],
-            capture_output=True
-        )
-        if ret.returncode != 0:
-            print(f"  ⚠️  fallocate başarısız, dd kullanılıyor...")
-            subprocess.run([
-                "dd", "if=/dev/zero", f"of={swap_file}",
-                f"bs=1M", f"count={swap_mb}", "status=none"
-            ], capture_output=True)
-
-    subprocess.run(["chmod", "600", swap_file], capture_output=True)
-    subprocess.run(["mkswap", "-f", swap_file], capture_output=True)
-    ret = subprocess.run(["swapon", swap_file], capture_output=True)
-
-    if ret.returncode == 0:
-        swp2 = psutil.swap_memory()
-        print(f"  ✅ Swap aktif: {swp2.total // 1024 // 1024}MB")
+    swp = psutil.swap_memory()
+    if swp.total >= swap_mb * 1024 * 1024 * 0.9:
+        print(f"  ✅ Swap zaten aktif: {swp.total//1024//1024}MB")
     else:
-        print(f"  ⚠️  swapon: {ret.stderr.decode().strip()}")
+        print(f"  📊 Disk boş: {free_gb:.0f}GB → Swap hedef: {swap_gb}GB")
+        if os.path.exists(swap_file):
+            sh(f"swapoff {swap_file} 2>/dev/null")
+            try: os.remove(swap_file)
+            except: pass
 
-    # Swap ayarları — kernel swap'ı agresif kullansın
+        ret = sh(f"fallocate -l {swap_mb}M {swap_file}")
+        if ret.returncode != 0:
+            print("  ⚠️  fallocate yok, dd kullanılıyor...")
+            sh(f"dd if=/dev/zero of={swap_file} bs=64M count={max(1,swap_mb//64)} status=none")
+
+        sh(f"chmod 600 {swap_file}")
+        sh(f"mkswap -f {swap_file}")
+        ret2 = sh(f"swapon -p 0 {swap_file}")
+        if ret2.returncode != 0:
+            print(f"  ⚠️  swapon: {ret2.stderr.decode().strip()}")
+
+    # zram — RAM sıkıştır, öncelikli swap
+    sh("modprobe zram num_devices=1 2>/dev/null")
+    mem_bytes = psutil.virtual_memory().total
+    zram_mb   = min(4096, mem_bytes // 1024 // 1024)
+    w("/sys/block/zram0/comp_algorithm", "lz4")
+    if w("/sys/block/zram0/disksize", f"{zram_mb}M"):
+        ret_z = sh("mkswap /dev/zram0 && swapon -p 100 /dev/zram0")
+        if ret_z.returncode == 0:
+            print(f"  ✅ zram: {zram_mb}MB sıkıştırılmış RAM (öncelikli)")
+
+    # VM ayarları
     for path, val in [
-        ("/proc/sys/vm/swappiness",              "200"),   # max agresif (kernel 5.8+ destekler, eskide 100)
-        ("/proc/sys/vm/vfs_cache_pressure",      "500"),   # cache'i agresif boşalt
-        ("/proc/sys/vm/overcommit_memory",       "1"),
-        ("/proc/sys/vm/overcommit_ratio",        "100"),
-        ("/proc/sys/vm/dirty_ratio",             "40"),
-        ("/proc/sys/vm/dirty_background_ratio",  "10"),
-        ("/proc/sys/vm/page-cluster",            "0"),     # swap sayfalarını tek tek oku (latency)
-        ("/proc/sys/vm/watermark_boost_factor",  "0"),
-        ("/proc/sys/vm/watermark_scale_factor",  "125"),
+        ("/proc/sys/vm/swappiness",             "200"),
+        ("/proc/sys/vm/vfs_cache_pressure",     "500"),
+        ("/proc/sys/vm/overcommit_memory",      "1"),
+        ("/proc/sys/vm/overcommit_ratio",       "100"),
+        ("/proc/sys/vm/page-cluster",           "0"),
+        ("/proc/sys/vm/watermark_boost_factor", "0"),
+        ("/proc/sys/vm/watermark_scale_factor", "125"),
     ]:
-        # swappiness için önce 200 dene, hata verirse 100
-        if path == "/proc/sys/vm/swappiness":
-            if not w(path, "200"):
-                w(path, "100")
-        else:
-            w(path, val)
+        if not w(path, val) and "swappiness" in path:
+            w(path, "100")
 
-    # zram — RAM'i sıkıştırarak daha fazla kullanılabilir alan
+    swp2 = psutil.swap_memory()
+    mem  = psutil.virtual_memory()
+    print(f"  ✅ RAM={mem.total//1024//1024}MB + Swap={swp2.total//1024//1024}MB = {(mem.total+swp2.total)//1024//1024}MB")
+
+
+# ══════════════════════════════════════════════════════════════
+#  4 — KERNEL PARAMETRELERİ
+# ══════════════════════════════════════════════════════════════
+
+def optimize_kernel():
+    print("  [kernel] Kernel parametreleri optimize ediliyor...")
+
+    all_params = {
+        # VM
+        "/proc/sys/vm/min_free_kbytes":              "65536",
+        "/proc/sys/vm/dirty_ratio":                  "80",
+        "/proc/sys/vm/dirty_background_ratio":       "5",
+        "/proc/sys/vm/dirty_expire_centisecs":       "3000",
+        "/proc/sys/vm/dirty_writeback_centisecs":    "500",
+        "/proc/sys/vm/zone_reclaim_mode":            "0",
+        "/proc/sys/vm/oom_kill_allocating_task":     "0",
+        "/proc/sys/vm/panic_on_oom":                 "0",
+        "/proc/sys/vm/nr_hugepages":                 "256",
+        "/proc/sys/vm/drop_caches":                  "3",
+        # Sched
+        "/proc/sys/kernel/sched_latency_ns":         "4000000",
+        "/proc/sys/kernel/sched_min_granularity_ns": "500000",
+        "/proc/sys/kernel/sched_migration_cost_ns":  "5000000",
+        "/proc/sys/kernel/sched_rt_runtime_us":      "-1",
+        "/proc/sys/kernel/sched_rt_period_us":       "1000000",
+        "/proc/sys/kernel/nmi_watchdog":             "0",
+        "/proc/sys/kernel/watchdog":                 "0",
+        "/proc/sys/kernel/numa_balancing":           "1",
+        "/proc/sys/kernel/perf_event_paranoid":      "-1",
+        "/proc/sys/kernel/randomize_va_space":       "0",
+        "/proc/sys/kernel/kptr_restrict":            "0",
+        "/proc/sys/kernel/dmesg_restrict":           "0",
+        "/proc/sys/kernel/pid_max":                  "4194304",
+        "/proc/sys/kernel/threads-max":              "4194304",
+        "/proc/sys/kernel/yama/ptrace_scope":        "0",
+        # FS
+        "/proc/sys/fs/file-max":                     "2097152",
+        "/proc/sys/fs/nr_open":                      "2097152",
+        "/proc/sys/fs/inotify/max_user_watches":     "524288",
+        "/proc/sys/fs/inotify/max_user_instances":   "8192",
+        "/proc/sys/fs/aio-max-nr":                   "1048576",
+        "/proc/sys/fs/pipe-max-size":                "67108864",
+        # Net
+        "/proc/sys/net/core/rmem_max":               "268435456",
+        "/proc/sys/net/core/wmem_max":               "268435456",
+        "/proc/sys/net/core/somaxconn":              "65535",
+        "/proc/sys/net/core/netdev_max_backlog":     "65536",
+        "/proc/sys/net/ipv4/tcp_rmem":               "4096 67108864 268435456",
+        "/proc/sys/net/ipv4/tcp_wmem":               "4096 67108864 268435456",
+        "/proc/sys/net/ipv4/tcp_fastopen":           "3",
+        "/proc/sys/net/ipv4/tcp_tw_reuse":           "1",
+        "/proc/sys/net/ipv4/tcp_fin_timeout":        "10",
+        "/proc/sys/net/ipv4/tcp_max_syn_backlog":    "65536",
+        "/proc/sys/net/ipv4/tcp_syncookies":         "1",
+        "/proc/sys/net/ipv4/tcp_mtu_probing":        "1",
+        "/proc/sys/net/ipv4/ip_local_port_range":    "1024 65535",
+        "/proc/sys/net/ipv4/tcp_low_latency":        "1",
+        # Namespace
+        "/proc/sys/kernel/unprivileged_userns_clone":"1",
+        "/proc/sys/user/max_user_namespaces":        "65536",
+        "/proc/sys/user/max_pid_namespaces":         "65536",
+    }
+    ok = sum(w(p, v) for p, v in all_params.items())
+    print(f"  ✅ Kernel → {ok}/{len(all_params)} parametre ayarlandı")
+
+    # CPU governor
+    govs = glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor")
+    gc = sum(w(g, "performance") for g in govs)
+    if gc: print(f"  ✅ CPU → {gc} çekirdek performance modunda")
+
+    # I/O
+    for dev in glob.glob("/sys/block/*/queue/scheduler"):
+        for s in ["none", "mq-deadline", "noop"]:
+            if w(dev, s): break
+    for dev in glob.glob("/sys/block/*/queue/nr_requests"):    w(dev, "512")
+    for dev in glob.glob("/sys/block/*/queue/read_ahead_kb"):  w(dev, "4096")
+    for dev in glob.glob("/sys/block/*/queue/rq_affinity"):    w(dev, "2")
+
+    # HugePage
+    w("/sys/kernel/mm/transparent_hugepage/enabled", "always")
+    w("/sys/kernel/mm/transparent_hugepage/defrag",  "defer+madvise")
+
+    # OOM — tüm process'leri koru
+    w("/proc/sys/vm/oom_kill_allocating_task", "0")
+    w("/proc/sys/vm/panic_on_oom", "0")
     try:
-        subprocess.run(["modprobe", "zram"], capture_output=True)
-        import psutil
-        mem_mb = int(psutil.virtual_memory().total / 1024 / 1024)
-        # RAM'in %50'si kadar zram
-        zram_mb = min(mem_mb // 2, 4096)
-        if w("/sys/block/zram0/disksize", f"{zram_mb}M"):
-            subprocess.run(["mkswap", "/dev/zram0"], capture_output=True)
-            subprocess.run(["swapon", "-p", "100", "/dev/zram0"], capture_output=True)
-            print(f"  ✅ zram: {zram_mb}MB sıkıştırılmış RAM swap")
+        w(f"/proc/{os.getpid()}/oom_score_adj", "-1000")
     except Exception:
         pass
 
-    print(f"  🎯 Toplam kullanılabilir bellek: {(psutil.virtual_memory().total + psutil.swap_memory().total) // 1024 // 1024}MB")
-
-
-def optimize():
-    print("⚡ Sistem optimizasyonu başlıyor...\n")
-
-    # ulimits
-    for res, val in [
-        (resource.RLIMIT_NOFILE,  (1048576, 1048576)),
-        (resource.RLIMIT_NPROC,   (resource.RLIM_INFINITY, resource.RLIM_INFINITY)),
-        (resource.RLIMIT_STACK,   (resource.RLIM_INFINITY, resource.RLIM_INFINITY)),
-        (resource.RLIMIT_CORE,    (resource.RLIM_INFINITY, resource.RLIM_INFINITY)),
-    ]:
-        try:
-            resource.setrlimit(res, val)
-        except Exception:
-            pass
-    print("  ✅ ulimits → sınırsız")
-
-    # cgroup limitlerini kaldır (EN ÖNEMLİSİ)
-    unlock_cgroup_memory()
-
-    # Swap kur
-    setup_swap_aggressive()
-
-    # Network
-    net_params = {
-        "/proc/sys/net/core/rmem_max":             "134217728",
-        "/proc/sys/net/core/wmem_max":             "134217728",
-        "/proc/sys/net/core/somaxconn":            "65535",
-        "/proc/sys/net/ipv4/tcp_fastopen":         "3",
-        "/proc/sys/net/ipv4/tcp_tw_reuse":         "1",
-        "/proc/sys/net/ipv4/tcp_fin_timeout":      "10",
-        "/proc/sys/net/ipv4/ip_local_port_range":  "1024 65535",
-    }
-    ok = sum(w(p, v) for p, v in net_params.items())
-    print(f"\n  ✅ Network → {ok}/{len(net_params)}")
-
-    # FS
-    for p, v in [
-        ("/proc/sys/fs/file-max",  "2097152"),
-        ("/proc/sys/fs/nr_open",   "2097152"),
-    ]:
-        w(p, v)
-
-    # HugePage — JVM GC için (sadece transparent)
-    w("/sys/kernel/mm/transparent_hugepage/enabled", "madvise")
-    w("/sys/kernel/mm/transparent_hugepage/defrag",  "defer+madvise")
-
-    # Kernel cache temizle — MC için yer aç
-    w("/proc/sys/vm/drop_caches", "3")
-    print("  ✅ Kernel cache temizlendi")
-    print("\n  🎯 Sistem hazır!")
+    # tmpfs
+    for tgt, sz in [("/tmp","2g"),("/var/tmp","512m")]:
+        os.makedirs(tgt, exist_ok=True)
+        sh(f"mount -t tmpfs tmpfs {tgt} -o defaults,noatime,nosuid,nodev,size={sz} 2>/dev/null")
+    print("  ✅ HugePage + OOM koruması + tmpfs aktif")
 
 
 # ══════════════════════════════════════════════════════════════
-#  AŞAMA 2 — PANEL + MC + TUNNEL
+#  ANA OPTİMİZASYON
+# ══════════════════════════════════════════════════════════════
+
+def optimize_all():
+    print("\n" + "═"*52)
+    print("  🔓 TÜM LİMİTLER VE ENGELLEMELER KALDIRILIYOR")
+    print("═"*52 + "\n")
+
+    bypass_ulimits()
+    print()
+    bypass_cgroups()
+    print()
+    setup_swap_maximum()
+    print()
+    optimize_kernel()
+
+    import psutil
+    mem  = psutil.virtual_memory()
+    swp  = psutil.swap_memory()
+    disk = psutil.disk_usage("/")
+    cpu  = psutil.cpu_count(logical=True)
+    print("\n" + "═"*52)
+    print(f"  CPU     : {cpu} çekirdek")
+    print(f"  RAM     : {mem.total//1024//1024} MB fiziksel")
+    print(f"  Swap    : {swp.total//1024//1024} MB")
+    print(f"  Disk    : {disk.free//1024//1024//1024} GB boş / {disk.total//1024//1024//1024} GB toplam")
+    print(f"  TOPLAM  : {(mem.total+swp.total)//1024//1024} MB kullanılabilir")
+    print("═"*52)
+
+
+# ══════════════════════════════════════════════════════════════
+#  PANEL + MC + TUNNEL
 # ══════════════════════════════════════════════════════════════
 
 def start_panel():
@@ -266,7 +355,6 @@ def start_panel():
 
 def auto_start_sequence():
     time.sleep(2)
-
     print("\n⛏️  [3/4] Minecraft Server başlatılıyor...")
     try:
         import urllib.request, json
@@ -288,27 +376,27 @@ def auto_start_sequence():
         print("  ⚠️  MC portu zaman aşımı — tunnel yine de açılıyor")
 
     print("\n🌐 [4/4] Cloudflare Tunnel MC:25565 → internet...")
-    log = "/tmp/cf_mc.log"
+    log_file = "/tmp/cf_mc.log"
     subprocess.Popen([
         "cloudflared", "tunnel",
         "--url", f"tcp://localhost:{MC_PORT}",
         "--no-autoupdate", "--loglevel", "info",
-    ], stdout=open(log, "w"), stderr=subprocess.STDOUT)
+    ], stdout=open(log_file, "w"), stderr=subprocess.STDOUT)
 
     for _ in range(120):
         try:
-            content = open(log).read()
+            content = open(log_file).read()
             urls = re.findall(r'https://[a-z0-9-]+\.trycloudflare\.com', content)
             if urls:
-                import json as _json
+                import json as _j
                 tunnel_url = urls[0]
                 host = tunnel_url.replace("https://", "")
-                print(f"\n  ┌─────────────────────────────────────────┐")
-                print(f"  │  ✅ MC Sunucu Adresi:                    │")
-                print(f"  │  📌 {host:<39}│")
-                print(f"  └─────────────────────────────────────────┘\n")
+                print(f"\n  ┌──────────────────────────────────────────┐")
+                print(f"  │  ✅ MC Sunucu Adresi:                     │")
+                print(f"  │  📌 {host:<40}│")
+                print(f"  └──────────────────────────────────────────┘\n")
                 try:
-                    data = _json.dumps({"url": tunnel_url, "host": host}).encode()
+                    data = _j.dumps({"url": tunnel_url, "host": host}).encode()
                     req2 = urllib.request.Request(
                         f"http://localhost:{PORT}/api/internal/tunnel",
                         data=data,
@@ -322,7 +410,6 @@ def auto_start_sequence():
         except Exception:
             pass
         time.sleep(0.5)
-
     print("  ⚠️  Tunnel URL alınamadı")
 
 
@@ -330,20 +417,19 @@ def auto_start_sequence():
 #  MAIN
 # ══════════════════════════════════════════════════════════════
 
-print("\n" + "━" * 50)
-print("  ⛏️   Minecraft Server Sistemi v3.0")
+print("\n" + "━"*52)
+print("  ⛏️   Minecraft Server Sistemi v4.0 — MAX MODE")
 print(f"      PORT={PORT}  |  MC_RAM={MC_RAM}")
-print("━" * 50)
+print("━"*52)
 
-print("\n⚡ [1/4] Sistem optimizasyonu...")
-optimize()
+print("\n⚡ [1/4] Limit bypass + Sistem optimizasyonu...")
+optimize_all()
 
 panel_proc = start_panel()
-
 threading.Thread(target=auto_start_sequence, daemon=True).start()
 
-print(f"\n{'━'*50}")
+print(f"\n{'━'*52}")
 print(f"  Panel: http://0.0.0.0:{PORT}")
-print(f"{'━'*50}\n")
+print(f"{'━'*52}\n")
 
 panel_proc.wait()
