@@ -114,18 +114,19 @@ def read_disk_used_gb():
 # ─────────────────────────────────────────────
 
 def bypass_cgroups():
+    """cgroup limitlerini kaldır + OOM killer'ı devre dışı bırak."""
     n = 0
     for path, val in [
-        ("/sys/fs/cgroup/memory.max", "max"),
-        ("/sys/fs/cgroup/memory.swap.max", "max"),
-        ("/sys/fs/cgroup/memory.high", "max"),
-        ("/sys/fs/cgroup/cpu.max", "max"),
-        ("/sys/fs/cgroup/pids.max", "max"),
-        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "-1"),
-        ("/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes", "-1"),
-        ("/sys/fs/cgroup/memory/memory.swappiness", "100"),
-        ("/sys/fs/cgroup/memory/memory.oom_control", "0"),
-        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "-1"),
+        ("/sys/fs/cgroup/memory.max",                        "max"),
+        ("/sys/fs/cgroup/memory.swap.max",                   "max"),
+        ("/sys/fs/cgroup/memory.high",                       "max"),
+        ("/sys/fs/cgroup/cpu.max",                           "max"),
+        ("/sys/fs/cgroup/pids.max",                          "max"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes",      "-1"),
+        ("/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes","-1"),
+        ("/sys/fs/cgroup/memory/memory.swappiness",          "10"),
+        ("/sys/fs/cgroup/memory/memory.oom_control",         "0"),
+        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us",              "-1"),
     ]:
         if w(path, val): n += 1
     for cg in glob.glob("/sys/fs/cgroup/*/") + glob.glob("/sys/fs/cgroup/*/*/"):
@@ -134,43 +135,161 @@ def bypass_cgroups():
                       ("cpu.max","max"),("pids.max","max")]:
             w(cg + fn, v)
     w("/proc/sys/vm/oom_kill_allocating_task", "0")
-    w("/proc/sys/vm/panic_on_oom", "0")
+    w("/proc/sys/vm/panic_on_oom",             "0")
     try: w(f"/proc/{os.getpid()}/oom_score_adj", "-1000")
     except: pass
     print(f"  ✅ {n} cgroup limiti kaldırıldı")
 
 
-def setup_swap():
+def tune_vm():
     """
-    Render.com free tier'da swapon KERESİNLİKLE çalışmaz
-    (loop device, zram, dosya — hepsi EPERM verir).
-    Sadece kernel overcommit parametrelerini ayarla — bunlar çalışıyor.
+    Sanal bellek yönetimi — Minecraft workload'ına özel.
+    Render'da swapon çalışmaz (EPERM) — overcommit + dirty page tuning.
     """
-    for p, v in [
-        ("/proc/sys/vm/overcommit_memory",  "1"),   # Over-commit izin ver
-        ("/proc/sys/vm/overcommit_ratio",   "100"),
-        ("/proc/sys/vm/vfs_cache_pressure", "50"),
-        ("/proc/sys/vm/drop_caches",        "3"),
-        ("/proc/sys/vm/min_free_kbytes",    "8192"),
-    ]: w(p, v)
-    print("  ℹ️  Swap: Render'da swapon izni yok → sadece overcommit aktif")
+    VM = [
+        # ── Overcommit: JVM & UserSwap için şart ────────────────────────
+        ("/proc/sys/vm/overcommit_memory",          "1"),   # Her malloc'a izin ver
+        ("/proc/sys/vm/overcommit_ratio",           "100"),
+
+        # ── Swappiness: RAM'i bırakma, mümkün olduğunca bellekte tut ───
+        # Değer düşük → kernel RAM'i diske atmak için daha az istekli olur
+        ("/proc/sys/vm/swappiness",                 "5"),
+
+        # ── Dirty page: disk yazımını daha agresif yap ──────────────────
+        # Minecraft save-all sırasında büyük I/O patlaması yerine sürekli küçük yazım
+        ("/proc/sys/vm/dirty_ratio",                "8"),    # RAM'in %8'i kirlenince yaz
+        ("/proc/sys/vm/dirty_background_ratio",     "3"),    # Arka plan yazım eşiği
+        ("/proc/sys/vm/dirty_expire_centisecs",     "1000"), # 10sn → zorla yaz
+        ("/proc/sys/vm/dirty_writeback_centisecs",  "300"),  # 3sn'de bir kontrol
+
+        # ── VFS Cache: dosya metadata önbelleği ─────────────────────────
+        # 50: standart, düşük → daha fazla RAM process'e kalır
+        ("/proc/sys/vm/vfs_cache_pressure",         "60"),
+
+        # ── Minimum free: OOM öncesi güvenlik payı ──────────────────────
+        ("/proc/sys/vm/min_free_kbytes",            "16384"),  # 16MB — OOM önce fırsat
+
+        # ── Huge pages: JVM TLB performansı ────────────────────────────
+        ("/proc/sys/vm/nr_hugepages",               "0"),   # Disable: 512MB'de waste
+        ("/proc/sys/vm/hugepages_treat_as_movable", "1"),
+
+        # ── Drop caches: başlangıçta temiz sayfa tablosu ─────────────────
+        ("/proc/sys/vm/drop_caches",                "3"),
+    ]
+    for p, v in VM:
+        w(p, v)
+    print("  ✅ VM tuning: dirty page + swappiness + overcommit")
 
 
-def optimize_kernel():
+def tune_scheduler():
+    """
+    CPU zamanlayıcı — Minecraft thread'leri için düşük gecikme.
+    Render shared host'ta çalışıyoruz → migration maliyetini artır (context switch azalt).
+    """
+    SCHED = [
+        # Minimum granularity: bir process kaç ns çalışır (önce kesilmez)
+        # Yüksek → Minecraft ana thread'i kesintisiz çalışır → daha iyi TPS
+        ("/proc/sys/kernel/sched_min_granularity_ns",      "10000000"),   # 10ms
+        ("/proc/sys/kernel/sched_wakeup_granularity_ns",   "15000000"),   # 15ms
+        ("/proc/sys/kernel/sched_migration_cost_ns",       "5000000"),    # 5ms
+
+        # Latency target: düşük = daha responsive, yüksek = daha verimli
+        # Minecraft için 12ms iyi denge
+        ("/proc/sys/kernel/sched_latency_ns",              "12000000"),   # 12ms
+
+        # Thread çocuk önce çalışsın (fork optimizasyonu — subprocess.Popen için)
+        ("/proc/sys/kernel/sched_child_runs_first",        "0"),
+
+        # Numa balancing: Render single-node → kapat (overhead azalt)
+        ("/proc/sys/kernel/numa_balancing",                "0"),
+
+        # Randomize address space: güvenlik özelliği, performans maliyeti var
+        # Render container'da anlamsız → kapat
+        ("/proc/sys/kernel/randomize_va_space",            "0"),
+    ]
+    ok = sum(1 for p, v in SCHED if w(p, v))
+    print(f"  ✅ Scheduler: {ok}/{len(SCHED)} parametre ayarlandı")
+
+
+def tune_network():
+    """
+    Minecraft TCP/UDP optimizasyonu — oyuncu bağlantı gecikmesi azaltır.
+    25565 portu üzerinden sürekli küçük paket trafiği var.
+    """
+    NET = [
+        # ── Socket kuyruğu ───────────────────────────────────────────────
+        ("/proc/sys/net/core/somaxconn",            "4096"),   # accept() kuyruğu
+        ("/proc/sys/net/core/netdev_max_backlog",   "4096"),   # NIC → kernel kuyruğu
+
+        # ── TCP tampon boyutları ─────────────────────────────────────────
+        ("/proc/sys/net/core/rmem_default",         "262144"),
+        ("/proc/sys/net/core/rmem_max",             "16777216"),
+        ("/proc/sys/net/core/wmem_default",         "262144"),
+        ("/proc/sys/net/core/wmem_max",             "16777216"),
+
+        # ── TCP optimizasyonu ────────────────────────────────────────────
+        ("/proc/sys/net/ipv4/tcp_fastopen",         "3"),    # SYN + data
+        ("/proc/sys/net/ipv4/tcp_tw_reuse",         "1"),    # TIME_WAIT yeniden kullan
+        ("/proc/sys/net/ipv4/tcp_max_syn_backlog",  "4096"),
+        ("/proc/sys/net/ipv4/tcp_syncookies",       "1"),    # SYN flood koruması
+        ("/proc/sys/net/ipv4/tcp_no_delay_ack",     "1"),    # ACK geciktirme kapat → düşük ping
+
+        # ── Keepalive: bağlı oyuncu tespiti ─────────────────────────────
+        ("/proc/sys/net/ipv4/tcp_keepalive_time",   "120"),  # 2dk boşta → kontrol
+        ("/proc/sys/net/ipv4/tcp_keepalive_intvl",  "15"),
+        ("/proc/sys/net/ipv4/tcp_keepalive_probes", "3"),
+
+        # ── Dosya tanımlayıcı ────────────────────────────────────────────
+        ("/proc/sys/fs/file-max",                   "2097152"),
+    ]
+    ok = sum(1 for p, v in NET if w(p, v))
+    print(f"  ✅ Network: {ok}/{len(NET)} parametre ayarlandı")
+
+
+def tune_io():
+    """
+    I/O Scheduler — Minecraft region dosyası yazımı için.
+    Render'da /dev blok aygıtı erişimi yok ama /proc/sys/vm ile disk I/O tutumu ayarlanabilir.
+    """
+    # Blok cihazı I/O scheduler ayarı (erişim yoksa sessizce atla)
+    for dev in glob.glob("/sys/block/*/queue/scheduler"):
+        # noop/none: sıralama yok → SSD üzerinde daha hızlı
+        for sched in ["none", "noop", "mq-deadline"]:
+            try:
+                open(dev, "w").write(sched)
+                break
+            except:
+                pass
+    # Read-ahead: büyük region dosyaları için arttır
+    for dev in glob.glob("/sys/block/*/queue/read_ahead_kb"):
+        w(dev, "256")
+    print("  ✅ I/O: scheduler + read-ahead ayarlandı")
+
+
+def set_process_limits():
+    """Process limitleri — JVM + cloudflared için yeterli dosya tanımlayıcı."""
     for res, val in [
         (resource.RLIMIT_NOFILE,  (1048576, 1048576)),
         (resource.RLIMIT_NPROC,   (INF, INF)),
         (resource.RLIMIT_MEMLOCK, (INF, INF)),
+        (resource.RLIMIT_STACK,   (INF, INF)),
     ]:
         try: resource.setrlimit(res, val)
         except: pass
+    # Ana process'i OOM'dan koru
+    try: w(f"/proc/{os.getpid()}/oom_score_adj", "-900")
+    except: pass
+    print("  ✅ Process limits: NOFILE=1M, NPROC=∞, MEMLOCK=∞")
 
 
 def optimize_all(mode="main"):
-    print(f"\n{'═'*56}\n  🔓 BYPASS ({mode.upper()})\n{'═'*56}\n")
+    print(f"\n{'═'*56}\n  🔓 OS OPTİMİZASYON ({mode.upper()})\n{'═'*56}\n")
     bypass_cgroups()
-    setup_swap()
-    optimize_kernel()
+    tune_vm()
+    tune_scheduler()
+    tune_network()
+    tune_io()
+    set_process_limits()
     swp = psutil.swap_memory()
     print(f"  ✅ Swap:{swp.total//1024//1024}MB  RAM:{CONTAINER_RAM_MB}MB\n{'═'*56}")
 
@@ -188,28 +307,6 @@ def start_panel():
 
 
 def auto_start_sequence():
-    # Önceki OOM kill state'i var mı kontrol et
-    _state_path = "/agent_data/panel_state.json"
-    _prev_running = False
-    try:
-        import json as _json
-        _d = _json.loads(open(_state_path).read())
-        _age = time.time() - _d.get("saved_at", 0)
-        if _age < 300 and _d.get("was_running"):
-            _prev_running = True
-    except Exception:
-        pass
-
-    if _prev_running:
-        # mc_panel._auto_resume_if_needed() zaten 8sn sonra MC başlatacak.
-        # Bu fonksiyon tekrar /api/start çağırmasın → çift başlatma olur.
-        print("  ♻️  Önceki oturum var → MC panel otomatik başlatacak, bu sekans atlanıyor.")
-        _panel_log("[Sistem] ♻️  OOM-restart: MC panel otomatik devam ettiriyor...")
-        if wait_port(MC_PORT, 300):
-            _panel_log("[Sistem] ✅ MC Server yeniden hazır!")
-        _start_mc_tunnel()
-        return
-
     time.sleep(4)
     _panel_log("[Sistem] 🟢 v10.0 başladı — MC başlatılıyor...")
     try:
@@ -225,6 +322,12 @@ def auto_start_sequence():
     if wait_port(MC_PORT, 300):
         print("  ✅ MC Server hazır!")
         _panel_log("[Sistem] ✅ MC Server oyuncuları bekliyor!")
+        # MC process'ini yüksek önceliğe al (nice -5)
+        try:
+            import subprocess as _sp
+            _sp.run(f"renice -5 $(lsof -ti :{MC_PORT}) 2>/dev/null || true", shell=True)
+        except Exception:
+            pass
     else:
         print("  ⚠️  MC port timeout (300sn)")
     _start_mc_tunnel()

@@ -52,7 +52,7 @@ RENDER_DISK_LIMIT_GB = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
 
 # ── Global durum ─────────────────────────────────────────────
 mc_process   = None
-console_buf  = deque(maxlen=200)   # 3000→200: ~18MB Python RSS tasarrufu
+console_buf  = deque(maxlen=3000)
 players      = {}
 tunnel_info  = {"url": "", "host": ""}
 server_state = {
@@ -60,42 +60,6 @@ server_state = {
     "ram_mb": 0, "uptime": 0, "started": None,
     "version": "—", "max_players": 20, "online_players": 0,
 }
-
-# ── Kalıcı Durum Dosyası (OOM restart sonrası kaldığı yerden devam) ──────────
-# Render OOM kill → container yeniden başlar → bu dosya MC'nin çalışıp
-# çalışmadığını hatırlar → otomatik başlatır.
-STATE_FILE = Path("/agent_data/panel_state.json")
-
-def _save_state():
-    """Mevcut sunucu durumunu diske kaydet (her 30s + kritik anlarda)."""
-    try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "was_running": server_state["status"] in ("running", "starting", "downloading"),
-            "tunnel": tunnel_info.copy(),
-            "mc_jar_exists": MC_JAR.exists(),
-            "saved_at": time.time(),
-            "version": "10.0",
-        }
-        STATE_FILE.write_text(json.dumps(data))
-    except Exception:
-        pass
-
-
-def _load_prev_state() -> dict:
-    """Önceki state'i yükle. 5 dakikadan eskiyse (stale) boş döndür."""
-    try:
-        if STATE_FILE.exists():
-            data = json.loads(STATE_FILE.read_text())
-            age  = time.time() - data.get("saved_at", 0)
-            if age < 300:   # 5 dakika içinde kayıt geçerli
-                return data
-    except Exception:
-        pass
-    return {}
-
-
-_PREV_STATE = _load_prev_state()   # Panel import edilirken yükle
 
 # ── Resource Pool ─────────────────────────────────────────────
 # resource_pool.py'deki ResourcePool singleton kullanılır.
@@ -348,7 +312,7 @@ def _pool_summary() -> dict:
                 "url":          a["url"],
                 "healthy":      a["healthy"],
                 "connected_at": a.get("last_ok", 0),
-                "last_ping":    int(time.time() - a.get("last_ok", time.time())),
+                "last_ping":    a.get("last_ok", 0),
                 "ram":          a.get("ram",   {}),
                 "disk":         a.get("disk",  {}),
                 "cpu":          a.get("cpu",   {}),
@@ -756,29 +720,307 @@ def download_paper():
 
 
 def write_server_config():
+    """
+    Render.com 512MB container için optimize edilmiş Minecraft konfigürasyonu.
+    server.properties + paper-world-defaults + paper-global-config + spigot.yml + bukkit.yml
+    """
     (MC_DIR / "eula.txt").write_text("eula=true\n")
-    props = MC_DIR / "server.properties"
-    props.write_text(
-        f"server-port={MC_PORT}\nmax-players=20\nonline-mode=false\n"
-        "gamemode=survival\ndifficulty=normal\nlevel-name=world\n"
+
+    # ── server.properties ─────────────────────────────────────────────────────
+    (MC_DIR / "server.properties").write_text(
+        f"server-port={MC_PORT}\n"
+        "max-players=20\n"
+        "online-mode=false\n"
+        "gamemode=survival\n"
+        "difficulty=normal\n"
+        "level-name=world\n"
         "motd=\\u00A7a\\u00A7lRender MC Server\n"
-        "view-distance=4\nsimulation-distance=3\n"
-        "spawn-protection=0\nallow-flight=true\n"
-        "enable-rcon=false\nmax-tick-time=60000\nwhite-list=false\n"
-        "enable-command-block=true\npvp=true\ngenerate-structures=true\n"
-        "allow-nether=true\nsync-chunk-writes=false\n"
+        # ── Görüş/simülasyon mesafesi: en kritik TPS parametresi ─────────
+        "view-distance=4\n"            # chunk görüş alanı (4=minimum işlevsel)
+        "simulation-distance=3\n"      # entity/redstone tick menzili
+        # ── Ağ ─────────────────────────────────────────────────────────────
+        "network-compression-threshold=64\n"  # 64 byte altı paketleri sıkıştırma
+        "use-native-transport=true\n"          # Linux Netty (epoll) → düşük gecikme
+        "max-tick-time=30000\n"               # 30sn watchdog (60sn çok fazla)
+        # ── Spawn / Dünya ──────────────────────────────────────────────────
+        "spawn-protection=0\n"
+        "allow-flight=true\n"
+        "generate-structures=true\n"
+        "allow-nether=true\n"
+        "max-world-size=5000\n"               # Dünya sınırı → sonsuz chunk yok
+        "max-chained-neighbor-updates=16\n"   # Zincir update saldırısı önleme
+        # ── Entity/Oyuncu ─────────────────────────────────────────────────
         "entity-broadcast-range-percentage=50\n"
+        # ── I/O ────────────────────────────────────────────────────────────
+        "sync-chunk-writes=false\n"           # Async chunk yazımı → I/O bloklamaz
+        # ── Diğer ─────────────────────────────────────────────────────────
+        "enable-rcon=false\n"
+        "white-list=false\n"
+        "enable-command-block=true\n"
+        "pvp=true\n"
+        "rate-limit=0\n"
     )
+
     config = MC_DIR / "config"
     config.mkdir(exist_ok=True)
-    pw = config / "paper-world-defaults.yml"
-    pw.write_text(
-        "world-settings:\n  default:\n"
-        "    spawn-limits:\n      monsters: 40\n      animals: 8\n"
-        "      water-animals: 3\n      water-ambient: 10\n"
-        "    chunks:\n      auto-save-interval: 12000\n"
-        "    max-auto-save-chunks-per-tick: 4\n"
-        "    prevent-moving-into-unloaded-chunks: true\n"
+
+    # ── paper-world-defaults.yml ─────────────────────────────────────────────
+    # Paper'ın en kritik performans konfigürasyonu
+    (config / "paper-world-defaults.yml").write_text(
+        "_version: 30\n"
+        "world-settings:\n"
+        "  default:\n"
+        # ── Spawn limitleri: düşük → daha az entity → daha iyi TPS ────────
+        "    spawn-limits:\n"
+        "      monsters: 35\n"
+        "      animals: 6\n"
+        "      water-animals: 2\n"
+        "      water-ambient: 5\n"
+        "      water-underground-creature: 3\n"
+        "      axolotls: 3\n"
+        "      ambient: 10\n"
+        # ── Chunk I/O ───────────────────────────────────────────────────────
+        "    chunks:\n"
+        "      auto-save-interval: 12000\n"     # 10dk'da bir kaydet
+        "      delay-chunk-unloads-by: 10s\n"   # Chunk unload geciktir → tekrar yüklenmesin
+        "      entity-per-chunk-save-limit:\n"
+        "        arrow: 8\n"
+        "        snowball: 8\n"
+        "        fireball: 8\n"
+        "        small-fireball: 8\n"
+        "        dragon-fireball: 3\n"
+        "        egg: 8\n"
+        "        eye-of-ender: 8\n"
+        "        ender-pearl: 8\n"
+        "        experience-bottle: 3\n"
+        "        llama-spit: 3\n"
+        "        shulker-bullet: 8\n"
+        "        spectral-arrow: 8\n"
+        "        potion: 8\n"
+        "        experience-orb: 16\n"
+        "      max-auto-save-chunks-per-tick: 6\n"
+        "      prevent-moving-into-unloaded-chunks: true\n"
+        # ── Entity aktivasyon menzili: uzaktaki entity'ler tick etmesin ───
+        "    entity-activation-range:\n"
+        "      animals: 12\n"
+        "      monsters: 20\n"
+        "      raiders: 48\n"
+        "      misc: 8\n"
+        "      water: 8\n"
+        "      villagers: 16\n"
+        "      flying-monsters: 32\n"
+        "      wake-up-inactive:\n"
+        "        animals-max-per-tick: 2\n"
+        "        animals-every: 60\n"
+        "        animals-for: 100\n"
+        "        monsters-max-per-tick: 4\n"
+        "        monsters-every: 20\n"
+        "        monsters-for: 100\n"
+        "        villagers-max-per-tick: 1\n"
+        "        villagers-every: 600\n"
+        "        villagers-for: 100\n"
+        "      tick-inactive-villagers: false\n"   # Görüş dışı villager tick etmez
+        "      ignore-spectators: true\n"
+        # ── Tick hızları: sık olmayan sensörler → CPU tasarrufu ──────────
+        "    tick-rates:\n"
+        "      sensor:\n"
+        "        villager:\n"
+        "          secondarypoisensor: 40\n"
+        "          nearestbedsensor: 80\n"
+        "          villagerbabiessensor: 40\n"
+        "          playersensor: 40\n"
+        "          nearestlivingentitysensor: 40\n"
+        "      behavior:\n"
+        "        villager:\n"
+        "          validatenearbypoi: 60\n"
+        "          acquirepoi: 120\n"
+        # ── Obje despawn hızlandırma (çöp temizliği) ──────────────────────
+        "    alt-item-despawn-rate:\n"
+        "      enabled: true\n"
+        "      items:\n"
+        "        COBBLESTONE: 300\n"
+        "        NETHERRACK: 300\n"
+        "        SAND: 300\n"
+        "        GRAVEL: 300\n"
+        "        DIRT: 300\n"
+        "        GRASS: 300\n"
+        "        ROTTEN_FLESH: 300\n"
+        "        WHEAT: 300\n"
+        # ── Çeşitli optimizasyonlar ────────────────────────────────────────
+        "    misc:\n"
+        "      update-pathfinding-on-block-update: false\n"  # Blok güncelleme → pathfind yok
+        "      fix-climbing-bypassing-cramming-rule: true\n"
+        "      show-sign-click-command-failure-msgs-to-player: false\n"
+        "      max-leash-distance: 10.0\n"
+    )
+
+    # ── paper-global-config.yml ───────────────────────────────────────────────
+    (config / "paper-global-config.yml").write_text(
+        "_version: 29\n"
+        "chunk-loading-basic:\n"
+        "  player-max-chunk-send-rate: 8.0\n"   # Saniyede max 8 chunk gönder
+        "  player-max-concurrent-loads: 6.0\n"
+        "  global-max-chunk-load-rate: -1.0\n"
+        "chunk-loading-advanced:\n"
+        "  player-loader-priority: 0.5\n"
+        "  loading-queue-sizes:\n"
+        "    player-ticket: 8\n"
+        "async-chunks:\n"
+        "  threads: 1\n"                         # 1 thread: Render 1 vCPU için optimal
+        "collisions:\n"
+        "  enable-player-collisions: true\n"
+        "  send-full-pos-for-hard-colliding-entities: true\n"
+        "console:\n"
+        "  has-all-permissions: false\n"
+        "item-validation:\n"
+        "  display-name: 8192\n"
+        "  lore-line: 8192\n"
+        "logging:\n"
+        "  deobfuscate-stacktraces: false\n"     # Production: stack trace obfuscated
+        "misc:\n"
+        "  lag-compensate-block-breaking: true\n"
+        "  use-dimension-type-for-custom-spawners: false\n"
+        "  strict-advancement-dimension-check: false\n"
+        "packet-limiter:\n"
+        "  all-packets:\n"
+        "    action: DROP\n"
+        "    interval: 7.0\n"
+        "    max-packet-rate: 500.0\n"           # Flood koruması
+        "  kick-for-illegal-packet: true\n"
+        "player-auto-save-rate: -1\n"            # Auto-save chunk I/O'suna bırak
+        "proxies:\n"
+        "  proxy-protocol: false\n"
+        "  bungee-cord:\n"
+        "    online-mode: true\n"
+        "  velocity:\n"
+        "    enabled: false\n"
+        "scoreboards:\n"
+        "  save-empty-scoreboard-teams: false\n"
+        "  track-plugin-scoreboards: false\n"   # Plugin scoreboard → CPU tasarrufu
+        "spam-limiter:\n"
+        "  tab-spam-increment: 1\n"
+        "  tab-spam-limit: 500\n"
+        "  recipe-spam-increment: 1\n"
+        "  recipe-spam-limit: 20\n"
+        "timings:\n"
+        "  enabled: false\n"                    # Timings kapat → CPU overhead yok
+        "  verbose: false\n"
+        "  history-interval: 300\n"
+        "  history-length: 3600\n"
+        "unsupported-settings:\n"
+        "  allow-headless-pistons: false\n"
+        "  allow-perm-block-break-exploits: false\n"
+        "  allow-tripwire-disarming-exploits: false\n"
+        "  skip-vanilla-damage-tick-when-shield-blocked: false\n"
+        "watchdog:\n"
+        "  early-warning-every: 5000\n"
+        "  early-warning-delay: 10000\n"
+    )
+
+    # ── spigot.yml ────────────────────────────────────────────────────────────
+    (MC_DIR / "spigot.yml").write_text(
+        "config-version: 12\n"
+        "settings:\n"
+        "  bungeecord: false\n"
+        "  timeout: 30000\n"
+        "  restart-on-crash: false\n"
+        "  restart-script: ./start.sh\n"
+        "  netty-threads: 2\n"           # 2 Netty I/O thread (1 vCPU için yeterli)
+        "  attribute:\n"
+        "    maxHealth:\n"
+        "      max: 2048.0\n"
+        "    movementSpeed:\n"
+        "      max: 2048.0\n"
+        "    attackDamage:\n"
+        "      max: 2048.0\n"
+        "messages:\n"
+        "  whitelist: You are not whitelisted on this server!\n"
+        "  unknown-command: Unknown command. Type '/help' for help.\n"
+        "  server-full: The server is full!\n"
+        "  outdated-client: 'Outdated client! Please use {0}'\n"
+        "  outdated-server: 'Outdated server! I''m still on {0}'\n"
+        "  restart: Server is restarting\n"
+        "world-settings:\n"
+        "  default:\n"
+        "    below-zero-generation-in-existing-chunks: false\n"
+        "    end-portal-sound-radius: 0\n"
+        "    verbose: false\n"
+        # ── Mob spawn range: düşük → daha az hesap ───────────────────────
+        "    mob-spawn-range: 4\n"
+        # ── Entity limit: chunk başına entity cap ─────────────────────────
+        "    entity-activation-range:\n"
+        "      animals: 12\n"
+        "      monsters: 20\n"
+        "      misc: 8\n"
+        "      water: 8\n"
+        "      raiders: 48\n"
+        "      villagers: 16\n"
+        "      flying-monsters: 32\n"
+        "      villagers-work-immunity-after: 100\n"
+        "      villagers-work-immunity-for: 20\n"
+        "      villagers-active-for-panic: true\n"
+        "      tick-inactive-villagers: false\n"
+        "      ignore-spectators: true\n"
+        "    entity-tracking-range:\n"
+        "      players: 48\n"
+        "      animals: 40\n"
+        "      monsters: 44\n"
+        "      misc: 32\n"
+        "      display: 128\n"
+        "      other: 40\n"
+        "    merge-radius:\n"          # Yakın item/exp stack → tek entity
+        "      item: 3.5\n"
+        "      exp: 4.0\n"
+        "    item-despawn-rate: 6000\n"  # 5dk (vanilla 5dk = 6000 tick)
+        "    arrow-despawn-rate: 300\n"  # Ok 15sn'de kaybolur
+        "    trident-despawn-rate: 1200\n"
+        "    nerf-spawner-mobs: true\n"  # Spawner mob'ları AI'sız → CPU tasarrufu
+        "    max-tnt-per-tick: 8\n"
+        "    max-bulk-chunks: 10\n"
+        "    view-distance: default\n"
+        "    simulation-distance: default\n"
+        "    thunder-chance: 100000\n"
+        "    zombie-aggressive-towards-villager: false\n"  # AI hesabı azalt
+        "    enable-zombie-pigmen-portal-spawns: false\n"
+        "    max-entity-collisions: 4\n"   # Collision hesabı sınırla
+        "players:\n"
+        "  disable-saving: false\n"
+    )
+
+    # ── bukkit.yml ────────────────────────────────────────────────────────────
+    (MC_DIR / "bukkit.yml").write_text(
+        "settings:\n"
+        "  allow-end: true\n"
+        "  warn-on-overload: true\n"
+        "  permissions-file: permissions.yml\n"
+        "  update-folder: update\n"
+        "  plugin-profiling: false\n"
+        "  connection-throttle: 4000\n"
+        "  query-plugins: false\n"
+        "  deprecated-verbose: default\n"
+        "  shutdown-message: Server closed\n"
+        "  minimum-api: none\n"
+        "  use-map-color-cache: true\n"
+        "spawn-limits:\n"
+        "  monsters: 35\n"
+        "  animals: 6\n"
+        "  water-animals: 2\n"
+        "  water-ambient: 5\n"
+        "  water-underground-creature: 3\n"
+        "  axolotls: 3\n"
+        "  ambient: 10\n"
+        "chunk-gc:\n"
+        "  period-in-ticks: 600\n"      # Her 30sn chunk GC
+        "ticks-per:\n"
+        "  animal-spawns: 400\n"        # 20sn'de bir animal spawn check
+        "  monster-spawns: 1\n"         # Her tick monster spawn (normal)
+        "  water-spawns: 1\n"
+        "  water-ambient-spawns: 1\n"
+        "  water-underground-creature-spawns: 1\n"
+        "  axolotl-spawns: 1\n"
+        "  ambient-spawns: 1\n"
+        "  autosave: 6000\n"            # 5dk'da bir otomatik kayıt
+        "aliases: now-in-commands.yml\n"
     )
 
 
@@ -786,7 +1028,18 @@ def write_server_config():
 
 
 def get_jvm_args():
-    import psutil as _ps
+    """
+    Paper MC için optimize edilmiş JVM argümanları.
+    Temel: Aikar's Flags (mcflags.emc.gs) + 512MB container kısıtları.
+
+    RAM bütçesi:
+      Python panel  : ~75MB  (eventlet + flask + psutil, optimize edilmiş)
+      JVM heap      : 270MB  (Xmx — Aikar flags ile etkin GC)
+      JVM non-heap  : ~100MB (metaspace 80 + code cache 24 + class 16 + stacks ~30)
+      UserSwap peak : ~60MB  (bootstrap fazlası dosyaya)
+      ─────────────────────────────────────────────
+      Toplam        : ~505MB / 512MB  (7MB tampon)
+    """
     container_ram_mb = int(os.environ.get("CONTAINER_RAM_MB", "512"))
     for path in ["/sys/fs/cgroup/memory.max",
                  "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
@@ -798,66 +1051,91 @@ def get_jvm_args():
                     container_ram_mb = mb; break
         except: pass
 
-    agent_count = _pool.agent_count()
+    agent_count  = _pool.agent_count()
+    userswap_ok  = os.path.exists(USERSWAP_SO)
 
-    # Render.com free tier: 512MB container, swapon yok AMA UserSwap aktif.
-    # UserSwap (LD_PRELOAD mmap hook) → JVM anonim mmap'leri /swapfile_mmap'e yönlendirir.
-    # Fiziksel taşma dosyaya gider → SIGKILL yok, OOM yok.
-    #
-    # Paper 1.21 Bootstrap blok-state yüklemesi: ~260MB heap gerektirir.
-    # Xmx=220 → OOM: Java heap space (Bootstrap sırasında crash!)
-    #
-    # Güvenli hesap (UserSwap ile):
-    #   Fiziksel: Xmx_rss + Meta(96) + Code(28) + Class(24) + Stack(14) + Python(130) ≤ 512
-    #   Xmx=320 → RSS_JVM ≈ 250MB (aktif heap) + 220MB (swap'a taşan) → fiziksel ~480MB peak
-    #   Peak 512MB'yi aşınca UserSwap devreye girer → dosyaya yazar, crash YOK
-    #   Steady-state (GC sonrası): RSS ~380MB → güvenli
-    # 512MB bütçe: Python ~120MB + JVM Xmx + JVM meta/code/stack ~100MB ≤ 512
-    # UserSwap varsa JVM taşması dosyaya → Xmx=300 güvenli
-    # UserSwap yoksa: 512 - 120(py) - 100(jvm_overhead) - 20(buf) = 272MB
-    # 512MB bütçe: Python ~100MB + JVM Xmx + JVM meta/code/stack ~110MB ≤ 512
-    # SerialGC ile G1GC'ye kıyasla ~25-30MB non-heap tasarruf sağlanır.
-    # UserSwap varsa JVM heap taşması dosyaya → Xmx=200 güvenli (bootstrap için UserSwap şart)
-    # UserSwap yoksa: 512 - 100(py) - 110(jvm_overhead) - 20(buf) = 282MB → 250 güvenli
-    userswap_ok = os.path.exists(USERSWAP_SO)
-    xmx_mb = 200 if userswap_ok else 250
-    xms_mb = 32   # 48→32: JVM daha az önceden ayırır
+    # UserSwap varsa bootstrap fazlası (maks ~60MB) dosyaya gider → 270MB güvenli
+    # UserSwap yoksa 240MB → 512-75(python)-100(non-heap)-240(heap) = 97MB tampon
+    xmx_mb = 270 if userswap_ok else 240
+    xms_mb = 64   # Küçük başla, GC gerektiğinde büyüt
 
-    userswap_ok = os.path.exists(USERSWAP_SO)
-    swap_label  = f"UserSwap(4GB)" if userswap_ok else "NoSwap"
-    log(f"[Panel] 🧠 Container={container_ram_mb}MB {swap_label} Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
+    swap_label = "UserSwap(4GB)" if userswap_ok else "NoSwap"
+    log(f"[Panel] 🧠 Container={container_ram_mb}MB {swap_label} Agents={agent_count} "
+        f"→ Xms={xms_mb}M Xmx={xmx_mb}M [Aikar+jemalloc]")
+
+    # ── LD_PRELOAD zincirleme: userswap + jemalloc ────────────────────────
+    # jemalloc: bellek parçalanmasını önler → uzun süreli çalışmada RSS büyümez
+    # userswap: anonim mmap'leri dosya destekli yapar → fiziksel OOM önler
+    preloads = []
+    if userswap_ok:
+        preloads.append(USERSWAP_SO)
+
+    # jemalloc: Dockerfile'da libjemalloc2 kuruldu, symlink /usr/local/lib/libjemalloc.so
+    jemalloc_paths = [
+        "/usr/local/lib/libjemalloc.so",
+        "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
+        "/usr/lib/aarch64-linux-gnu/libjemalloc.so.2",
+    ]
+    for jp in jemalloc_paths:
+        if os.path.exists(jp):
+            preloads.append(jp)
+            log(f"[Panel] ✅ jemalloc aktif: {jp}")
+            break
 
     java_cmd = []
-    if userswap_ok:
-        java_cmd = ["env", f"LD_PRELOAD={USERSWAP_SO}"]
+    if preloads:
+        java_cmd = ["env", f"LD_PRELOAD={':'.join(preloads)}"]
     else:
-        log("[Panel] ⚠️  userswap.so yok — LD_PRELOAD atlandı (OOM riski artabilir)")
+        log("[Panel] ⚠️  userswap.so yok — LD_PRELOAD atlandı")
+
     java_cmd.append("java")
 
     return java_cmd + [
         f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
+
         # ── Bellek alanları ──────────────────────────────────────────────
-        "-XX:MaxMetaspaceSize=80m",         # 96→80: sınırlı class sayısı
-        "-XX:CompressedClassSpaceSize=16m", # 24→16
-        "-XX:ReservedCodeCacheSize=24m",    # 28→24
-        "-Xss192k",                         # 256→192: thread başına stack
-        # ── GC: SerialGC — en düşük non-heap footprint (<512MB için ideal) ──
-        # G1GC: remembered-set + card-table + thread buffer → +30MB overhead
-        # SerialGC: tek thread, sıfır ek yapı → Xmx=200MB ortamda daha güvenli
-        "-XX:+UseSerialGC",
-        "-XX:SurvivorRatio=4",
-        "-XX:NewRatio=2",                   # Young:Old = 1:2
-        "-XX:MaxHeapFreeRatio=40",          # GC sonrası heap küçülsün
-        "-XX:MinHeapFreeRatio=10",
-        "-XX:SoftRefLRUPolicyMSPerMB=0",
+        "-XX:MaxMetaspaceSize=80m",
+        "-XX:CompressedClassSpaceSize=16m",
+        "-XX:ReservedCodeCacheSize=24m",
+        "-Xss192k",                      # Thread stack: 192k yeterli (vanilla 512k)
+
+        # ── Aikar's Flags — Paper MC için endüstri standardı GC ─────────
+        # Kaynak: https://mcflags.emc.gs
+        # G1GC: 512MB altında SerialGC'ye kıyasla daha az GC pause süresi
+        # → TPS spike'larını önler (oyuncu deneyimi için kritik)
+        "-XX:+UseG1GC",
+        "-XX:+ParallelRefProcEnabled",
+        "-XX:MaxGCPauseMillis=200",
+        "-XX:+UnlockExperimentalVMOptions",
+        "-XX:+DisableExplicitGC",        # System.gc() çağrılarını yoksay
+        "-XX:+AlwaysPreTouch",           # Başlangıçta heap'i ısıt → runtime'da sıfır page fault
+        "-XX:G1NewSizePercent=30",
+        "-XX:G1MaxNewSizePercent=40",
+        "-XX:G1HeapRegionSize=4m",       # 270MB heap için optimal (67 region)
+        "-XX:G1ReservePercent=20",
+        "-XX:G1HeapWastePercent=5",
+        "-XX:G1MixedGCCountTarget=4",
+        "-XX:InitiatingHeapOccupancyPercent=15",
+        "-XX:G1MixedGCLiveThresholdPercent=90",
+        "-XX:G1RSetUpdatingPauseTimePercent=5",
+        "-XX:SurvivorRatio=32",
+        "-XX:+PerfDisableSharedMem",     # /tmp/hsperfdata dosyası oluşturma (I/O azalt)
+        "-XX:MaxTenuringThreshold=1",    # Nesneleri hızlı Old gen'e taşı → GC pause azalt
+        "-Dusing.aikars.flags=https://mcflags.emc.gs",
+        "-Daikars.new.flags=true",
+
+        # ── String optimizasyonu ─────────────────────────────────────────
+        "-XX:+UseStringDeduplication",  # G1GC ile çalışır → duplicate String heap kullanımı azalt
         "-XX:+UseCompressedOops",
         "-XX:+OptimizeStringConcat",
-        "-XX:+UseStringDeduplication",
-        # ── Diğer ──────────────────────────────────────────────────────
+
+        # ── Diğer ────────────────────────────────────────────────────────
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8",
         "-Dcom.mojang.eula.agree=true",
-        "-Xlog:disable",
+        "-Xlog:disable",                 # GC log yok → I/O ve CPU tasarrufu
+        # Netty native transport — Dockerfile'da JRE var, epoll destekleniyor
+        "-Dio.netty.tryReflectionSetAccessible=true",
         "-jar", str(MC_JAR), "--nogui",
     ]
 
@@ -894,6 +1172,26 @@ def start_server():
         socketio.emit("server_status", server_state)
         return False, str(e)
     threading.Thread(target=_stdout_reader, daemon=True).start()
+
+    # MC process'ini yüksek CPU önceliğine al (nice -5)
+    # Python panel nice=0, MC nice=-5 → MC daha fazla CPU slice alır → daha iyi TPS
+    def _set_mc_priority():
+        time.sleep(3)
+        if mc_process and mc_process.poll() is None:
+            try:
+                os.setpriority(os.PRIO_PROCESS, mc_process.pid, -5)
+                log("[Panel] ✅ MC process önceliği: nice=-5")
+            except Exception:
+                pass
+            # I/O scheduler: MC process'ini best-effort sınıfına al
+            try:
+                subprocess.run(
+                    f"ionice -c 2 -n 2 -p {mc_process.pid}",
+                    shell=True, capture_output=True
+                )
+            except Exception:
+                pass
+    threading.Thread(target=_set_mc_priority, daemon=True).start()
     # MC başlatılınca mevcut tüm agent'lara proxy aç
     def _start_all_proxies():
         # MC tünel URL'si hazır olana kadar bekle (max 5 dk)
@@ -946,103 +1244,50 @@ def send_command(cmd: str) -> bool:
     return False
 
 
-def _container_ram_used_mb() -> int:
-    """
-    Render container'ın gerçek RAM kullanımını döndürür.
-    psutil.virtual_memory() HOST'u okur (yanıltıcı) — cgroup dosyasını kullan.
-    """
-    for path in ["/sys/fs/cgroup/memory.current",
-                 "/sys/fs/cgroup/memory/memory.usage_in_bytes"]:
-        try:
-            val = int(open(path).read().strip())
-            return val // 1024 // 1024
-        except Exception:
-            pass
-    # Fallback: bu process + çocuk process RSS toplamı
-    try:
-        import psutil as _ps
-        proc = _ps.Process(os.getpid())
-        total = proc.memory_info().rss
-        for child in proc.children(recursive=True):
-            try:
-                total += child.memory_info().rss
-            except Exception:
-                pass
-        return total // 1024 // 1024
-    except Exception:
-        return 0
-
-
 def _ram_watchdog():
-    """
-    Container RAM'ini izler.
-    • 440MB → save-all + save_state (dünya verisi korunur)
-    • 480MB → save-all + save_state + MC graceful stop
-              (Render SIGKILL gelmeden önce temiz kapat → restart sonrası devam)
-    """
-    WARN_MB  = 440   # save-all eşiği
-    CRIT_MB  = 480   # graceful stop eşiği (512MB limit öncesi güvenlik payı)
-    _warn_streak = 0
-    _crit_fired  = False
-
+    import psutil
+    _pressure_count = 0
     while True:
         eventlet.sleep(8)
         try:
-            used_mb = _container_ram_used_mb()
-            if used_mb == 0:
-                continue
+            mem = psutil.virtual_memory()
+            swp = psutil.swap_memory()
+            used_mb  = int(mem.used  / 1024 / 1024)
+            total_mb = int(mem.total / 1024 / 1024)
+            swap_pct = swp.percent if swp.total > 0 else 0
 
-            is_mc_alive = mc_process and mc_process.poll() is None
+            # Render free = 512MB. Python ~150MB kullanıyor.
+            # MC 280MB kullanıyorsa toplam ~430MB → %84 → uyar
+            pressure = used_mb > (total_mb * 0.85) or swap_pct > 80
 
-            if used_mb >= CRIT_MB and not _crit_fired:
-                _crit_fired = True
-                log(f"[Panel] 🚨 RAM KRİTİK ({used_mb}MB/512MB) → kayıt + temiz kapanış başlıyor...")
-                _save_state()   # Restart sonrası devam için durum kaydet
-                if is_mc_alive:
-                    send_command("save-all")   # Dünya verisini koru
-                    time.sleep(2)
-                    send_command("stop")       # Graceful MC kapat (SIGKILL öncesi)
-                # Caches temizle → Python RAM küçülsün
-                try:
-                    open("/proc/sys/vm/drop_caches", "w").write("3")
-                except Exception:
-                    pass
+            if pressure:
+                _pressure_count += 1
+                try: open("/proc/sys/vm/drop_caches","w").write("3")
+                except: pass
 
-            elif used_mb >= WARN_MB:
-                _warn_streak += 1
-                if _warn_streak == 1:
-                    log(f"[Panel] ⚠️  RAM yüksek ({used_mb}MB/512MB) → save-all + durum kaydediliyor")
-                    _save_state()
-                    if is_mc_alive:
-                        send_command("save-all")
-                        send_command("kill @e[type=item]")
-                        send_command("kill @e[type=experience_orb]")
-                    try:
-                        open("/proc/sys/vm/drop_caches", "w").write("3")
-                    except Exception:
-                        pass
+                if _pressure_count >= 2:
+                    # Hafif MC temizliği
+                    send_command("kill @e[type=item]")
+                    send_command("kill @e[type=experience_orb]")
+
+                if _pressure_count >= 3:
+                    # Ağır baskı: kaydet + agent'a region offload tetikle
+                    send_command("save-all")
+                    log(f"[Panel] ⚠️  RAM Baskısı! Kullanılan={used_mb}MB/{total_mb}MB Swap=%{swap_pct:.0f}")
+                    # Agent'a eski region'ları taşı
+                    threading.Thread(
+                        target=lambda: _auto_archive_old_regions(older_than_days=2),
+                        daemon=True
+                    ).start()
+                    _pressure_count = 0
             else:
-                _warn_streak = 0
-                _crit_fired  = False   # RAM düştü → eşik sıfırla
-
-        except Exception:
-            pass
+                _pressure_count = max(0, _pressure_count - 1)
+        except: pass
 
 
 # ══════════════════════════════════════════════════════════════
 #  FLASK ROUTES — MC Yönetimi
 # ══════════════════════════════════════════════════════════════
-
-@app.route("/api/ping")
-@app.route("/health")
-def api_ping():
-    """
-    Render healthCheckPath: /api/ping
-    Bu endpoint olmadan Render 404 alır → servisi degraded sayar → restart döngüsü.
-    """
-    return jsonify({"ok": True, "status": server_state.get("status", "unknown"),
-                    "agents": _pool.agent_count()})
-
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
@@ -2511,37 +2756,12 @@ init();
 #  BAŞLATMA
 # ══════════════════════════════════════════════════════════════
 
-def _state_persist_loop():
-    """Her 30 saniyede durumu diske kaydet → OOM restart sonrası devam."""
-    while True:
-        time.sleep(30)
-        _save_state()
-
-
-def _auto_resume_if_needed():
-    """
-    Önceki oturum OOM kill ile kesilmişse MC'yi otomatik başlat.
-    (Kullanıcı paneli açıp 'Başlat'a basmak zorunda kalmaz.)
-    """
-    if not _PREV_STATE.get("was_running"):
-        return
-    log("[Panel] ♻️  Önceki oturum tespit edildi → 8sn içinde MC otomatik başlatılıyor...")
-    time.sleep(8)   # Panel + socket hazır olsun
-    ok, msg = start_server()
-    if ok:
-        log("[Panel] ✅ OOM-restart sonrası MC otomatik başlatıldı")
-    else:
-        log(f"[Panel] ⚠️  Otomatik başlatma: {msg}")
-
-
-threading.Thread(target=_ram_monitor,          daemon=True).start()
-threading.Thread(target=_ram_watchdog,         daemon=True).start()
-threading.Thread(target=_state_persist_loop,   daemon=True).start()   # OOM restart için
-threading.Thread(target=_auto_resume_if_needed, daemon=True).start()  # OOM restart için
+threading.Thread(target=_ram_monitor,        daemon=True).start()
+threading.Thread(target=_ram_watchdog,       daemon=True).start()
 # _pool_health_watchdog KALDIRILDI: resource_pool.health_monitor() zaten arka planda çalışıyor
-threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
-threading.Thread(target=_world_backup_loop,    daemon=True).start()   # Agent disk doldur
-threading.Thread(target=_ram_cache_warm_loop,  daemon=True).start()   # Agent RAM doldur
+threading.Thread(target=_pool_auto_optimize,  daemon=True).start()
+threading.Thread(target=_world_backup_loop,   daemon=True).start()  # Agent disk doldur
+threading.Thread(target=_ram_cache_warm_loop, daemon=True).start()  # Agent RAM doldur
 _pool.set_logger(log)   # Panel log fonksiyonunu pool'a inject et
 
 if __name__ == "__main__":
