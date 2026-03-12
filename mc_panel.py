@@ -592,15 +592,15 @@ def api_worker_register():
     host    = d.get("worker_host", "")
     nbd_gb  = d.get("nbd_gb", 0)
     node_id = d.get("node_id", host)
-
+    if not host:
+        return jsonify({"ok": False, "error": "host eksik"})
     log(f"[Panel] ⚙️  Destek düğümü bağlandı: {host} ({nbd_gb}GB)")
-
     support_nodes[node_id] = {
         "node_id":      node_id,
         "host":         host,
         "nbd_gb":       nbd_gb,
         "connected_at": time.time(),
-        "status":       "connecting",
+        "status":       "connected",
     }
     socketio.emit("support_nodes_update", list(support_nodes.values()))
     socketio.emit("worker_update", {"host": host, "nbd_gb": nbd_gb})
@@ -609,15 +609,29 @@ def api_worker_register():
 
 @app.route("/api/worker/heartbeat", methods=["POST"])
 def api_worker_heartbeat():
+    """
+    FIX v9.2: Heartbeat host bilgisini de içeriyor.
+    Eğer node yeni ise register et (main server restart sonrası kurtarma).
+    """
     d = request.json or {}
     node_id = d.get("node_id", "")
-    if node_id in support_nodes:
+    host    = d.get("worker_host", "")
+
+    if node_id:
+        is_new = node_id not in support_nodes
+        support_nodes[node_id] = support_nodes.get(node_id, {})
         support_nodes[node_id].update({
-            "last_ping":    time.time(),
-            "ram_mb":       d.get("rss_mb", 0),
-            "disk_free_gb": d.get("disk_free_gb", 0),
-            "status":       "connected",
+            "node_id":    node_id,
+            "host":       host or support_nodes[node_id].get("host", ""),
+            "nbd_gb":     d.get("nbd_gb", support_nodes[node_id].get("nbd_gb", 0)),
+            "last_ping":  time.time(),
+            "ram_mb":     d.get("rss_mb", 0),
+            "status":     "connected",
         })
+        if is_new and host:
+            # Ana sunucu restart olmuş — yeniden kayıt
+            support_nodes[node_id]["connected_at"] = time.time()
+            log(f"[Panel] 🔄 Destek yeniden bağlandı (heartbeat): {host}")
         socketio.emit("support_nodes_update", list(support_nodes.values()))
     return jsonify({"ok": True})
 
