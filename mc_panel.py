@@ -1,16 +1,20 @@
 """
-⛏️  Minecraft Yönetim Paneli — v9.1
+⛏️  Minecraft Yönetim Paneli — v10.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Düzeltmeler:
-  - get_jvm_args: psutil yerine cgroup'tan RAM oku
-  - api_plugin_search: requests yerine urllib (eventlet uyumlu)
-  - import requests kaldırıldı
+v10.0: NBD kaldırıldı → Resource Pool entegrasyonu
+  - /api/agent/register + heartbeat
+  - RAM Cache stats, flush
+  - File Store (region arşiv)
+  - CPU Worker görev gönderimi
+  - TCP Proxy yönetimi
+  - Panel'e "Kaynak Havuzu" sayfası eklendi
 """
 
 import os, sys, json, time, threading, subprocess, shutil, zipfile
 import re, glob
 import urllib.request as _urllib_req
 import urllib.parse as _urllib_parse
+import urllib.error
 import ssl as _ssl_mod
 from collections import deque
 from datetime import datetime
@@ -23,12 +27,12 @@ from flask import Flask, request, jsonify, send_file, abort, Response
 from flask_socketio import SocketIO, emit
 
 # ── Ayarlar ───────────────────────────────────────────────────
-MC_DIR    = Path("/minecraft")
-MC_JAR    = MC_DIR / "server.jar"
-MC_PORT   = 25565
-PANEL_PORT= int(os.environ.get("PORT", "5000"))
-MC_VERSION= "1.21.1"
-MC_RAM    = os.environ.get("MC_RAM", "2G")
+MC_DIR     = Path("/minecraft")
+MC_JAR     = MC_DIR / "server.jar"
+MC_PORT    = 25565
+PANEL_PORT = int(os.environ.get("PORT", "5000"))
+MC_VERSION = "1.21.1"
+MC_RAM     = os.environ.get("MC_RAM", "2G")
 
 # ── Global durum ─────────────────────────────────────────────
 mc_process   = None
@@ -36,18 +40,15 @@ console_buf  = deque(maxlen=3000)
 players      = {}
 tunnel_info  = {"url": "", "host": ""}
 server_state = {
-    "status":  "stopped",
-    "tps":     20.0,
-    "tps15":   20.0,
-    "tps5":    20.0,
-    "ram_mb":  0,
-    "uptime":  0,
-    "started": None,
-    "version": "—",
-    "max_players": 20,
-    "online_players": 0,
+    "status": "stopped", "tps": 20.0, "tps15": 20.0, "tps5": 20.0,
+    "ram_mb": 0, "uptime": 0, "started": None,
+    "version": "—", "max_players": 20, "online_players": 0,
 }
-support_nodes = {}
+
+# ── Resource Pool ─────────────────────────────────────────────
+# key: node_id  val: {url, node_id, healthy, last_ping, info:{ram,disk,cpu,proxy}}
+_agents: dict = {}
+_agents_lock  = threading.Lock()
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
@@ -70,43 +71,35 @@ def log(line: str):
 def _parse_mc_output(line: str):
     m = re.search(r"(\w+)\[/.+\] logged in", line)
     if m:
-        name = m.group(1)
-        players[name] = {"op": False, "joined_ts": time.time()}
+        players[m.group(1)] = {"op": False, "joined_ts": time.time()}
         server_state["online_players"] = len(players)
         socketio.emit("players_update", _players_list())
         socketio.emit("stats_update", server_state)
         return
-
     m = re.search(r"(\w+) lost connection|(\w+) left the game", line)
     if m:
-        name = m.group(1) or m.group(2)
-        players.pop(name, None)
+        players.pop(m.group(1) or m.group(2), None)
         server_state["online_players"] = len(players)
         socketio.emit("players_update", _players_list())
         socketio.emit("stats_update", server_state)
         return
-
     m = re.search(r"TPS from last 1m, 5m, 15m: ([\d.]+),\s*([\d.]+),\s*([\d.]+)", line)
     if m:
-        server_state["tps"]   = float(m.group(1))
-        server_state["tps5"]  = float(m.group(2))
-        server_state["tps15"] = float(m.group(3))
+        server_state["tps"]  = float(m.group(1))
+        server_state["tps5"] = float(m.group(2))
+        server_state["tps15"]= float(m.group(3))
         socketio.emit("stats_update", server_state)
         return
-
     m = re.search(r"Starting minecraft server version (.+)", line)
     if m:
         server_state["version"] = m.group(1).strip()
-
     if "Done" in line and "help" in line.lower():
         server_state["status"]  = "running"
         server_state["started"] = time.time()
         server_state["online_players"] = 0
         socketio.emit("server_status", server_state)
-        log("[Panel] ✅ Minecraft Server hazır! Oyuncular bağlanabilir.")
+        log("[Panel] ✅ Minecraft Server hazır!")
         threading.Thread(target=_tps_monitor, daemon=True).start()
-        return
-
     if "Stopping server" in line:
         server_state["status"] = "stopping"
         socketio.emit("server_status", server_state)
@@ -156,7 +149,197 @@ def _ram_monitor():
 
 
 # ══════════════════════════════════════════════════════════════
-#  MINECRAFT SERVER YÖNETİMİ
+#  RESOURCE POOL — Agent yönetimi
+# ══════════════════════════════════════════════════════════════
+
+def _pool_register(tunnel_url: str, node_id: str, info: dict):
+    with _agents_lock:
+        is_new = node_id not in _agents
+        _agents[node_id] = {
+            "url":       tunnel_url.rstrip("/"),
+            "node_id":   node_id,
+            "healthy":   True,
+            "last_ping": time.time(),
+            "connected_at": _agents.get(node_id, {}).get("connected_at", time.time()),
+            "info":      info,
+        }
+    return is_new
+
+
+def _pool_summary() -> dict:
+    with _agents_lock:
+        agents = list(_agents.values())
+    healthy = [a for a in agents if a["healthy"]]
+    total_ram_mb   = sum(a["info"].get("ram",  {}).get("free_mb",   0) for a in healthy)
+    total_disk_gb  = sum(a["info"].get("disk", {}).get("free_gb",   0) for a in healthy)
+    total_cache_mb = sum(a["info"].get("ram",  {}).get("cache_mb",  0) for a in healthy)
+    total_cpu      = sum(a["info"].get("cpu",  {}).get("cores",     0) for a in healthy)
+    return {
+        "total":    len(agents),
+        "healthy":  len(healthy),
+        "resources": {
+            "ram_free_mb":   total_ram_mb,
+            "disk_free_gb":  round(total_disk_gb, 1),
+            "cache_used_mb": total_cache_mb,
+            "cpu_cores":     total_cpu,
+        },
+        "agents": [
+            {
+                "node_id":      a["node_id"],
+                "url":          a["url"],
+                "healthy":      a["healthy"],
+                "connected_at": a["connected_at"],
+                "last_ping":    a["last_ping"],
+                "ram":          a["info"].get("ram",   {}),
+                "disk":         a["info"].get("disk",  {}),
+                "cpu":          a["info"].get("cpu",   {}),
+                "proxy":        a["info"].get("proxy", {}),
+            }
+            for a in agents
+        ],
+    }
+
+
+def _agent_req(agent: dict, method: str, path: str,
+               data: bytes = None, headers: dict = None, timeout: int = 15):
+    try:
+        req = _urllib_req.Request(
+            agent["url"] + path,
+            data=data,
+            headers={"Content-Type": "application/octet-stream", **(headers or {})},
+            method=method,
+        )
+        with _urllib_req.urlopen(req, timeout=timeout) as r:
+            agent["healthy"]   = True
+            agent["last_ping"] = time.time()
+            return r.read()
+    except Exception as e:
+        agent["healthy"] = False
+        return None
+
+
+def _agent_json(agent: dict, method: str, path: str,
+                body: dict = None, timeout: int = 15):
+    raw = _agent_req(
+        agent, method, path,
+        data=json.dumps(body).encode() if body else None,
+        headers={"Content-Type": "application/json"},
+        timeout=timeout,
+    )
+    if raw:
+        try: return json.loads(raw)
+        except: pass
+    return None
+
+
+def _best_agent_by_disk() -> dict | None:
+    with _agents_lock:
+        agents = [a for a in _agents.values() if a["healthy"]]
+    if not agents:
+        return None
+    return max(agents, key=lambda a: a["info"].get("disk", {}).get("free_gb", 0))
+
+
+def _best_agent_by_ram() -> dict | None:
+    with _agents_lock:
+        agents = [a for a in _agents.values() if a["healthy"]]
+    if not agents:
+        return None
+    return min(agents, key=lambda a: a["info"].get("ram", {}).get("cache_mb", 9999))
+
+
+def _pool_health_watchdog():
+    """Arka planda agent sağlığını izle."""
+    while True:
+        time.sleep(35)
+        with _agents_lock:
+            agents = list(_agents.values())
+        for ag in agents:
+            r = _agent_json(ag, "GET", "/api/status", timeout=8)
+            if r:
+                ag["info"]      = r
+                ag["healthy"]   = True
+                ag["last_ping"] = time.time()
+            else:
+                # 90sn yanıt yoksa unhealthy
+                if time.time() - ag["last_ping"] > 90:
+                    ag["healthy"] = False
+        socketio.emit("pool_update", _pool_summary())
+
+
+def _pool_auto_optimize():
+    """
+    Periyodik olarak:
+    1. Eski region'ları agent'a taşı → ana sunucuda disk aç → swap büyüt
+    2. Düşük RAM'de JVM dışı cache devreye girer
+    """
+    time.sleep(120)   # Sunucu stabil olana kadar bekle
+    while True:
+        try:
+            _auto_archive_old_regions()
+        except Exception as e:
+            log(f"[Pool] ⚠️  Otomatik arşiv hatası: {e}")
+        time.sleep(600)   # 10 dakikada bir
+
+
+def _auto_archive_old_regions(older_than_days: int = 5):
+    import shutil as _sh
+    best = _best_agent_by_disk()
+    if not best:
+        return
+    free_gb = _sh.disk_usage("/").free / 1e9
+    if free_gb > 8.0:
+        return   # Yeterli yer var, gerek yok
+
+    archived  = 0
+    freed_mb  = 0
+    now       = time.time()
+
+    for dim_dir in [MC_DIR / "world" / "region",
+                    MC_DIR / "world_nether" / "DIM-1" / "region",
+                    MC_DIR / "world_the_end" / "DIM1" / "region"]:
+        if not dim_dir.exists():
+            continue
+        dim = dim_dir.parts[-3]   # world / world_nether / world_the_end
+
+        for rf in sorted(dim_dir.glob("*.mca"), key=lambda f: f.stat().st_mtime):
+            if (now - rf.stat().st_mtime) / 86400 < older_than_days:
+                continue
+            try:
+                data = rf.read_bytes()
+                url  = best["url"] + f"/api/files/regions/{dim}/{rf.name}"
+                req  = _urllib_req.Request(url, data=data, method="PUT",
+                                           headers={"Content-Type": "application/octet-stream"})
+                _urllib_req.urlopen(req, timeout=120)
+                rf.unlink()
+                freed_mb += len(data) / 1e6
+                archived  += 1
+            except Exception as e:
+                continue   # sessiz hata
+
+    if archived > 0:
+        # Swap dosyası büyüt
+        new_free_gb = _sh.disk_usage("/").free / 1e9
+        sw_mb       = min(6144, int(new_free_gb * 0.7 * 1024))
+        sf2         = "/swapfile2"
+        subprocess.run(f"swapoff {sf2} 2>/dev/null", shell=True)
+        try:
+            if Path(sf2).exists(): Path(sf2).unlink()
+        except: pass
+        r = subprocess.run(f"fallocate -l {sw_mb}M {sf2} && chmod 600 {sf2} && "
+                           f"mkswap -f {sf2} && swapon -p 1 {sf2}",
+                           shell=True, capture_output=True)
+        if r.returncode == 0:
+            log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB boşaltıldı) "
+                f"→ yeni swap dosyası: {sw_mb}MB")
+        else:
+            log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB)")
+
+    return archived, freed_mb
+
+
+# ══════════════════════════════════════════════════════════════
+#  MC SERVER YÖNETİMİ
 # ══════════════════════════════════════════════════════════════
 
 def download_paper():
@@ -164,45 +347,31 @@ def download_paper():
     ctx = ssl.create_default_context()
     log("[Panel] 📥 Paper MC indiriliyor...")
     try:
-        api_url = (
-            f"https://api.papermc.io/v2/projects/paper"
-            f"/versions/{MC_VERSION}/builds"
-        )
-        req = _urllib_req.Request(api_url, headers={"User-Agent": "MCPanel/9.1"})
+        api_url = f"https://api.papermc.io/v2/projects/paper/versions/{MC_VERSION}/builds"
+        req = _urllib_req.Request(api_url, headers={"User-Agent": "MCPanel/10.0"})
         with _urllib_req.urlopen(req, timeout=20, context=ctx) as r:
             builds = json.loads(r.read()).get("builds", [])
-
         if not builds:
             raise ValueError("Build listesi boş")
-
         build    = builds[-1]["build"]
         jar_name = f"paper-{MC_VERSION}-{build}.jar"
-        url = (
-            f"https://api.papermc.io/v2/projects/paper"
-            f"/versions/{MC_VERSION}/builds/{build}/downloads/{jar_name}"
-        )
-        log(f"[Panel] 📦 {jar_name} indiriliyor (build #{build})...")
-
-        req2 = _urllib_req.Request(url, headers={"User-Agent": "MCPanel/9.1"})
+        url = (f"https://api.papermc.io/v2/projects/paper"
+               f"/versions/{MC_VERSION}/builds/{build}/downloads/{jar_name}")
+        log(f"[Panel] 📦 {jar_name} (build #{build})...")
+        req2 = _urllib_req.Request(url, headers={"User-Agent": "MCPanel/10.0"})
         done = 0
         with _urllib_req.urlopen(req2, timeout=180, context=ctx) as r2:
             total = int(r2.headers.get("Content-Length", 0))
             with open(MC_JAR, "wb") as f:
                 while True:
                     chunk = r2.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
+                    if not chunk: break
+                    f.write(chunk); done += len(chunk)
                     if total:
-                        pct = int(done * 100 / total)
                         socketio.emit("download_progress",
-                                      {"pct": pct, "done": done, "total": total})
-
-        log(f"[Panel] ✅ Paper MC {MC_VERSION} build #{build} indirildi "
-            f"({done // 1024 // 1024} MB)")
+                                      {"pct": int(done*100/total), "done": done, "total": total})
+        log(f"[Panel] ✅ Paper MC {MC_VERSION} build #{build} indirildi ({done//1024//1024}MB)")
         return True
-
     except Exception as e:
         log(f"[Panel] ❌ İndirme hatası: {e}")
         return False
@@ -210,194 +379,32 @@ def download_paper():
 
 def write_server_config():
     (MC_DIR / "eula.txt").write_text("eula=true\n")
-
-    props_file = MC_DIR / "server.properties"
-    if not props_file.exists():
-        props_file.write_text(
-            f"server-port={MC_PORT}\n"
-            "max-players=20\n"
-            "online-mode=false\n"
-            "gamemode=survival\n"
-            "difficulty=normal\n"
-            "level-name=world\n"
-            "motd=\\u00A7a\\u00A7lLinux Masaüstü \\u00A7r\\u00A7fMC Server\n"
-            "view-distance=8\n"
-            "simulation-distance=6\n"
-            "spawn-protection=0\n"
-            "allow-flight=true\n"
-            "enable-rcon=false\n"
-            "max-tick-time=60000\n"
-            "white-list=false\n"
-            "enable-command-block=true\n"
-            "enforce-whitelist=false\n"
-            "pvp=true\n"
-            "generate-structures=true\n"
-            "allow-nether=true\n"
-            "enable-query=false\n"
-            "sync-chunk-writes=true\n"
+    props = MC_DIR / "server.properties"
+    if not props.exists():
+        props.write_text(
+            f"server-port={MC_PORT}\nmax-players=20\nonline-mode=false\n"
+            "gamemode=survival\ndifficulty=normal\nlevel-name=world\n"
+            "motd=\\u00A7a\\u00A7lRender MC Server\nview-distance=8\n"
+            "simulation-distance=6\nspawn-protection=0\nallow-flight=true\n"
+            "enable-rcon=false\nmax-tick-time=60000\nwhite-list=false\n"
+            "enable-command-block=true\npvp=true\ngenerate-structures=true\n"
+            "allow-nether=true\nsync-chunk-writes=true\n"
         )
-
-    config_dir = MC_DIR / "config"
-    config_dir.mkdir(exist_ok=True)
-
-    paper_world = config_dir / "paper-world-defaults.yml"
-    if not paper_world.exists():
-        paper_world.write_text(
-            "world-settings:\n"
-            "  default:\n"
-            "    spawn-limits:\n"
-            "      monsters: 70\n"
-            "      animals: 10\n"
-            "      water-animals: 5\n"
-            "      water-ambient: 20\n"
-            "    chunks:\n"
-            "      auto-save-interval: 6000\n"
-            "    entity-per-chunk-save-limit:\n"
-            "      experience_orb: 16\n"
-            "      snowball: 8\n"
-            "      ender_pearl: 8\n"
-            "      arrow: 16\n"
+    config = MC_DIR / "config"
+    config.mkdir(exist_ok=True)
+    pw = config / "paper-world-defaults.yml"
+    if not pw.exists():
+        pw.write_text(
+            "world-settings:\n  default:\n"
+            "    spawn-limits:\n      monsters: 70\n      animals: 10\n"
+            "      water-animals: 5\n      water-ambient: 20\n"
+            "    chunks:\n      auto-save-interval: 6000\n"
         )
-
-
-def _setup_swap():
-    import psutil
-
-    def _w(path, val):
-        try:
-            with open(path, "w") as f: f.write(str(val))
-            return True
-        except Exception:
-            return False
-
-    try:
-        for path, val in [
-            ("/sys/fs/cgroup/memory.max",      "max"),
-            ("/sys/fs/cgroup/memory.swap.max", "max"),
-            ("/sys/fs/cgroup/memory.high",     "max"),
-            ("/sys/fs/cgroup/cpu.max",         "max"),
-            ("/sys/fs/cgroup/pids.max",        "max"),
-        ]:
-            _w(path, val)
-        for cg_dir in glob.glob("/sys/fs/cgroup/*/") + glob.glob("/sys/fs/cgroup/*/*/"):
-            for fn, v in [("memory.max","max"),("memory.swap.max","max"),
-                          ("memory.high","max"),("cpu.max","max"),("pids.max","max")]:
-                _w(cg_dir + fn, v)
-        for path, val in [
-            ("/sys/fs/cgroup/memory/memory.limit_in_bytes",       "-1"),
-            ("/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes", "-1"),
-            ("/sys/fs/cgroup/memory/memory.soft_limit_in_bytes",  "-1"),
-            ("/sys/fs/cgroup/memory/memory.swappiness",           "100"),
-            ("/sys/fs/cgroup/memory/memory.oom_control",          "0"),
-            ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us",               "-1"),
-            ("/sys/fs/cgroup/pids/pids.max",                      "max"),
-        ]:
-            _w(path, val)
-
-        log("[Panel] 🔓 cgroup tüm limitler kaldırıldı")
-
-        swp = psutil.swap_memory()
-        disk = psutil.disk_usage("/")
-        free_gb = disk.free / 1024 / 1024 / 1024
-        # Render 18GB disk limiti: max 3GB swap bırak, kalan disk için alan bırak
-        swap_gb = min(3, int(free_gb * 0.25))
-        swap_gb = max(1, swap_gb)
-        swap_mb = swap_gb * 1024
-
-        if swp.total >= swap_mb * 1024 * 1024 * 0.9:
-            log(f"[Panel] ✅ Swap zaten aktif: {swp.total//1024//1024}MB")
-        else:
-            swap_file = "/swapfile"
-            log(f"[Panel] 💾 Swap oluşturuluyor: {swap_gb}GB...")
-
-            if os.path.exists(swap_file):
-                subprocess.run(["swapoff", swap_file], capture_output=True)
-                try: os.remove(swap_file)
-                except: pass
-
-            ret = subprocess.run(
-                ["fallocate", "-l", f"{swap_mb}M", swap_file],
-                capture_output=True
-            )
-            if ret.returncode != 0:
-                subprocess.run([
-                    "dd", "if=/dev/zero", f"of={swap_file}",
-                    "bs=64M", f"count={max(1, swap_mb//64)}", "status=none"
-                ], capture_output=True)
-
-            subprocess.run(["chmod", "600", swap_file], capture_output=True)
-            subprocess.run(["mkswap", "-f", swap_file], capture_output=True)
-            r2 = subprocess.run(["swapon", "-p", "0", swap_file], capture_output=True)
-            if r2.returncode == 0:
-                log(f"[Panel] ✅ Swap dosyası aktif: {swap_mb}MB")
-            else:
-                log(f"[Panel] ⚠️  Swap/cgroup hatası: {r2.stderr.decode().strip()}")
-
-        for path, val in [
-            ("/proc/sys/vm/swappiness",             "100"),
-            ("/proc/sys/vm/vfs_cache_pressure",     "200"),
-            ("/proc/sys/vm/overcommit_memory",      "1"),
-            ("/proc/sys/vm/overcommit_ratio",       "100"),
-            ("/proc/sys/vm/page-cluster",           "0"),
-            ("/proc/sys/vm/watermark_boost_factor", "0"),
-            ("/proc/sys/vm/drop_caches",            "3"),
-        ]:
-            _w(path, val)
-
-        swp2 = psutil.swap_memory()
-        mem  = psutil.virtual_memory()
-        log(f"[Panel] ✅ RAM={mem.total//1024//1024}MB + Swap={swp2.total//1024//1024}MB "
-            f"= {(mem.total+swp2.total)//1024//1024}MB toplam")
-
-    except Exception as e:
-        log(f"[Panel] ⚠️  Swap/cgroup hatası: {e}")
-
-
-def _ram_watchdog():
-    import psutil
-    last_warn = 0
-
-    while True:
-        eventlet.sleep(5)
-        try:
-            mem  = psutil.virtual_memory()
-            swp  = psutil.swap_memory()
-            avail_mb = int((mem.available + swp.free) / 1024 / 1024)
-
-            if avail_mb < 512:
-                try:
-                    with open("/proc/sys/vm/drop_caches", "w") as f:
-                        f.write("3")
-                except Exception:
-                    pass
-                send_command("kill @e[type=item]")
-                send_command("kill @e[type=experience_orb]")
-                send_command("kill @e[type=arrow]")
-                send_command("save-all")
-
-            elif avail_mb < 1024:
-                now = time.time()
-                if now - last_warn > 60:
-                    send_command("kill @e[type=item]")
-                    send_command("save-all")
-                    last_warn = now
-
-        except Exception:
-            pass
 
 
 def get_jvm_args():
-    """
-    FIX v9.1: cgroup'tan gerçek container RAM'i oku.
-    psutil host değerlerini (31GB+) döndürür — KULLANMA.
-    Render 512MB container için Xmx max 384MB olmalı.
-    """
-    import psutil
-
-    # Önce main.py'nin env'e koyduğu değeri al
+    import psutil as _ps
     container_ram_mb = int(os.environ.get("CONTAINER_RAM_MB", "512"))
-
-    # cgroup'tan kontrol et (daha güvenilir)
     for path in ["/sys/fs/cgroup/memory.max",
                  "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
         try:
@@ -405,49 +412,28 @@ def get_jvm_args():
             if val not in ("max", "-1"):
                 mb = int(val) // 1024 // 1024
                 if 64 < mb < 65536:
-                    container_ram_mb = mb
-                    break
-        except:
-            pass
+                    container_ram_mb = mb; break
+        except: pass
 
-    swp = psutil.swap_memory()
-    swap_mb = int(swp.total / 1024 / 1024)
-
-    # Render 512MB: OS+Python~150MB → MC için max 384MB fiziksel
+    swp    = _ps.swap_memory()
+    sw_mb  = int(swp.total / 1024 / 1024)
     xmx_mb = min(384, container_ram_mb - 128)
     xmx_mb = max(256, xmx_mb)
-
-    # Swap varsa daha yüksek Xmx (swap'a taşar, OOM olmaz)
-    if swap_mb > 512:
-        xmx_mb = min(xmx_mb + min(swap_mb // 4, 512), 2048)
-
+    if sw_mb > 512:
+        xmx_mb = min(xmx_mb + min(sw_mb // 4, 512), 2048)
     xms_mb = 32
-    xmx = f"{xmx_mb}M"
-    xms = f"{xms_mb}M"
-    log(f"[Panel] 🧠 Container RAM={container_ram_mb}MB Swap={swap_mb}MB → Xms={xms} Xmx={xmx}")
-
+    log(f"[Panel] 🧠 Container RAM={container_ram_mb}MB Swap={sw_mb}MB → Xms={xms_mb}M Xmx={xmx_mb}M")
     return [
-        "java",
-        f"-Xms{xms}", f"-Xmx{xmx}",
-        "-XX:CompressedClassSpaceSize=64m",
-        "-XX:MaxMetaspaceSize=128m",
-        "-XX:+UseG1GC",
-        "-XX:+ParallelRefProcEnabled",
-        "-XX:MaxGCPauseMillis=200",
-        "-XX:+UnlockExperimentalVMOptions",
-        "-XX:+DisableExplicitGC",
-        "-XX:G1PeriodicGCInterval=15000",
-        "-XX:+G1PeriodicGCInvokesConcurrent",
-        "-XX:G1NewSizePercent=20",
-        "-XX:G1MaxNewSizePercent=30",
-        "-XX:G1HeapRegionSize=4m",
-        "-XX:G1ReservePercent=20",
-        "-XX:InitiatingHeapOccupancyPercent=15",
-        "-XX:SoftRefLRUPolicyMSPerMB=0",
-        "-XX:+UseStringDeduplication",
-        "-Djava.net.preferIPv4Stack=true",
-        "-Dfile.encoding=UTF-8",
-        "-Dcom.mojang.eula.agree=true",
+        "java", f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
+        "-XX:CompressedClassSpaceSize=64m", "-XX:MaxMetaspaceSize=128m",
+        "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled", "-XX:MaxGCPauseMillis=200",
+        "-XX:+UnlockExperimentalVMOptions", "-XX:+DisableExplicitGC",
+        "-XX:G1PeriodicGCInterval=15000", "-XX:+G1PeriodicGCInvokesConcurrent",
+        "-XX:G1NewSizePercent=20", "-XX:G1MaxNewSizePercent=30",
+        "-XX:G1HeapRegionSize=4m", "-XX:G1ReservePercent=20",
+        "-XX:InitiatingHeapOccupancyPercent=15", "-XX:SoftRefLRUPolicyMSPerMB=0",
+        "-XX:+UseStringDeduplication", "-Djava.net.preferIPv4Stack=true",
+        "-Dfile.encoding=UTF-8", "-Dcom.mojang.eula.agree=true",
         "-jar", str(MC_JAR), "--nogui",
     ]
 
@@ -456,22 +442,7 @@ def start_server():
     global mc_process
     if mc_process and mc_process.poll() is None:
         return False, "Server zaten çalışıyor"
-
     MC_DIR.mkdir(parents=True, exist_ok=True)
-    _setup_swap()
-
-    # NBD bağlantı kontrolü — uyarı ver (otomatik başlatma zaten bariyerli)
-    min_req  = int(os.environ.get("MIN_SUPPORT_NODES", "3"))
-    nbd_cnt  = nbd_connected_count()
-    if nbd_cnt < min_req:
-        log(f"[Panel] ⚠️  UYARI: {nbd_cnt}/{min_req} NBD dugumu bagli! "
-            f"Swap yetersiz — sunucu RAM'e sigilmayabilir.")
-    else:
-        import psutil as _ps
-        swp = _ps.swap_memory()
-        log(f"[Panel] ✅ {nbd_cnt}/{min_req} NBD dugumu hazir | "
-            f"Swap: {swp.total//1024//1024}MB")
-
     if not MC_JAR.exists():
         server_state["status"] = "downloading"
         socketio.emit("server_status", server_state)
@@ -479,32 +450,23 @@ def start_server():
             server_state["status"] = "stopped"
             socketio.emit("server_status", server_state)
             return False, "Jar indirilemedi"
-
     write_server_config()
-
-    server_state["status"] = "starting"
-    server_state["online_players"] = 0
+    server_state.update({"status": "starting", "online_players": 0})
     players.clear()
     socketio.emit("server_status", server_state)
     socketio.emit("players_update", [])
-
     jvm = get_jvm_args()
-    log(f"[Panel] 🚀 Server başlatılıyor (RAM: {MC_RAM})...")
-    log(f"[Panel] JVM: {' '.join(jvm[:6])} ...")
-
+    log(f"[Panel] 🚀 Server başlatılıyor...")
     try:
         mc_process = subprocess.Popen(
             jvm, cwd=str(MC_DIR),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
     except Exception as e:
         log(f"[Panel] ❌ Başlatma hatası: {e}")
         server_state["status"] = "stopped"
         socketio.emit("server_status", server_state)
         return False, str(e)
-
     threading.Thread(target=_stdout_reader, daemon=True).start()
     return True, "Başlatılıyor..."
 
@@ -517,11 +479,8 @@ def stop_server(force=False):
     socketio.emit("server_status", server_state)
     if force:
         mc_process.kill()
-        log("[Panel] ⚠️  Server zorla kapatıldı")
     else:
-        send_command("save-all")
-        time.sleep(1)
-        send_command("stop")
+        send_command("save-all"); time.sleep(1); send_command("stop")
     return True, "Durduruluyor..."
 
 
@@ -531,63 +490,61 @@ def send_command(cmd: str) -> bool:
             mc_process.stdin.write(f"{cmd}\n".encode())
             mc_process.stdin.flush()
             return True
-        except Exception:
-            pass
+        except: pass
     return False
 
 
+def _ram_watchdog():
+    import psutil
+    while True:
+        eventlet.sleep(5)
+        try:
+            mem = psutil.virtual_memory()
+            swp = psutil.swap_memory()
+            avail_mb = int((mem.available + swp.free) / 1024 / 1024)
+            if avail_mb < 512:
+                try: open("/proc/sys/vm/drop_caches","w").write("3")
+                except: pass
+                send_command("kill @e[type=item]")
+                send_command("kill @e[type=experience_orb]")
+                send_command("save-all")
+        except: pass
+
+
 # ══════════════════════════════════════════════════════════════
-#  FLASK ROUTES
+#  FLASK ROUTES — MC Yönetimi
 # ══════════════════════════════════════════════════════════════
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
-    data = request.json or {}
-    is_internal = data.get("_internal", False)
-
-    if not is_internal:
-        min_req = int(os.environ.get("MIN_SUPPORT_NODES", "3"))
-        nbd_cnt = nbd_connected_count()
-        if nbd_cnt < min_req:
-            msg = (f"⛔ {nbd_cnt}/{min_req} destek düğümü NBD bağlı. "
-                   f"Otomatik başlatma düğümler hazır olunca devreye girecek.")
-            log(f"[Panel] {msg}")
-            return jsonify({"ok": False, "msg": msg})
-
     ok, msg = start_server()
     return jsonify({"ok": ok, "msg": msg})
 
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
-    force = (request.json or {}).get("force", False)
-    ok, msg = stop_server(force)
+    ok, msg = stop_server((request.json or {}).get("force", False))
     return jsonify({"ok": ok, "msg": msg})
 
 
 @app.route("/api/restart", methods=["POST"])
 def api_restart():
-    stop_server()
-    time.sleep(4)
+    stop_server(); time.sleep(4)
     ok, msg = start_server()
     return jsonify({"ok": ok, "msg": msg})
 
 
 @app.route("/api/status")
 def api_status():
-    return jsonify({**server_state,
-                    "players": _players_list(),
+    return jsonify({**server_state, "players": _players_list(),
                     "tunnel": tunnel_info,
-                    "support_nodes": list(support_nodes.values())})
+                    "pool": _pool_summary()})
 
 
 @app.route("/api/command", methods=["POST"])
 def api_command():
     cmd = (request.json or {}).get("cmd", "").strip()
-    if not cmd:
-        return jsonify({"ok": False})
-    ok = send_command(cmd)
-    return jsonify({"ok": ok})
+    return jsonify({"ok": send_command(cmd) if cmd else False})
 
 
 @app.route("/api/console/history")
@@ -598,44 +555,15 @@ def api_console_history():
 @app.route("/api/internal/tunnel", methods=["POST"])
 def api_internal_tunnel():
     d = request.json or {}
-    tunnel_info["url"]  = d.get("url", "")
-    tunnel_info["host"] = d.get("host", "")
+    tunnel_info.update({"url": d.get("url",""), "host": d.get("host","")})
     socketio.emit("tunnel_update", tunnel_info)
     return jsonify({"ok": True})
 
 
 @app.route("/api/internal/status_msg", methods=["POST"])
 def api_internal_status_msg():
-    """main.py sistem mesajlarını konsola iletir."""
-    d = request.json or {}
-    msg = d.get("msg", "")
-    if msg:
-        log(msg)
-    return jsonify({"ok": True})
-
-
-def nbd_connected_count():
-    """NBD baglantisi tamamlanmis destek dugumu sayisi."""
-    return sum(1 for n in support_nodes.values()
-               if n.get("status") == "nbd_connected")
-
-
-@app.route("/api/internal/nbd_status", methods=["POST"])
-def api_internal_nbd_status():
-    """main.py NBD baglantisi kurulunca buraya bildirir."""
-    d = request.json or {}
-    if d.get("nbd_connected"):
-        host    = d.get("host", "")
-        node_id = d.get("node_id", host.replace(".trycloudflare.com", ""))
-        dev     = d.get("dev", "")
-        for nid, node in support_nodes.items():
-            if nid == node_id or node.get("host", "") == host:
-                support_nodes[nid]["status"] = "nbd_connected"
-                support_nodes[nid]["dev"]    = dev
-        cnt     = nbd_connected_count()
-        min_req = int(os.environ.get("MIN_SUPPORT_NODES", "3"))
-        log(f"[Panel] 🔗 NBD baglandi: {host} ({dev}) | {cnt}/{min_req} dugum hazir")
-        socketio.emit("support_nodes_update", list(support_nodes.values()))
+    msg = (request.json or {}).get("msg", "")
+    if msg: log(msg)
     return jsonify({"ok": True})
 
 
@@ -644,63 +572,162 @@ def api_tunnel():
     return jsonify(tunnel_info)
 
 
-# ── Worker / Destek Sunucusu API ──────────────────────────────
+# ── Eski destek düğümü uyumluluğu (v9.x agent'lar için) ──────
 
 @app.route("/api/worker/register", methods=["POST"])
 def api_worker_register():
     d = request.json or {}
-    host    = d.get("worker_host", "")
-    nbd_gb  = d.get("nbd_gb", 0)
-    node_id = d.get("node_id", host)
-    if not host:
-        return jsonify({"ok": False, "error": "host eksik"})
-    log(f"[Panel] ⚙️  Destek düğümü bağlandı: {host} ({nbd_gb}GB)")
-    support_nodes[node_id] = {
-        "node_id":      node_id,
-        "host":         host,
-        "nbd_gb":       nbd_gb,
-        "connected_at": time.time(),
-        "status":       "connected",
-    }
-    socketio.emit("support_nodes_update", list(support_nodes.values()))
-    socketio.emit("worker_update", {"host": host, "nbd_gb": nbd_gb})
-    return jsonify({"ok": True, "message": f"Destek düğümü {host} kaydedildi"})
+    host = d.get("worker_host", "")
+    if host:
+        log(f"[Panel] ⚙️  Eski destek düğümü: {host} (v9.x uyumlu)")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/worker/heartbeat", methods=["POST"])
 def api_worker_heartbeat():
-    """
-    FIX v9.2: Heartbeat host bilgisini de içeriyor.
-    Eğer node yeni ise register et (main server restart sonrası kurtarma).
-    """
-    d = request.json or {}
-    node_id = d.get("node_id", "")
-    host    = d.get("worker_host", "")
-
-    if node_id:
-        is_new = node_id not in support_nodes
-        support_nodes[node_id] = support_nodes.get(node_id, {})
-        support_nodes[node_id].update({
-            "node_id":    node_id,
-            "host":       host or support_nodes[node_id].get("host", ""),
-            "nbd_gb":     d.get("nbd_gb", support_nodes[node_id].get("nbd_gb", 0)),
-            "last_ping":  time.time(),
-            "ram_mb":     d.get("rss_mb", 0),
-            "status":     "connected",
-        })
-        if is_new and host:
-            # Ana sunucu restart olmuş — yeniden kayıt
-            support_nodes[node_id]["connected_at"] = time.time()
-            log(f"[Panel] 🔄 Destek yeniden bağlandı (heartbeat): {host}")
-        socketio.emit("support_nodes_update", list(support_nodes.values()))
     return jsonify({"ok": True})
 
 
 @app.route("/api/worker/status")
 def api_worker_status():
+    return jsonify({"nodes": []})
+
+
+# ══════════════════════════════════════════════════════════════
+#  RESOURCE POOL — Agent API (v10.0)
+# ══════════════════════════════════════════════════════════════
+
+@app.route("/api/agent/register", methods=["POST"])
+def api_agent_register():
+    d          = request.json or {}
+    tunnel_url = d.get("tunnel", "")
+    node_id    = d.get("node_id", "")
+    if not tunnel_url or not node_id:
+        return jsonify({"ok": False, "error": "tunnel veya node_id eksik"})
+    is_new = _pool_register(tunnel_url, node_id, d)
+    if is_new:
+        log(f"[Pool] ✅ Yeni agent: {node_id} | "
+            f"RAM:{d.get('ram',{}).get('free_mb',0)}MB | "
+            f"Disk:{d.get('disk',{}).get('free_gb',0):.1f}GB | "
+            f"CPU:{d.get('cpu',{}).get('cores',0)} core")
+    socketio.emit("pool_update", _pool_summary())
+    return jsonify({"ok": True})
+
+
+@app.route("/api/agent/heartbeat", methods=["POST"])
+def api_agent_heartbeat():
+    d = request.json or {}
+    if d.get("node_id") and d.get("tunnel"):
+        _pool_register(d["tunnel"], d["node_id"], d)
+    socketio.emit("pool_update", _pool_summary())
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pool/status")
+def api_pool_status():
+    return jsonify(_pool_summary())
+
+
+@app.route("/api/pool/cache/stats")
+def api_pool_cache_stats():
+    stats = []
+    with _agents_lock:
+        agents = list(_agents.values())
+    for ag in agents:
+        r = _agent_json(ag, "GET", "/api/cache/stats")
+        if r:
+            r["node_id"] = ag["node_id"]
+            stats.append(r)
     return jsonify({
-        "nodes": list(support_nodes.values()),
+        "agents":     stats,
+        "total_keys": sum(s.get("keys",   0) for s in stats),
+        "total_mb":   sum(s.get("used_mb",0) for s in stats),
     })
+
+
+@app.route("/api/pool/cache/flush", methods=["POST"])
+def api_pool_cache_flush():
+    prefix = (request.json or {}).get("prefix", "")
+    total  = 0
+    with _agents_lock:
+        agents = list(_agents.values())
+    for ag in agents:
+        r = _agent_json(ag, "POST", "/api/cache/flush", {"prefix": prefix})
+        total += (r or {}).get("flushed", 0)
+    log(f"[Pool] 🗑️  {total} önbellek anahtarı temizlendi")
+    return jsonify({"ok": True, "flushed": total})
+
+
+@app.route("/api/pool/storage")
+def api_pool_storage():
+    result = []
+    with _agents_lock:
+        agents = list(_agents.values())
+    for ag in agents:
+        r = _agent_json(ag, "GET", "/api/files/storage/stats")
+        if r:
+            r["node_id"] = ag["node_id"]
+            result.append(r)
+    return jsonify({"agents": result})
+
+
+@app.route("/api/pool/task", methods=["POST"])
+def api_pool_task():
+    d = request.json or {}
+    with _agents_lock:
+        agents = [a for a in _agents.values() if a["healthy"]]
+    if not agents:
+        return jsonify({"ok": False, "error": "Aktif agent yok"})
+    import hashlib as _hlib
+    key = d.get("type","") + str(d.get("payload",""))
+    ag  = agents[int(_hlib.md5(key.encode()).hexdigest(),16) % len(agents)]
+    r   = _agent_json(ag, "POST", "/api/cpu/submit", d)
+    if not r:
+        return jsonify({"ok": False, "error": "Görev gönderilemedi"})
+    task_id = r.get("task_id")
+    for _ in range(30):
+        time.sleep(1)
+        res = _agent_json(ag, "GET", f"/api/cpu/result/{task_id}")
+        if res and res.get("status") == "done":
+            return jsonify({"ok": True, "result": res.get("result")})
+    return jsonify({"ok": True, "task_id": task_id, "status": "pending"})
+
+
+@app.route("/api/pool/proxy/start", methods=["POST"])
+def api_pool_proxy_start():
+    d    = request.json or {}
+    host = d.get("host", "127.0.0.1")
+    port = int(d.get("port", 25565))
+    with _agents_lock:
+        agents = list(_agents.values())
+    started = []
+    for ag in agents:
+        r = _agent_json(ag, "POST", "/api/proxy/start",
+                        {"host": host, "port": port, "listen_port": 25565})
+        if r and r.get("ok"):
+            started.append(ag["node_id"])
+            log(f"[Pool] 🔀 Proxy: {ag['node_id']} → {host}:{port}")
+    return jsonify({"ok": True, "started": started})
+
+
+@app.route("/api/pool/proxy/stop", methods=["POST"])
+def api_pool_proxy_stop():
+    with _agents_lock:
+        agents = list(_agents.values())
+    for ag in agents:
+        _agent_json(ag, "POST", "/api/proxy/stop")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pool/archive/regions", methods=["POST"])
+def api_pool_archive_regions():
+    result = _auto_archive_old_regions(
+        older_than_days=int((request.json or {}).get("older_than_days", 3))
+    )
+    if result:
+        archived, freed_mb = result
+        return jsonify({"ok": True, "archived": archived, "freed_mb": round(freed_mb,1)})
+    return jsonify({"ok": False, "error": "Agent yok veya region bulunamadı"})
 
 
 # ── Oyuncu yönetimi ───────────────────────────────────────────
@@ -710,390 +737,234 @@ def api_players():
     send_command("list")
     return jsonify({"players": _players_list(), "count": len(players)})
 
-
-@app.route("/api/players/kick", methods=["POST"])
+@app.route("/api/players/kick",     methods=["POST"])
 def api_kick():
-    d = request.json or {}
-    send_command(f"kick {d['player']} {d.get('reason', 'Kicked by admin')}")
-    return jsonify({"ok": True})
-
-
-@app.route("/api/players/ban", methods=["POST"])
+    d=request.json or {}; send_command(f"kick {d['player']} {d.get('reason','Kicked')}"); return jsonify({"ok":True})
+@app.route("/api/players/ban",      methods=["POST"])
 def api_ban():
-    d = request.json or {}
-    send_command(f"ban {d['player']} {d.get('reason', 'Banned by admin')}")
-    return jsonify({"ok": True})
-
-
-@app.route("/api/players/ban-ip", methods=["POST"])
+    d=request.json or {}; send_command(f"ban {d['player']} {d.get('reason','Banned')}"); return jsonify({"ok":True})
+@app.route("/api/players/ban-ip",   methods=["POST"])
 def api_ban_ip():
-    send_command(f"ban-ip {(request.json or {})['player']}")
-    return jsonify({"ok": True})
-
-
-@app.route("/api/players/pardon", methods=["POST"])
+    send_command(f"ban-ip {(request.json or {})['player']}"); return jsonify({"ok":True})
+@app.route("/api/players/pardon",   methods=["POST"])
 def api_pardon():
-    send_command(f"pardon {(request.json or {})['player']}")
-    return jsonify({"ok": True})
-
-
-@app.route("/api/players/op", methods=["POST"])
+    send_command(f"pardon {(request.json or {})['player']}"); return jsonify({"ok":True})
+@app.route("/api/players/op",       methods=["POST"])
 def api_op():
-    send_command(f"op {(request.json or {})['player']}")
-    return jsonify({"ok": True})
-
-
-@app.route("/api/players/deop", methods=["POST"])
+    send_command(f"op {(request.json or {})['player']}"); return jsonify({"ok":True})
+@app.route("/api/players/deop",     methods=["POST"])
 def api_deop():
-    send_command(f"deop {(request.json or {})['player']}")
-    return jsonify({"ok": True})
-
-
+    send_command(f"deop {(request.json or {})['player']}"); return jsonify({"ok":True})
 @app.route("/api/players/gamemode", methods=["POST"])
 def api_gamemode():
-    d = request.json or {}
-    send_command(f"gamemode {d['mode']} {d['player']}")
-    return jsonify({"ok": True})
-
-
-@app.route("/api/players/tp", methods=["POST"])
+    d=request.json or {}; send_command(f"gamemode {d['mode']} {d['player']}"); return jsonify({"ok":True})
+@app.route("/api/players/tp",       methods=["POST"])
 def api_tp():
-    d = request.json or {}
-    dest = d.get("to") or d.get("player")
-    send_command(f"tp {d['player']} {dest}")
-    return jsonify({"ok": True})
-
-
-@app.route("/api/players/give", methods=["POST"])
+    d=request.json or {}; send_command(f"tp {d['player']} {d.get('to') or d.get('player')}"); return jsonify({"ok":True})
+@app.route("/api/players/give",     methods=["POST"])
 def api_give():
-    d = request.json or {}
-    send_command(f"give {d['player']} {d['item']} {d.get('count', 1)}")
-    return jsonify({"ok": True})
-
-
-@app.route("/api/players/msg", methods=["POST"])
+    d=request.json or {}; send_command(f"give {d['player']} {d['item']} {d.get('count',1)}"); return jsonify({"ok":True})
+@app.route("/api/players/msg",      methods=["POST"])
 def api_msg():
-    d = request.json or {}
-    send_command(f"tell {d['player']} {d['message']}")
-    return jsonify({"ok": True})
-
-
-@app.route("/api/players/heal", methods=["POST"])
+    d=request.json or {}; send_command(f"tell {d['player']} {d['message']}"); return jsonify({"ok":True})
+@app.route("/api/players/heal",     methods=["POST"])
 def api_heal():
-    p = (request.json or {}).get("player", "@a")
+    p=(request.json or {}).get("player","@a")
     send_command(f"effect give {p} regeneration 5 255 true")
     send_command(f"effect give {p} saturation 5 255 true")
-    return jsonify({"ok": True})
-
-
-@app.route("/api/players/kill", methods=["POST"])
+    return jsonify({"ok":True})
+@app.route("/api/players/kill",     methods=["POST"])
 def api_kill_player():
-    send_command(f"kill {(request.json or {}).get('player', '')}")
-    return jsonify({"ok": True})
-
+    send_command(f"kill {(request.json or {}).get('player','')}"); return jsonify({"ok":True})
 
 @app.route("/api/banlist")
 def api_banlist():
-    f = MC_DIR / "banned-players.json"
-    return jsonify(json.loads(f.read_text()) if f.exists() else [])
-
-
+    f=MC_DIR/"banned-players.json"; return jsonify(json.loads(f.read_text()) if f.exists() else [])
 @app.route("/api/whitelist")
 def api_whitelist():
-    f = MC_DIR / "whitelist.json"
-    return jsonify(json.loads(f.read_text()) if f.exists() else [])
-
-
-@app.route("/api/whitelist/add", methods=["POST"])
-def api_whitelist_add():
-    send_command(f"whitelist add {(request.json or {})['player']}")
-    return jsonify({"ok": True})
-
-
+    f=MC_DIR/"whitelist.json"; return jsonify(json.loads(f.read_text()) if f.exists() else [])
+@app.route("/api/whitelist/add",    methods=["POST"])
+def api_wl_add():
+    send_command(f"whitelist add {(request.json or {})['player']}"); return jsonify({"ok":True})
 @app.route("/api/whitelist/remove", methods=["POST"])
-def api_whitelist_remove():
-    send_command(f"whitelist remove {(request.json or {})['player']}")
-    return jsonify({"ok": True})
-
-
+def api_wl_rm():
+    send_command(f"whitelist remove {(request.json or {})['player']}"); return jsonify({"ok":True})
 @app.route("/api/whitelist/toggle", methods=["POST"])
-def api_whitelist_toggle():
-    on = (request.json or {}).get("on", True)
-    send_command("whitelist on" if on else "whitelist off")
-    return jsonify({"ok": True})
-
+def api_wl_toggle():
+    send_command("whitelist on" if (request.json or {}).get("on",True) else "whitelist off"); return jsonify({"ok":True})
 
 # ── Dosya yönetimi ────────────────────────────────────────────
 
-def safe_path(rel: str) -> Path:
-    p = (MC_DIR / rel).resolve()
-    if not str(p).startswith(str(MC_DIR.resolve())):
-        abort(403)
+def safe_path(rel):
+    p=(MC_DIR/rel).resolve()
+    if not str(p).startswith(str(MC_DIR.resolve())): abort(403)
     return p
-
 
 @app.route("/api/files")
 def api_files():
-    p = safe_path(request.args.get("path", ""))
-    if not p.exists():
-        return jsonify([])
-    items = []
-    for item in sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name.lower())):
-        stat = item.stat()
-        size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file()) if item.is_dir() else stat.st_size
-        items.append({
-            "name":     item.name,
-            "path":     str(item.relative_to(MC_DIR)),
-            "type":     "dir" if item.is_dir() else "file",
-            "size":     size,
-            "modified": int(stat.st_mtime),
-            "ext":      item.suffix.lower() if item.is_file() else "",
-        })
+    p=safe_path(request.args.get("path",""))
+    if not p.exists(): return jsonify([])
+    items=[]
+    for item in sorted(p.iterdir(),key=lambda x:(x.is_file(),x.name.lower())):
+        stat=item.stat()
+        size=sum(f.stat().st_size for f in item.rglob("*") if f.is_file()) if item.is_dir() else stat.st_size
+        items.append({"name":item.name,"path":str(item.relative_to(MC_DIR)),"type":"dir" if item.is_dir() else "file","size":size,"modified":int(stat.st_mtime),"ext":item.suffix.lower() if item.is_file() else ""})
     return jsonify(items)
-
 
 @app.route("/api/files/read")
 def api_file_read():
-    p = safe_path(request.args.get("path", ""))
-    if not p.is_file():
-        abort(404)
-    try:
-        return jsonify({"content": p.read_text(errors="replace"),
-                        "path": str(p.relative_to(MC_DIR))})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+    p=safe_path(request.args.get("path",""))
+    if not p.is_file(): abort(404)
+    try: return jsonify({"content":p.read_text(errors="replace"),"path":str(p.relative_to(MC_DIR))})
+    except Exception as e: return jsonify({"error":str(e)}),500
 
 @app.route("/api/files/write", methods=["POST"])
 def api_file_write():
-    d = request.json or {}
-    p = safe_path(d["path"])
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(d["content"])
-    return jsonify({"ok": True})
-
+    d=request.json or {}; p=safe_path(d["path"]); p.parent.mkdir(parents=True,exist_ok=True); p.write_text(d["content"]); return jsonify({"ok":True})
 
 @app.route("/api/files/delete", methods=["POST"])
 def api_file_delete():
-    p = safe_path((request.json or {})["path"])
-    shutil.rmtree(p) if p.is_dir() else p.unlink()
-    return jsonify({"ok": True})
+    p=safe_path((request.json or {})["path"])
+    shutil.rmtree(p) if p.is_dir() else p.unlink(); return jsonify({"ok":True})
 
-
-@app.route("/api/files/mkdir", methods=["POST"])
+@app.route("/api/files/mkdir",  methods=["POST"])
 def api_mkdir():
-    safe_path((request.json or {})["path"]).mkdir(parents=True, exist_ok=True)
-    return jsonify({"ok": True})
-
+    safe_path((request.json or {})["path"]).mkdir(parents=True,exist_ok=True); return jsonify({"ok":True})
 
 @app.route("/api/files/rename", methods=["POST"])
 def api_rename():
-    d = request.json or {}
-    safe_path(d["from"]).rename(safe_path(d["to"]))
-    return jsonify({"ok": True})
-
+    d=request.json or {}; safe_path(d["from"]).rename(safe_path(d["to"])); return jsonify({"ok":True})
 
 @app.route("/api/files/upload", methods=["POST"])
 def api_upload():
-    rel = request.form.get("path", "")
-    for fname, f in request.files.items():
-        p = safe_path(rel + "/" + f.filename)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        f.save(str(p))
-    return jsonify({"ok": True})
-
+    rel=request.form.get("path","")
+    for _,f in request.files.items():
+        p=safe_path(rel+"/"+f.filename); p.parent.mkdir(parents=True,exist_ok=True); f.save(str(p))
+    return jsonify({"ok":True})
 
 @app.route("/api/files/download")
 def api_download():
-    p = safe_path(request.args.get("path", ""))
-    if not p.exists():
-        abort(404)
+    p=safe_path(request.args.get("path",""))
+    if not p.exists(): abort(404)
     if p.is_dir():
-        zp = f"/tmp/{p.name}.zip"
-        with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+        zp=f"/tmp/{p.name}.zip"
+        with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:
             for fp in p.rglob("*"):
-                if fp.is_file():
-                    z.write(fp, fp.relative_to(p))
-        return send_file(zp, as_attachment=True, download_name=f"{p.name}.zip")
-    return send_file(str(p), as_attachment=True)
-
+                if fp.is_file(): z.write(fp,fp.relative_to(p))
+        return send_file(zp,as_attachment=True,download_name=f"{p.name}.zip")
+    return send_file(str(p),as_attachment=True)
 
 # ── Plugin yönetimi ───────────────────────────────────────────
 
 @app.route("/api/plugins")
 def api_plugins():
-    pdir = MC_DIR / "plugins"
-    pdir.mkdir(exist_ok=True)
-    result = []
+    pdir=MC_DIR/"plugins"; pdir.mkdir(exist_ok=True)
+    result=[]
     for jar in sorted(pdir.glob("*.jar")):
-        result.append({"name": jar.stem, "file": jar.name, "size": jar.stat().st_size, "enabled": True})
+        result.append({"name":jar.stem,"file":jar.name,"size":jar.stat().st_size,"enabled":True})
     for jar in sorted(pdir.glob("*.jar.disabled")):
-        result.append({"name": jar.name.replace(".jar.disabled", ""), "file": jar.name, "size": jar.stat().st_size, "enabled": False})
+        result.append({"name":jar.name.replace(".jar.disabled",""),"file":jar.name,"size":jar.stat().st_size,"enabled":False})
     return jsonify(result)
-
 
 @app.route("/api/plugins/upload", methods=["POST"])
 def api_plugin_upload():
-    pdir = MC_DIR / "plugins"
-    pdir.mkdir(exist_ok=True)
-    uploaded = []
+    pdir=MC_DIR/"plugins"; pdir.mkdir(exist_ok=True); uploaded=[]
     for f in request.files.values():
         if f.filename.endswith(".jar"):
-            dest = pdir / f.filename
-            f.save(str(dest))
-            uploaded.append(f.filename)
-    return jsonify({"ok": True, "uploaded": uploaded, "msg": f"{len(uploaded)} plugin yüklendi. Yeniden başlatın."})
-
+            f.save(str(pdir/f.filename)); uploaded.append(f.filename)
+    return jsonify({"ok":True,"uploaded":uploaded,"msg":f"{len(uploaded)} plugin yüklendi."})
 
 @app.route("/api/plugins/delete", methods=["POST"])
 def api_plugin_delete():
-    p = MC_DIR / "plugins" / (request.json or {})["file"]
-    if p.exists():
-        p.unlink()
-    return jsonify({"ok": True})
-
+    p=MC_DIR/"plugins"/(request.json or {})["file"]
+    if p.exists(): p.unlink()
+    return jsonify({"ok":True})
 
 @app.route("/api/plugins/toggle", methods=["POST"])
 def api_plugin_toggle():
-    name = (request.json or {})["file"]
-    p    = MC_DIR / "plugins" / name
-    if name.endswith(".disabled"):
-        new = MC_DIR / "plugins" / name[:-len(".disabled")]
-    else:
-        new = MC_DIR / "plugins" / (name + ".disabled")
-    if p.exists():
-        p.rename(new)
-    return jsonify({"ok": True})
-
+    name=(request.json or {})["file"]; p=MC_DIR/"plugins"/name
+    new=MC_DIR/"plugins"/(name[:-len(".disabled")] if name.endswith(".disabled") else name+".disabled")
+    if p.exists(): p.rename(new)
+    return jsonify({"ok":True})
 
 @app.route("/api/plugins/search")
 def api_plugin_search():
-    """
-    FIX v9.1: requests kütüphanesi eventlet.monkey_patch() ile
-    sonsuz recursion'a giriyor. urllib kullan.
-    """
-    q = request.args.get("q", "")
-    if not q:
-        return jsonify([])
-
+    q=request.args.get("q","")
+    if not q: return jsonify([])
     try:
-        ctx = _ssl_mod.create_default_context()
-        url = (
-            "https://hangar.papermc.io/api/v1/projects?"
-            + _urllib_parse.urlencode({"q": q, "limit": 12})
-        )
-        req = _urllib_req.Request(url, headers={"User-Agent": "MCPanel/9.1"})
-        with _urllib_req.urlopen(req, timeout=10, context=ctx) as resp:
-            data = json.loads(resp.read())
-
-        out = []
-        for p in data.get("result", []):
-            ns    = p.get("namespace", {})
-            owner = ns.get("owner", "")
-            name  = p.get("name", "")
-            out.append({
-                "name":        name,
-                "description": p.get("description", "")[:120],
-                "downloads":   p.get("stats", {}).get("downloads", 0),
-                "url":         f"https://hangar.papermc.io/{owner}/{name}",
-                "owner":       owner,
-            })
+        ctx=_ssl_mod.create_default_context()
+        url="https://hangar.papermc.io/api/v1/projects?"+_urllib_parse.urlencode({"q":q,"limit":12})
+        with _urllib_req.urlopen(_urllib_req.Request(url,headers={"User-Agent":"MCPanel/10.0"}),timeout=10,context=ctx) as resp:
+            data=json.loads(resp.read())
+        out=[]
+        for p in data.get("result",[]):
+            ns=p.get("namespace",{}); owner=ns.get("owner",""); name=p.get("name","")
+            out.append({"name":name,"description":p.get("description","")[:120],"downloads":p.get("stats",{}).get("downloads",0),"url":f"https://hangar.papermc.io/{owner}/{name}","owner":owner})
         return jsonify(out)
-
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error":str(e)}),500
 
-
-# ── Sunucu ayarları ───────────────────────────────────────────
+# ── Ayarlar ───────────────────────────────────────────────────
 
 @app.route("/api/settings")
 def api_settings():
-    f = MC_DIR / "server.properties"
-    if not f.exists():
-        return jsonify({})
-    props = {}
+    f=MC_DIR/"server.properties"
+    if not f.exists(): return jsonify({})
+    props={}
     for line in f.read_text().splitlines():
-        line = line.strip()
+        line=line.strip()
         if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            props[k.strip()] = v.strip()
+            k,v=line.split("=",1); props[k.strip()]=v.strip()
     return jsonify(props)
-
 
 @app.route("/api/settings", methods=["POST"])
 def api_settings_save():
-    f = MC_DIR / "server.properties"
-    existing = {}
+    f=MC_DIR/"server.properties"; existing={}
     if f.exists():
         for line in f.read_text().splitlines():
-            line = line.strip()
+            line=line.strip()
             if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                existing[k.strip()] = v.strip()
+                k,v=line.split("=",1); existing[k.strip()]=v.strip()
     existing.update(request.json or {})
-    lines = [f"# Güncellendi: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
-    for k, v in existing.items():
-        lines.append(f"{k}={v}")
-    f.write_text("\n".join(lines) + "\n")
-    return jsonify({"ok": True, "msg": "Kaydedildi. Yeniden başlatın."})
+    f.write_text("\n".join(f"{k}={v}" for k,v in existing.items())+"\n")
+    return jsonify({"ok":True,"msg":"Kaydedildi. Yeniden başlatın."})
 
-
-# ── Dünya yönetimi ────────────────────────────────────────────
+# ── Dünya / Yedek ─────────────────────────────────────────────
 
 @app.route("/api/worlds")
 def api_worlds():
-    worlds = []
+    worlds=[]
     for d in MC_DIR.iterdir():
-        if d.is_dir() and (d / "level.dat").exists():
-            size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
-            worlds.append({"name": d.name, "size": size, "modified": int(d.stat().st_mtime)})
+        if d.is_dir() and (d/"level.dat").exists():
+            size=sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+            worlds.append({"name":d.name,"size":size,"modified":int(d.stat().st_mtime)})
     return jsonify(worlds)
-
 
 @app.route("/api/worlds/backup", methods=["POST"])
 def api_world_backup():
-    world = (request.json or {}).get("world", "world")
-    src   = MC_DIR / world
-    if not src.exists():
-        return jsonify({"ok": False, "error": "Dünya bulunamadı"})
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = MC_DIR / "backups" / f"{world}_{ts}.zip"
+    world=(request.json or {}).get("world","world"); src=MC_DIR/world
+    if not src.exists(): return jsonify({"ok":False,"error":"Dünya bulunamadı"})
+    ts=datetime.now().strftime("%Y%m%d_%H%M%S"); dest=MC_DIR/"backups"/f"{world}_{ts}.zip"
     dest.parent.mkdir(exist_ok=True)
-    send_command("save-off")
-    time.sleep(1)
-    send_command("save-all")
-    time.sleep(2)
-    with zipfile.ZipFile(str(dest), "w", zipfile.ZIP_DEFLATED) as z:
+    send_command("save-off"); time.sleep(1); send_command("save-all"); time.sleep(2)
+    with zipfile.ZipFile(str(dest),"w",zipfile.ZIP_DEFLATED) as z:
         for fp in src.rglob("*"):
-            if fp.is_file():
-                z.write(fp, fp.relative_to(MC_DIR))
+            if fp.is_file(): z.write(fp,fp.relative_to(MC_DIR))
     send_command("save-on")
-    size = dest.stat().st_size
-    return jsonify({"ok": True, "file": str(dest.relative_to(MC_DIR)), "size": size})
-
+    return jsonify({"ok":True,"file":str(dest.relative_to(MC_DIR)),"size":dest.stat().st_size})
 
 @app.route("/api/worlds/delete", methods=["POST"])
 def api_world_delete():
-    world = (request.json or {}).get("world")
-    if not world:
-        return jsonify({"ok": False})
-    p = MC_DIR / world
-    if p.exists() and (p / "level.dat").exists():
-        shutil.rmtree(p)
-        return jsonify({"ok": True})
-    return jsonify({"ok": False, "error": "Dünya bulunamadı"})
-
+    world=(request.json or {}).get("world"); p=MC_DIR/world if world else None
+    if p and p.exists() and (p/"level.dat").exists():
+        shutil.rmtree(p); return jsonify({"ok":True})
+    return jsonify({"ok":False,"error":"Dünya bulunamadı"})
 
 @app.route("/api/backups")
 def api_backups():
-    bdir = MC_DIR / "backups"
-    bdir.mkdir(exist_ok=True)
-    items = []
-    for f in sorted(bdir.glob("*.zip"), key=lambda x: x.stat().st_mtime, reverse=True):
-        items.append({"name": f.name, "path": str(f.relative_to(MC_DIR)),
-                      "size": f.stat().st_size, "created": int(f.stat().st_mtime)})
-    return jsonify(items)
-
+    bdir=MC_DIR/"backups"; bdir.mkdir(exist_ok=True)
+    return jsonify([{"name":f.name,"path":str(f.relative_to(MC_DIR)),"size":f.stat().st_size,"created":int(f.stat().st_mtime)}
+                    for f in sorted(bdir.glob("*.zip"),key=lambda x:x.stat().st_mtime,reverse=True)])
 
 # ── Performans ────────────────────────────────────────────────
 
@@ -1101,42 +972,32 @@ def api_backups():
 def api_performance():
     try:
         import psutil
-        cpu = psutil.cpu_percent(0.2)
-        vm  = psutil.virtual_memory()
-        swp = psutil.swap_memory()
-        dk  = psutil.disk_usage("/")
-        procs = []
+        cpu=psutil.cpu_percent(0.2); vm=psutil.virtual_memory(); swp=psutil.swap_memory(); dk=psutil.disk_usage("/")
+        procs=[]
         if mc_process and mc_process.poll() is None:
             try:
-                proc = psutil.Process(mc_process.pid)
-                procs = [{"cpu": round(proc.cpu_percent(), 1),
-                          "ram": int(proc.memory_info().rss / 1024 / 1024),
-                          "threads": proc.num_threads()}]
-            except Exception:
-                pass
+                proc=psutil.Process(mc_process.pid)
+                procs=[{"cpu":round(proc.cpu_percent(),1),"ram":int(proc.memory_info().rss/1024/1024),"threads":proc.num_threads()}]
+            except: pass
+        pool=_pool_summary()
         return jsonify({
-            "cpu":          round(cpu, 1),
-            "ram_pct":      round(vm.percent, 1),
-            "ram_used_mb":  int(vm.used    / 1024 / 1024),
-            "ram_total_mb": int(vm.total   / 1024 / 1024),
-            "ram_free_mb":  int(vm.available/1024 / 1024),
-            "swap_total_mb":int(swp.total  / 1024 / 1024),
-            "swap_free_mb": int(swp.free   / 1024 / 1024),
-            "disk_pct":     round(dk.percent, 1),
-            "disk_used_gb": round(dk.used  / 1e9, 1),
-            "disk_total_gb":round(dk.total / 1e9, 1),
-            "cpu_count":    psutil.cpu_count(),
-            "mc":           procs[0] if procs else {},
-            "tps":          server_state["tps"],
-            "tps5":         server_state["tps5"],
-            "tps15":        server_state["tps15"],
-            "support_nodes": len(support_nodes),
+            "cpu":round(cpu,1),"ram_pct":round(vm.percent,1),
+            "ram_used_mb":int(vm.used/1024/1024),"ram_total_mb":int(vm.total/1024/1024),
+            "ram_free_mb":int(vm.available/1024/1024),
+            "swap_total_mb":int(swp.total/1024/1024),"swap_free_mb":int(swp.free/1024/1024),
+            "disk_pct":round(dk.percent,1),"disk_used_gb":round(dk.used/1e9,1),"disk_total_gb":round(dk.total/1e9,1),
+            "cpu_count":psutil.cpu_count(),"mc":procs[0] if procs else {},
+            "tps":server_state["tps"],"tps5":server_state["tps5"],"tps15":server_state["tps15"],
+            "pool_agents":pool["healthy"],
+            "pool_ram_mb":pool["resources"]["ram_free_mb"],
+            "pool_disk_gb":pool["resources"]["disk_free_gb"],
+            "pool_cache_mb":pool["resources"]["cache_used_mb"],
         })
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return jsonify({"error":str(e)})
 
 
-# ── SocketIO events ──────────────────────────────────────────
+# ── SocketIO ──────────────────────────────────────────────────
 
 @socketio.on("connect")
 def on_connect():
@@ -1144,21 +1005,21 @@ def on_connect():
     emit("server_status",   server_state)
     emit("players_update",  _players_list())
     emit("tunnel_update",   tunnel_info)
-    emit("support_nodes_update", list(support_nodes.values()))
+    emit("pool_update",     _pool_summary())
 
 
 @socketio.on("send_command")
 def on_send_command(data):
-    cmd = (data or {}).get("cmd", "").strip()
+    cmd=(data or {}).get("cmd","").strip()
     if cmd:
-        ok = send_command(cmd)
+        ok=send_command(cmd)
         if not ok:
-            emit("console_line", {"ts": datetime.now().strftime("%H:%M:%S"),
-                                   "line": "[Panel] ⚠️  Server çalışmıyor, komut gönderilemedi"})
+            emit("console_line",{"ts":datetime.now().strftime("%H:%M:%S"),
+                                  "line":"[Panel] ⚠️  Server çalışmıyor"})
 
 
 # ══════════════════════════════════════════════════════════════
-#  PANEL HTML
+#  PANEL HTML  (v10.0 — Kaynak Havuzu sekmesi eklendi)
 # ══════════════════════════════════════════════════════════════
 
 @app.route("/")
@@ -1171,144 +1032,135 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⛏️ Minecraft Yönetim Paneli</title>
+<title>⛏️ MC Panel v10</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root {
-  --bg: #05060c; --s1: #0b0d16; --s2: #0f1120; --s3: #131627;
-  --a1: #00e5ff; --a2: #7c6aff; --a3: #00ffaa; --a4: #ff6b35;
-  --red: #ff4757; --green: #2ed573; --yellow: #ffa502; --orange: #ff6b35;
-  --t1: #eef0f8; --t2: #8892a4; --t3: #3d4558;
-  --font: 'Sora', sans-serif; --mono: 'JetBrains Mono', monospace;
-  --sidebar: 230px; --r: 12px;
-}
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { height: 100%; background: var(--bg); color: var(--t1); font-family: var(--font); overflow: hidden; }
-.layout { display: flex; height: 100vh; }
-.sidebar { width: var(--sidebar); background: var(--s1); border-right: 1px solid rgba(255,255,255,.06); display: flex; flex-direction: column; flex-shrink: 0; overflow-y: auto; }
-.sb-head { padding: 18px 16px 14px; border-bottom: 1px solid rgba(255,255,255,.06); }
-.sb-head h2 { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-.sb-ver { font-size: 10px; color: var(--t2); font-family: var(--mono); margin-top: 4px; }
-.sb-status { margin: 10px 10px 0; background: rgba(255,255,255,.03); border-radius: 9px; padding: 9px 12px; display: flex; align-items: center; gap: 8px; font-size: 12px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.dot-green  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
-.dot-red    { background: var(--red);    box-shadow: 0 0 6px var(--red); }
-.dot-yellow { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); animation: blink 1s infinite; }
-@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
-.nav { padding: 10px; flex: 1; }
-.nav-sec { font-size: 9px; font-weight: 700; color: var(--t3); text-transform: uppercase; letter-spacing: .12em; padding: 10px 6px 5px; }
-.nav-item { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 9px; cursor: pointer; transition: all .15s; font-size: 13px; color: var(--t2); margin-bottom: 1px; }
-.nav-item:hover { background: rgba(255,255,255,.05); color: var(--t1); }
-.nav-item.active { background: rgba(0,229,255,.09); color: var(--a1); font-weight: 600; }
-.nav-item .ico { font-size: 15px; width: 18px; text-align: center; }
-.sb-ctrl { padding: 12px 10px; border-top: 1px solid rgba(255,255,255,.06); }
-.ctrl-btn { width: 100%; padding: 8px; border-radius: 9px; font-size: 12px; font-weight: 600; border: none; cursor: pointer; font-family: var(--font); transition: all .15s; margin-bottom: 6px; display: flex; align-items: center; justify-content: center; gap: 6px; }
-.cb-start   { background: linear-gradient(135deg, #2ed573, #00a550); color: #000; }
-.cb-restart { background: rgba(255,165,2,.12); color: var(--yellow); border: 1px solid rgba(255,165,2,.25); }
-.cb-stop    { background: rgba(255,71,87,.12); color: var(--red);    border: 1px solid rgba(255,71,87,.25); }
-.ctrl-btn:hover { transform: translateY(-1px); filter: brightness(1.1); }
-.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.topbar { height: 50px; background: var(--s1); border-bottom: 1px solid rgba(255,255,255,.06); display: flex; align-items: center; padding: 0 18px; gap: 14px; flex-shrink: 0; }
-.page-title { font-size: 14px; font-weight: 700; flex: 1; }
-.top-stats { display: flex; gap: 18px; font-size: 11px; color: var(--t2); font-family: var(--mono); }
-.ts { display: flex; align-items: center; gap: 4px; }
-.ts-v { color: var(--t1); font-weight: 600; }
-.mc-addr-bar { background: linear-gradient(90deg, rgba(0,255,170,.08), rgba(0,229,255,.06)); border-bottom: 1px solid rgba(0,255,170,.15); padding: 7px 18px; display: flex; align-items: center; gap: 10px; font-size: 12px; flex-shrink: 0; }
-.mc-addr-bar .lbl { color: var(--t2); }
-.mc-addr-bar .addr { color: var(--a3); font-family: var(--mono); font-weight: 600; }
-.mc-addr-bar.hidden { display: none; }
-.support-bar { background: linear-gradient(90deg, rgba(124,106,255,.1), rgba(0,229,255,.06)); border-bottom: 1px solid rgba(124,106,255,.2); padding: 6px 18px; display: flex; align-items: center; gap: 12px; font-size: 11px; flex-shrink: 0; }
-.support-bar.hidden { display: none; }
-.pages { flex: 1; overflow: hidden; }
-.page  { display: none; height: 100%; overflow-y: auto; padding: 18px; }
-.page.active { display: block; }
-.card { background: var(--s1); border: 1px solid rgba(255,255,255,.06); border-radius: var(--r); padding: 18px; margin-bottom: 14px; }
-.card-hd { font-size: 11px; font-weight: 700; color: var(--t2); text-transform: uppercase; letter-spacing: .1em; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
-.card-hd::before { content:''; width: 3px; height: 11px; border-radius: 2px; background: var(--a1); }
-.g2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.g3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
-.g4 { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; }
-.sc { background: var(--s2); border: 1px solid rgba(255,255,255,.05); border-radius: 10px; padding: 16px; text-align: center; }
-.sc-val { font-size: 26px; font-weight: 700; font-family: var(--mono); background: linear-gradient(135deg, var(--a1), var(--a2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-.sc-lbl { font-size: 11px; color: var(--t2); margin-top: 4px; }
-.tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
-.tbl th { padding: 8px 10px; text-align: left; font-size: 10px; font-weight: 700; color: var(--t2); text-transform: uppercase; letter-spacing: .08em; border-bottom: 1px solid rgba(255,255,255,.06); }
-.tbl td { padding: 9px 10px; border-bottom: 1px solid rgba(255,255,255,.04); }
-.tbl tr:hover td { background: rgba(255,255,255,.02); }
-.tbl tr:last-child td { border: none; }
-.badge { border-radius: 20px; padding: 2px 8px; font-size: 10px; font-weight: 700; font-family: var(--mono); }
-.bg  { background: rgba(46,213,115,.1);  border: 1px solid rgba(46,213,115,.25);  color: var(--green); }
-.br  { background: rgba(255,71,87,.1);   border: 1px solid rgba(255,71,87,.25);   color: var(--red); }
-.bb  { background: rgba(0,229,255,.08);  border: 1px solid rgba(0,229,255,.2);    color: var(--a1); }
-.by  { background: rgba(255,165,2,.1);   border: 1px solid rgba(255,165,2,.25);   color: var(--yellow); }
-.bp  { background: rgba(124,106,255,.1); border: 1px solid rgba(124,106,255,.25); color: var(--a2); }
-.btn { padding: 6px 14px; border-radius: 7px; font-size: 12px; font-weight: 600; border: none; cursor: pointer; font-family: var(--font); transition: all .15s; display: inline-flex; align-items: center; gap: 5px; text-decoration: none; white-space: nowrap; }
-.btn:hover { transform: translateY(-1px); }
-.btn-sm  { padding: 4px 10px; font-size: 11px; }
-.btn-lg  { padding: 10px 22px; font-size: 13px; }
-.b-prim  { background: linear-gradient(135deg, var(--a1), var(--a2)); color: #000; }
-.b-prim:hover { box-shadow: 0 6px 20px rgba(0,229,255,.3); }
-.b-dang  { background: rgba(255,71,87,.12);  color: var(--red);    border: 1px solid rgba(255,71,87,.25); }
-.b-warn  { background: rgba(255,165,2,.1);   color: var(--yellow); border: 1px solid rgba(255,165,2,.25); }
-.b-succ  { background: rgba(46,213,115,.1);  color: var(--green);  border: 1px solid rgba(46,213,115,.25); }
-.b-ghost { background: rgba(255,255,255,.05); color: var(--t2);    border: 1px solid rgba(255,255,255,.1); }
-.b-purp  { background: rgba(124,106,255,.12); color: var(--a2);   border: 1px solid rgba(124,106,255,.25); }
-.con-wrap { height: calc(100% - 42px); display: flex; flex-direction: column; }
-.con-out { flex: 1; background: #000; border-radius: 10px; padding: 12px; overflow-y: auto; font-family: var(--mono); font-size: 11.5px; line-height: 1.65; border: 1px solid rgba(255,255,255,.06); }
-.con-out::-webkit-scrollbar { width: 5px; }
-.con-out::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 3px; }
-.cl-info  { color: #9cdcfe; }
-.cl-warn  { color: #dcdcaa; }
-.cl-err   { color: #f44747; }
-.cl-panel { color: #00e5ff; }
-.cl-def   { color: #d4d4d4; }
-.con-in   { display: flex; gap: 8px; margin-top: 8px; }
-.con-input { flex: 1; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1); color: var(--t1); border-radius: 8px; padding: 9px 12px; font-family: var(--mono); font-size: 12px; outline: none; }
-.con-input:focus { border-color: rgba(0,229,255,.4); }
-.con-send { padding: 9px 20px; background: linear-gradient(135deg, var(--a1), var(--a2)); color: #000; border: none; border-radius: 8px; font-weight: 700; cursor: pointer; font-family: var(--font); transition: all .15s; }
-.con-send:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(0,229,255,.3); }
-.fm { display: flex; gap: 12px; height: calc(100vh - 160px); }
-.fm-tree { width: 280px; flex-shrink: 0; display: flex; flex-direction: column; background: var(--s1); border: 1px solid rgba(255,255,255,.06); border-radius: var(--r); overflow: hidden; }
-.fm-toolbar { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.06); display: flex; gap: 6px; align-items: center; }
-.fm-bread { font-size: 11px; color: var(--t2); font-family: var(--mono); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.fm-list { flex: 1; overflow-y: auto; }
-.fm-item { display: flex; align-items: center; gap: 8px; padding: 7px 12px; cursor: pointer; border-bottom: 1px solid rgba(255,255,255,.03); transition: background .1s; font-size: 12px; }
-.fm-item:hover { background: rgba(255,255,255,.04); }
-.fm-item.sel   { background: rgba(0,229,255,.07); border-left: 2px solid var(--a1); }
-.fm-ico  { font-size: 14px; width: 18px; text-align: center; }
-.fm-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.fm-size { font-size: 10px; color: var(--t3); font-family: var(--mono); }
-.fm-editor { flex: 1; display: flex; flex-direction: column; background: var(--s1); border: 1px solid rgba(255,255,255,.06); border-radius: var(--r); overflow: hidden; }
-.fm-etool { padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,.06); display: flex; gap: 6px; align-items: center; }
-.fm-fname { font-family: var(--mono); font-size: 11px; color: var(--t2); flex: 1; }
-.fm-area { flex: 1; background: #1e1e1e; color: #d4d4d4; font-family: var(--mono); font-size: 12px; border: none; outline: none; padding: 14px; resize: none; line-height: 1.6; }
-.set-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
-.set-item { background: var(--s2); border: 1px solid rgba(255,255,255,.05); border-radius: 9px; padding: 12px; }
-.set-lbl  { font-size: 10px; color: var(--t2); margin-bottom: 5px; text-transform: uppercase; letter-spacing: .06em; }
-.set-inp  { width: 100%; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1); color: var(--t1); border-radius: 7px; padding: 7px 9px; font-family: var(--mono); font-size: 12px; outline: none; }
-.set-inp:focus { border-color: rgba(0,229,255,.4); }
-select.set-inp option { background: #1e1e1e; }
-.prog { height: 5px; background: rgba(255,255,255,.06); border-radius: 3px; overflow: hidden; margin-top: 5px; }
-.prog-f { height: 100%; border-radius: 3px; transition: width .5s; }
-.pf-cpu  { background: linear-gradient(90deg, var(--a1), var(--a2)); }
-.pf-ram  { background: linear-gradient(90deg, var(--a3), var(--a1)); }
-.pf-disk { background: linear-gradient(90deg, var(--a2), var(--orange)); }
-.inp { background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1); color: var(--t1); border-radius: 8px; padding: 8px 12px; font-family: var(--font); font-size: 12px; outline: none; }
-.inp:focus { border-color: rgba(0,229,255,.4); }
-.inp-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
-.node-card { background: var(--s2); border: 1px solid rgba(124,106,255,.2); border-radius: 10px; padding: 14px; margin-bottom: 10px; }
-.node-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-.notif-wrap { position: fixed; top: 14px; right: 14px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
-.notif { padding: 10px 16px; border-radius: 10px; font-size: 12px; font-weight: 600; max-width: 300px; animation: slide-in .3s ease; }
-@keyframes slide-in { from { transform: translateX(120px); opacity: 0; } to { transform: none; opacity: 1; } }
-.n-ok   { background: rgba(46,213,115,.15);  border: 1px solid rgba(46,213,115,.3);  color: var(--green); }
-.n-err  { background: rgba(255,71,87,.15);   border: 1px solid rgba(255,71,87,.3);   color: var(--red); }
-.n-info { background: rgba(0,229,255,.1);    border: 1px solid rgba(0,229,255,.25);  color: var(--a1); }
-::-webkit-scrollbar { width: 5px; height: 5px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 3px; }
-input[type=file] { display: none; }
+:root{--bg:#05060c;--s1:#0b0d16;--s2:#0f1120;--s3:#131627;--a1:#00e5ff;--a2:#7c6aff;--a3:#00ffaa;--a4:#ff6b35;--red:#ff4757;--green:#2ed573;--yellow:#ffa502;--t1:#eef0f8;--t2:#8892a4;--t3:#3d4558;--font:'Sora',sans-serif;--mono:'JetBrains Mono',monospace;--sidebar:230px;--r:12px}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--t1);font-family:var(--font);overflow:hidden}
+.layout{display:flex;height:100vh}
+.sidebar{width:var(--sidebar);background:var(--s1);border-right:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+.sb-head{padding:18px 16px 14px;border-bottom:1px solid rgba(255,255,255,.06)}
+.sb-head h2{font-size:15px;font-weight:700;display:flex;align-items:center;gap:8px}
+.sb-ver{font-size:10px;color:var(--t2);font-family:var(--mono);margin-top:4px}
+.sb-status{margin:10px 10px 0;background:rgba(255,255,255,.03);border-radius:9px;padding:9px 12px;display:flex;align-items:center;gap:8px;font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot-green{background:var(--green);box-shadow:0 0 6px var(--green)}
+.dot-red{background:var(--red);box-shadow:0 0 6px var(--red)}
+.dot-yellow{background:var(--yellow);box-shadow:0 0 6px var(--yellow);animation:blink 1s infinite}
+.dot-purple{background:var(--a2);box-shadow:0 0 6px var(--a2)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.nav{padding:10px;flex:1}
+.nav-sec{font-size:9px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.12em;padding:10px 6px 5px}
+.nav-item{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:9px;cursor:pointer;transition:all .15s;font-size:13px;color:var(--t2);margin-bottom:1px}
+.nav-item:hover{background:rgba(255,255,255,.05);color:var(--t1)}
+.nav-item.active{background:rgba(0,229,255,.09);color:var(--a1);font-weight:600}
+.nav-item .ico{font-size:15px;width:18px;text-align:center}
+.sb-ctrl{padding:12px 10px;border-top:1px solid rgba(255,255,255,.06)}
+.ctrl-btn{width:100%;padding:8px;border-radius:9px;font-size:12px;font-weight:600;border:none;cursor:pointer;font-family:var(--font);transition:all .15s;margin-bottom:6px;display:flex;align-items:center;justify-content:center;gap:6px}
+.cb-start{background:linear-gradient(135deg,#2ed573,#00a550);color:#000}
+.cb-restart{background:rgba(255,165,2,.12);color:var(--yellow);border:1px solid rgba(255,165,2,.25)}
+.cb-stop{background:rgba(255,71,87,.12);color:var(--red);border:1px solid rgba(255,71,87,.25)}
+.ctrl-btn:hover{transform:translateY(-1px);filter:brightness(1.1)}
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.topbar{height:50px;background:var(--s1);border-bottom:1px solid rgba(255,255,255,.06);display:flex;align-items:center;padding:0 18px;gap:14px;flex-shrink:0}
+.page-title{font-size:14px;font-weight:700;flex:1}
+.top-stats{display:flex;gap:18px;font-size:11px;color:var(--t2);font-family:var(--mono)}
+.ts{display:flex;align-items:center;gap:4px}
+.ts-v{color:var(--t1);font-weight:600}
+.mc-addr-bar{background:linear-gradient(90deg,rgba(0,255,170,.08),rgba(0,229,255,.06));border-bottom:1px solid rgba(0,255,170,.15);padding:7px 18px;display:flex;align-items:center;gap:10px;font-size:12px;flex-shrink:0}
+.mc-addr-bar.hidden{display:none}
+.pool-bar{background:linear-gradient(90deg,rgba(124,106,255,.1),rgba(0,229,255,.06));border-bottom:1px solid rgba(124,106,255,.2);padding:6px 18px;display:flex;align-items:center;gap:12px;font-size:11px;flex-shrink:0}
+.pool-bar.hidden{display:none}
+.pages{flex:1;overflow:hidden}
+.page{display:none;height:100%;overflow-y:auto;padding:18px}
+.page.active{display:block}
+.card{background:var(--s1);border:1px solid rgba(255,255,255,.06);border-radius:var(--r);padding:18px;margin-bottom:14px}
+.card-hd{font-size:11px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:.1em;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.card-hd::before{content:'';width:3px;height:11px;border-radius:2px;background:var(--a1)}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.sc{background:var(--s2);border:1px solid rgba(255,255,255,.05);border-radius:10px;padding:16px;text-align:center}
+.sc-val{font-size:26px;font-weight:700;font-family:var(--mono);background:linear-gradient(135deg,var(--a1),var(--a2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.sc-lbl{font-size:11px;color:var(--t2);margin-top:4px}
+.tbl{width:100%;border-collapse:collapse;font-size:12px}
+.tbl th{padding:8px 10px;text-align:left;font-size:10px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid rgba(255,255,255,.06)}
+.tbl td{padding:9px 10px;border-bottom:1px solid rgba(255,255,255,.04)}
+.tbl tr:hover td{background:rgba(255,255,255,.02)}
+.tbl tr:last-child td{border:none}
+.badge{border-radius:20px;padding:2px 8px;font-size:10px;font-weight:700;font-family:var(--mono)}
+.bg{background:rgba(46,213,115,.1);border:1px solid rgba(46,213,115,.25);color:var(--green)}
+.br{background:rgba(255,71,87,.1);border:1px solid rgba(255,71,87,.25);color:var(--red)}
+.bb{background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.2);color:var(--a1)}
+.by{background:rgba(255,165,2,.1);border:1px solid rgba(255,165,2,.25);color:var(--yellow)}
+.bp{background:rgba(124,106,255,.1);border:1px solid rgba(124,106,255,.25);color:var(--a2)}
+.btn{padding:6px 14px;border-radius:7px;font-size:12px;font-weight:600;border:none;cursor:pointer;font-family:var(--font);transition:all .15s;display:inline-flex;align-items:center;gap:5px;text-decoration:none;white-space:nowrap}
+.btn:hover{transform:translateY(-1px)}
+.btn-sm{padding:4px 10px;font-size:11px}
+.btn-lg{padding:10px 22px;font-size:13px}
+.b-prim{background:linear-gradient(135deg,var(--a1),var(--a2));color:#000}
+.b-dang{background:rgba(255,71,87,.12);color:var(--red);border:1px solid rgba(255,71,87,.25)}
+.b-warn{background:rgba(255,165,2,.1);color:var(--yellow);border:1px solid rgba(255,165,2,.25)}
+.b-succ{background:rgba(46,213,115,.1);color:var(--green);border:1px solid rgba(46,213,115,.25)}
+.b-ghost{background:rgba(255,255,255,.05);color:var(--t2);border:1px solid rgba(255,255,255,.1)}
+.b-purp{background:rgba(124,106,255,.12);color:var(--a2);border:1px solid rgba(124,106,255,.25)}
+.con-wrap{height:calc(100% - 42px);display:flex;flex-direction:column}
+.con-out{flex:1;background:#000;border-radius:10px;padding:12px;overflow-y:auto;font-family:var(--mono);font-size:11.5px;line-height:1.65;border:1px solid rgba(255,255,255,.06)}
+.con-out::-webkit-scrollbar{width:5px}
+.con-out::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:3px}
+.cl-info{color:#9cdcfe}.cl-warn{color:#dcdcaa}.cl-err{color:#f44747}.cl-panel{color:#00e5ff}.cl-pool{color:#7c6aff}.cl-def{color:#d4d4d4}
+.con-in{display:flex;gap:8px;margin-top:8px}
+.con-input{flex:1;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:var(--t1);border-radius:8px;padding:9px 12px;font-family:var(--mono);font-size:12px;outline:none}
+.con-input:focus{border-color:rgba(0,229,255,.4)}
+.con-send{padding:9px 20px;background:linear-gradient(135deg,var(--a1),var(--a2));color:#000;border:none;border-radius:8px;font-weight:700;cursor:pointer;font-family:var(--font)}
+.prog{height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden;margin-top:5px}
+.prog-f{height:100%;border-radius:3px;transition:width .5s}
+.pf-cpu{background:linear-gradient(90deg,var(--a1),var(--a2))}
+.pf-ram{background:linear-gradient(90deg,var(--a3),var(--a1))}
+.pf-disk{background:linear-gradient(90deg,var(--a2),#ff6b35)}
+.pf-pool{background:linear-gradient(90deg,var(--a2),var(--a1))}
+.inp{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:var(--t1);border-radius:8px;padding:8px 12px;font-family:var(--font);font-size:12px;outline:none}
+.inp:focus{border-color:rgba(0,229,255,.4)}
+.inp-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+/* Pool agent card */
+.agent-card{background:var(--s2);border:1px solid rgba(124,106,255,.2);border-radius:12px;padding:16px;margin-bottom:12px}
+.agent-hd{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.agent-res{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.res-box{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);border-radius:8px;padding:10px 8px;text-align:center}
+.res-val{font-size:16px;font-weight:700;font-family:var(--mono);color:var(--a1)}
+.res-lbl{font-size:9px;color:var(--t2);margin-top:3px;text-transform:uppercase;letter-spacing:.06em}
+.notif-wrap{position:fixed;top:14px;right:14px;z-index:200;display:flex;flex-direction:column;gap:8px}
+.notif{padding:10px 16px;border-radius:10px;font-size:12px;font-weight:600;max-width:300px;animation:slide-in .3s ease}
+@keyframes slide-in{from{transform:translateX(120px);opacity:0}to{transform:none;opacity:1}}
+.n-ok{background:rgba(46,213,115,.15);border:1px solid rgba(46,213,115,.3);color:var(--green)}
+.n-err{background:rgba(255,71,87,.15);border:1px solid rgba(255,71,87,.3);color:var(--red)}
+.n-info{background:rgba(0,229,255,.1);border:1px solid rgba(0,229,255,.25);color:var(--a1)}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:3px}
+input[type=file]{display:none}
+.fm{display:flex;gap:12px;height:calc(100vh - 160px)}
+.fm-tree{width:280px;flex-shrink:0;display:flex;flex-direction:column;background:var(--s1);border:1px solid rgba(255,255,255,.06);border-radius:var(--r);overflow:hidden}
+.fm-toolbar{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);display:flex;gap:6px;align-items:center}
+.fm-bread{font-size:11px;color:var(--t2);font-family:var(--mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fm-list{flex:1;overflow-y:auto}
+.fm-item{display:flex;align-items:center;gap:8px;padding:7px 12px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.03);transition:background .1s;font-size:12px}
+.fm-item:hover{background:rgba(255,255,255,.04)}
+.fm-item.sel{background:rgba(0,229,255,.07);border-left:2px solid var(--a1)}
+.fm-ico{font-size:14px;width:18px;text-align:center}
+.fm-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fm-size{font-size:10px;color:var(--t3);font-family:var(--mono)}
+.fm-editor{flex:1;display:flex;flex-direction:column;background:var(--s1);border:1px solid rgba(255,255,255,.06);border-radius:var(--r);overflow:hidden}
+.fm-etool{padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.06);display:flex;gap:6px;align-items:center}
+.fm-fname{font-family:var(--mono);font-size:11px;color:var(--t2);flex:1}
+.fm-area{flex:1;background:#1e1e1e;color:#d4d4d4;font-family:var(--mono);font-size:12px;border:none;outline:none;padding:14px;resize:none;line-height:1.6}
+.set-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.set-item{background:var(--s2);border:1px solid rgba(255,255,255,.05);border-radius:9px;padding:12px}
+.set-lbl{font-size:10px;color:var(--t2);margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em}
+.set-inp{width:100%;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:var(--t1);border-radius:7px;padding:7px 9px;font-family:var(--mono);font-size:12px;outline:none}
+.set-inp:focus{border-color:rgba(0,229,255,.4)}
+select.set-inp option{background:#1e1e1e}
 </style>
 </head>
 <body>
@@ -1316,7 +1168,7 @@ input[type=file] { display: none; }
 <div class="sidebar">
   <div class="sb-head">
     <h2>⛏️ MC Panel</h2>
-    <div class="sb-ver" id="sb-ver">Paper MC • yükleniyor...</div>
+    <div class="sb-ver" id="sb-ver">Paper MC • v10.0</div>
   </div>
   <div class="sb-status">
     <div class="dot dot-red" id="status-dot"></div>
@@ -1332,13 +1184,13 @@ input[type=file] { display: none; }
     <div class="nav-item" data-page="banlist"><span class="ico">🔨</span>Ban Listesi</div>
     <div class="nav-sec">Sunucu</div>
     <div class="nav-item" data-page="plugins"><span class="ico">🔌</span>Pluginler</div>
-    <div class="nav-item" data-page="files"><span class="ico">📁</span>Dosya Yöneticisi</div>
+    <div class="nav-item" data-page="files"><span class="ico">📁</span>Dosyalar</div>
     <div class="nav-item" data-page="worlds"><span class="ico">🌍</span>Dünyalar</div>
     <div class="nav-item" data-page="backups"><span class="ico">💾</span>Yedekler</div>
     <div class="nav-item" data-page="settings"><span class="ico">⚙️</span>Ayarlar</div>
     <div class="nav-sec">İzleme</div>
     <div class="nav-item" data-page="perf"><span class="ico">📈</span>Performans</div>
-    <div class="nav-item" data-page="support"><span class="ico">🔗</span>Destek Düğümleri <span id="node-count" style="background:rgba(124,106,255,.2);color:var(--a2);border-radius:20px;padding:1px 6px;font-size:10px;margin-left:auto">0</span></div>
+    <div class="nav-item" data-page="pool"><span class="ico">🔗</span>Kaynak Havuzu <span id="pool-badge" style="background:rgba(124,106,255,.2);color:var(--a2);border-radius:20px;padding:1px 6px;font-size:10px;margin-left:auto">0</span></div>
   </nav>
   <div class="sb-ctrl">
     <button class="ctrl-btn cb-start"   onclick="srvAction('start')">▶ Başlat</button>
@@ -1350,30 +1202,42 @@ input[type=file] { display: none; }
   <div class="topbar">
     <div class="page-title" id="page-title">📊 Dashboard</div>
     <div class="top-stats">
-      <div class="ts">🔗 <span class="ts-v" id="tb-nodes">0</span> destek</div>
+      <div class="ts">🔗 <span class="ts-v" id="tb-agents">0</span> agent</div>
+      <div class="ts">🧠 <span class="ts-v" id="tb-cache">0MB</span> cache</div>
       <div class="ts">👥 <span class="ts-v" id="tb-pl">0</span></div>
       <div class="ts">⚡ <span class="ts-v" id="tb-tps">20.0</span> TPS</div>
-      <div class="ts">🧠 <span class="ts-v" id="tb-ram">— MB</span></div>
+      <div class="ts">🧠 <span class="ts-v" id="tb-ram">—MB</span></div>
     </div>
   </div>
   <div class="mc-addr-bar hidden" id="mc-addr-bar">
-    <span class="lbl">📌 MC Server Adresi:</span>
-    <span class="addr" id="mc-addr-text">bekleniyor...</span>
+    <span style="color:var(--t2)">📌 MC Adresi:</span>
+    <span id="mc-addr-text" style="color:var(--a3);font-family:var(--mono);font-weight:600">bekleniyor...</span>
     <button class="btn btn-sm b-ghost" onclick="copyAddr()">📋 Kopyala</button>
   </div>
-  <div class="support-bar hidden" id="support-bar">
-    <span style="color:var(--a2)">🔗 Destek Düğümleri:</span>
-    <span id="support-bar-text" style="color:var(--t2);font-size:11px">bağlı düğüm yok</span>
+  <div class="pool-bar hidden" id="pool-bar">
+    <span style="color:var(--a2)">🔗 Aktif Agentlar:</span>
+    <span id="pool-bar-text" style="color:var(--t2);font-size:11px">bağlı agent yok</span>
+    <span id="pool-res-bar" style="color:var(--a1);font-family:var(--mono);font-size:10px;margin-left:auto"></span>
   </div>
   <div class="pages">
 
   <!-- DASHBOARD -->
   <div class="page active" id="page-dashboard">
     <div class="g4" style="margin-bottom:14px">
-      <div class="sc"><div class="sc-val" id="d-pl">0</div><div class="sc-lbl">👥 Online Oyuncu</div></div>
-      <div class="sc"><div class="sc-val" id="d-tps">20.0</div><div class="sc-lbl">⚡ TPS (1dk)</div></div>
-      <div class="sc"><div class="sc-val" id="d-ram">—</div><div class="sc-lbl">🧠 MC RAM (MB)</div></div>
-      <div class="sc"><div class="sc-val" id="d-nodes">0</div><div class="sc-lbl">🔗 Destek Düğümü</div></div>
+      <div class="sc"><div class="sc-val" id="d-pl">0</div><div class="sc-lbl">👥 Online</div></div>
+      <div class="sc"><div class="sc-val" id="d-tps">20.0</div><div class="sc-lbl">⚡ TPS</div></div>
+      <div class="sc"><div class="sc-val" id="d-ram">—</div><div class="sc-lbl">🧠 MC RAM MB</div></div>
+      <div class="sc"><div class="sc-val" id="d-agents">0</div><div class="sc-lbl">🔗 Agentlar</div></div>
+    </div>
+    <!-- Pool kaynak özeti -->
+    <div class="card" id="pool-summary-card" style="display:none;background:linear-gradient(135deg,rgba(124,106,255,.08),rgba(0,229,255,.05));border-color:rgba(124,106,255,.25)">
+      <div class="card-hd" style="color:var(--a2)">🔗 Kaynak Havuzu</div>
+      <div class="g4">
+        <div class="res-box"><div class="res-val" id="ds-cache">0MB</div><div class="res-lbl">RAM Cache</div></div>
+        <div class="res-box"><div class="res-val" id="ds-disk">0GB</div><div class="res-lbl">Disk Deposu</div></div>
+        <div class="res-box"><div class="res-val" id="ds-cpu">0</div><div class="res-lbl">CPU Core</div></div>
+        <div class="res-box"><div class="res-val" id="ds-proxy">0</div><div class="res-lbl">Proxy Agent</div></div>
+      </div>
     </div>
     <div class="g2">
       <div class="card">
@@ -1383,7 +1247,7 @@ input[type=file] { display: none; }
           <tr><td style="color:var(--t2)">Versiyon</td><td id="d-ver">—</td></tr>
           <tr><td style="color:var(--t2)">TPS (1m/5m/15m)</td><td id="d-tps3">—</td></tr>
           <tr><td style="color:var(--t2)">Bağlantı</td><td><span id="d-addr" style="font-family:var(--mono);font-size:11px;color:var(--a3)">—</span></td></tr>
-          <tr><td style="color:var(--t2)">Destek Düğümleri</td><td id="d-nodeinfo" style="color:var(--a2)">0 bağlı</td></tr>
+          <tr><td style="color:var(--t2)">Agent Kaynakları</td><td id="d-poolinfo" style="color:var(--a2)">Bekleniyor...</td></tr>
         </table>
       </div>
       <div class="card">
@@ -1396,7 +1260,7 @@ input[type=file] { display: none; }
         <span>Son Konsol</span>
         <a class="btn btn-sm b-ghost" onclick="navTo('console')">Konsola Git →</a>
       </div>
-      <div id="d-log" style="font-family:var(--mono);font-size:11px;max-height:200px;overflow-y:auto;line-height:1.7;color:#9cdcfe"></div>
+      <div id="d-log" style="font-family:var(--mono);font-size:11px;max-height:180px;overflow-y:auto;line-height:1.7;color:#9cdcfe"></div>
     </div>
   </div>
 
@@ -1412,7 +1276,7 @@ input[type=file] { display: none; }
     <div class="con-wrap" style="flex:1">
       <div class="con-out" id="con-out"></div>
       <div class="con-in">
-        <input class="con-input" id="con-inp" placeholder="Komut gir... (list / tps / give / tp / gamemode / weather ...)">
+        <input class="con-input" id="con-inp" placeholder="Komut gir...">
         <button class="con-send" onclick="conSend()">▶ Gönder</button>
       </div>
     </div>
@@ -1423,10 +1287,7 @@ input[type=file] { display: none; }
     <div class="card" style="margin-bottom:14px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
         <div class="card-hd" style="margin:0">👥 Online Oyuncular</div>
-        <div style="display:flex;gap:6px">
-          <button class="btn btn-sm b-ghost" onclick="broadcast()">📢 Duyuru</button>
-          <button class="btn btn-sm b-ghost" onclick="refreshPlayers()">↺ Yenile</button>
-        </div>
+        <button class="btn btn-sm b-ghost" onclick="refreshPlayers()">↺ Yenile</button>
       </div>
       <table class="tbl"><thead><tr><th>Oyuncu</th><th>Durum</th><th>İşlemler</th></tr></thead><tbody id="pl-body"></tbody></table>
     </div>
@@ -1434,29 +1295,28 @@ input[type=file] { display: none; }
       <div class="card">
         <div class="card-hd">⚡ Hızlı İşlem</div>
         <div class="inp-row"><input class="inp" id="pl-name" placeholder="Oyuncu adı" style="flex:1"></div>
-        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
-          <button class="btn btn-sm b-dang" onclick="plAct('kick')">👢 Kick</button>
-          <button class="btn btn-sm b-dang" onclick="plAct('ban')">🔨 Ban</button>
-          <button class="btn btn-sm b-succ" onclick="plAct('op')">⭐ OP</button>
-          <button class="btn btn-sm b-warn" onclick="plAct('deop')">✕ DeOP</button>
-          <button class="btn btn-sm b-ghost" onclick="plAct('heal')">❤️ Heal</button>
-          <button class="btn btn-sm b-dang" onclick="plAct('kill')">💀 Kill</button>
-        </div>
         <div style="display:flex;flex-wrap:wrap;gap:6px">
-          <button class="btn btn-sm b-ghost" onclick="setGM('survival')">⚔️ Survival</button>
-          <button class="btn btn-sm b-ghost" onclick="setGM('creative')">🎨 Creative</button>
-          <button class="btn btn-sm b-ghost" onclick="setGM('adventure')">🗺️ Adventure</button>
-          <button class="btn btn-sm b-ghost" onclick="setGM('spectator')">👁 Spectator</button>
+          <button class="btn btn-sm b-dang" onclick="plAct('kick')">Kick</button>
+          <button class="btn btn-sm b-dang" onclick="plAct('ban')">Ban</button>
+          <button class="btn btn-sm b-succ" onclick="plAct('op')">OP</button>
+          <button class="btn btn-sm b-warn" onclick="plAct('deop')">DeOP</button>
+          <button class="btn btn-sm b-ghost" onclick="plAct('heal')">Heal</button>
+          <button class="btn btn-sm b-dang" onclick="plAct('kill')">Kill</button>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+          <button class="btn btn-sm b-ghost" onclick="setGM('survival')">Survival</button>
+          <button class="btn btn-sm b-ghost" onclick="setGM('creative')">Creative</button>
+          <button class="btn btn-sm b-ghost" onclick="setGM('spectator')">Spectator</button>
         </div>
       </div>
       <div class="card">
         <div class="card-hd">📩 Mesaj & Give</div>
         <input class="inp" id="msg-pl" placeholder="Oyuncu" style="width:100%;margin-bottom:6px">
         <input class="inp" id="msg-txt" placeholder="Mesaj" style="width:100%;margin-bottom:6px">
-        <button class="btn b-prim btn-sm" style="width:100%;margin-bottom:12px" onclick="sendMsg()">📩 Gönder</button>
+        <button class="btn b-prim btn-sm" style="width:100%;margin-bottom:10px" onclick="sendMsg()">📩 Gönder</button>
         <div style="display:flex;gap:6px;flex-wrap:wrap">
-          <input class="inp" id="give-item" placeholder="Item (diamond_sword)" style="flex:2">
-          <input class="inp" id="give-count" placeholder="Miktar" type="number" value="1" style="width:70px">
+          <input class="inp" id="give-item" placeholder="Item" style="flex:2">
+          <input class="inp" id="give-count" type="number" value="1" style="width:70px">
           <button class="btn b-prim btn-sm" onclick="giveItem()">🎁 Give</button>
         </div>
       </div>
@@ -1469,10 +1329,8 @@ input[type=file] { display: none; }
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
         <div class="card-hd" style="margin:0">📋 Beyaz Liste</div>
         <div class="inp-row" style="margin:0;gap:6px">
-          <input class="inp" id="wl-name" placeholder="Oyuncu adı" style="width:160px">
+          <input class="inp" id="wl-name" placeholder="Oyuncu" style="width:140px">
           <button class="btn btn-sm b-succ" onclick="wlAdd()">+ Ekle</button>
-          <button class="btn btn-sm b-ghost" onclick="api('/api/whitelist/toggle',{on:true});notify('Beyaz liste açıldı','ok')">Aç</button>
-          <button class="btn btn-sm b-ghost" onclick="api('/api/whitelist/toggle',{on:false});notify('Kapatıldı','ok')">Kapat</button>
         </div>
       </div>
       <table class="tbl"><thead><tr><th>Oyuncu</th><th>UUID</th><th>İşlem</th></tr></thead><tbody id="wl-body"></tbody></table>
@@ -1485,9 +1343,9 @@ input[type=file] { display: none; }
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
         <div class="card-hd" style="margin:0">🔨 Ban Listesi</div>
         <div class="inp-row" style="margin:0;gap:6px">
-          <input class="inp" id="ban-name" placeholder="Oyuncu adı" style="width:160px">
-          <input class="inp" id="ban-reason" placeholder="Sebep" style="width:160px">
-          <button class="btn btn-sm b-dang" onclick="banPlayer()">🔨 Ban Et</button>
+          <input class="inp" id="ban-name" placeholder="Oyuncu" style="width:130px">
+          <input class="inp" id="ban-reason" placeholder="Sebep" style="width:130px">
+          <button class="btn btn-sm b-dang" onclick="banPlayer()">🔨 Ban</button>
         </div>
       </div>
       <table class="tbl"><thead><tr><th>Oyuncu</th><th>Sebep</th><th>Tarih</th><th>İşlem</th></tr></thead><tbody id="ban-body"></tbody></table>
@@ -1496,12 +1354,12 @@ input[type=file] { display: none; }
 
   <!-- PLUGİNLER -->
   <div class="page" id="page-plugins">
-    <div class="g2" style="height:calc(100vh - 150px)">
+    <div class="g2" style="height:calc(100vh-150px)">
       <div class="card" style="display:flex;flex-direction:column;overflow:hidden">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-shrink:0">
           <div class="card-hd" style="margin:0">🔌 Kurulu Pluginler</div>
           <div>
-            <label for="plug-up" class="btn btn-sm b-prim" style="cursor:pointer">⬆ .jar Yükle</label>
+            <label for="plug-up" class="btn btn-sm b-prim" style="cursor:pointer">⬆ Yükle</label>
             <input type="file" id="plug-up" accept=".jar" multiple onchange="uploadPlugin(this)">
             <button class="btn btn-sm b-ghost" onclick="loadPlugins()">↺</button>
           </div>
@@ -1509,17 +1367,11 @@ input[type=file] { display: none; }
         <div style="flex:1;overflow-y:auto">
           <table class="tbl"><thead><tr><th>Plugin</th><th>Boyut</th><th>Durum</th><th>İşlem</th></tr></thead><tbody id="plug-body"></tbody></table>
         </div>
-        <div style="padding-top:10px;flex-shrink:0">
-          <div style="border: 2px dashed rgba(255,255,255,.12); border-radius: 10px; padding: 20px; text-align: center; cursor: pointer; color: var(--t2); font-size: 13px;"
-            ondragover="event.preventDefault()" ondrop="dropPlugin(event)">
-            📦 Plugin .jar dosyasını buraya sürükleyin
-          </div>
-        </div>
       </div>
       <div class="card" style="display:flex;flex-direction:column;overflow:hidden">
-        <div class="card-hd">🔍 Plugin Market (Hangar)</div>
+        <div class="card-hd">🔍 Plugin Market</div>
         <div style="display:flex;gap:6px;margin-bottom:12px;flex-shrink:0">
-          <input class="inp" id="plug-q" placeholder="Ara: EssentialsX, WorldEdit..." style="flex:1">
+          <input class="inp" id="plug-q" placeholder="Ara..." style="flex:1">
           <button class="btn b-prim" onclick="searchPlugins()">Ara</button>
         </div>
         <div id="plug-results" style="flex:1;overflow-y:auto"></div>
@@ -1527,7 +1379,7 @@ input[type=file] { display: none; }
     </div>
   </div>
 
-  <!-- DOSYA YÖNETİCİSİ -->
+  <!-- DOSYALAR -->
   <div class="page" id="page-files" style="height:100%;padding:14px">
     <div class="fm">
       <div class="fm-tree">
@@ -1535,19 +1387,19 @@ input[type=file] { display: none; }
           <span class="fm-bread" id="fm-bread">/</span>
           <button class="btn btn-sm b-ghost" onclick="fmUp()">↑</button>
           <button class="btn btn-sm b-ghost" onclick="fmRefresh()">↺</button>
-          <button class="btn btn-sm b-prim"  onclick="fmNewModal()">+</button>
+          <button class="btn btn-sm b-prim" onclick="fmNewModal()">+</button>
         </div>
         <div class="fm-list" id="fm-list"></div>
       </div>
       <div class="fm-editor">
         <div class="fm-etool">
           <span class="fm-fname" id="fm-fname">Dosya seçin...</span>
-          <button class="btn btn-sm b-prim"  id="fm-save" onclick="fmSave()" disabled>💾 Kaydet</button>
-          <button class="btn btn-sm b-ghost" onclick="fmDownload()">⬇ İndir</button>
-          <label class="btn btn-sm b-ghost" style="cursor:pointer">⬆ Yükle <input type="file" multiple onchange="fmUpload(this)"></label>
-          <button class="btn btn-sm b-dang"  onclick="fmDelete()">🗑 Sil</button>
+          <button class="btn btn-sm b-prim" id="fm-save" onclick="fmSave()" disabled>💾 Kaydet</button>
+          <button class="btn btn-sm b-ghost" onclick="fmDownload()">⬇</button>
+          <label class="btn btn-sm b-ghost" style="cursor:pointer">⬆ <input type="file" multiple onchange="fmUpload(this)"></label>
+          <button class="btn btn-sm b-dang" onclick="fmDelete()">🗑</button>
         </div>
-        <textarea class="fm-area" id="fm-area" placeholder="Düzenlemek için sol panelden bir dosya seçin..." oninput="document.getElementById('fm-save').disabled=false"></textarea>
+        <textarea class="fm-area" id="fm-area" placeholder="Düzenlemek için sol panelden dosya seçin..." oninput="document.getElementById('fm-save').disabled=false"></textarea>
       </div>
     </div>
   </div>
@@ -1556,7 +1408,7 @@ input[type=file] { display: none; }
   <div class="page" id="page-worlds">
     <div class="card" style="margin-bottom:14px">
       <div class="card-hd">🌍 Dünya Listesi</div>
-      <div id="worlds-list"><div style="color:var(--t2)">Yükleniyor...</div></div>
+      <div id="worlds-list"></div>
     </div>
     <div class="card">
       <div class="card-hd">⚡ Dünya Komutları</div>
@@ -1565,9 +1417,7 @@ input[type=file] { display: none; }
         <button class="btn b-ghost" onclick="cmd('time set night')">🌙 Gece</button>
         <button class="btn b-ghost" onclick="cmd('weather clear')">⛅ Açık</button>
         <button class="btn b-ghost" onclick="cmd('weather rain')">🌧️ Yağmur</button>
-        <button class="btn b-ghost" onclick="cmd('weather thunder')">⛈️ Fırtına</button>
         <button class="btn b-ghost" onclick="cmd('difficulty peaceful')">😊 Peaceful</button>
-        <button class="btn b-ghost" onclick="cmd('difficulty normal')">🟡 Normal</button>
         <button class="btn b-ghost" onclick="cmd('difficulty hard')">🔴 Hard</button>
         <button class="btn b-ghost" onclick="cmd('save-all')">💾 Kaydet</button>
         <button class="btn b-ghost" onclick="cmd('kill @e[type=!player]')">⚡ Mob Temizle</button>
@@ -1579,7 +1429,7 @@ input[type=file] { display: none; }
   <div class="page" id="page-backups">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <div class="card-hd" style="margin:0">💾 Yedek Dosyaları</div>
+        <div class="card-hd" style="margin:0">💾 Yedekler</div>
         <button class="btn b-prim" onclick="loadBackups()">↺ Yenile</button>
       </div>
       <table class="tbl"><thead><tr><th>Dosya</th><th>Boyut</th><th>Tarih</th><th>İşlem</th></tr></thead><tbody id="backup-body"></tbody></table>
@@ -1593,7 +1443,7 @@ input[type=file] { display: none; }
         <div class="card-hd" style="margin:0">⚙️ server.properties</div>
         <button class="btn b-prim btn-lg" onclick="saveSettings()">💾 Kaydet & Yeniden Başlat</button>
       </div>
-      <div class="set-grid" id="settings-grid"><div style="color:var(--t2);padding:10px">Yükleniyor...</div></div>
+      <div class="set-grid" id="settings-grid"></div>
     </div>
   </div>
 
@@ -1601,12 +1451,12 @@ input[type=file] { display: none; }
   <div class="page" id="page-perf">
     <div class="g2" style="margin-bottom:14px">
       <div class="card">
-        <div class="card-hd">💻 Sistem Kaynakları</div>
-        <div style="margin-bottom:12px">
+        <div class="card-hd">💻 Sistem</div>
+        <div style="margin-bottom:10px">
           <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px"><span>CPU</span><span id="p-cpu">—</span></div>
           <div class="prog"><div class="prog-f pf-cpu" id="pb-cpu" style="width:0%"></div></div>
         </div>
-        <div style="margin-bottom:12px">
+        <div style="margin-bottom:10px">
           <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px"><span>RAM</span><span id="p-ram">—</span></div>
           <div class="prog"><div class="prog-f pf-ram" id="pb-ram" style="width:0%"></div></div>
         </div>
@@ -1616,228 +1466,268 @@ input[type=file] { display: none; }
         </div>
       </div>
       <div class="card">
-        <div class="card-hd">⛏️ Minecraft Kaynakları</div>
+        <div class="card-hd">⛏️ MC + Pool</div>
         <table class="tbl">
           <tr><td style="color:var(--t2)">MC RAM</td><td id="p-mcram">—</td></tr>
-          <tr><td style="color:var(--t2)">MC CPU</td><td id="p-mccpu">—</td></tr>
           <tr><td style="color:var(--t2)">TPS (1m/5m/15m)</td><td id="p-tps1">—</td></tr>
-          <tr><td style="color:var(--t2)">Swap Kullanımı</td><td id="p-swap">—</td></tr>
-          <tr><td style="color:var(--t2)">Destek Düğümleri</td><td id="p-nodes">—</td></tr>
+          <tr><td style="color:var(--t2)">Swap</td><td id="p-swap">—</td></tr>
+          <tr><td style="color:var(--t2)">Pool Agentlar</td><td id="p-agents">—</td></tr>
+          <tr><td style="color:var(--t2)">Pool RAM Cache</td><td id="p-pcache">—</td></tr>
+          <tr><td style="color:var(--t2)">Pool Disk Deposu</td><td id="p-pdisk">—</td></tr>
         </table>
-        <button class="btn b-ghost" style="margin-top:10px;width:100%" onclick="cmd('tps')">📊 TPS Sorgula</button>
       </div>
     </div>
   </div>
 
-  <!-- DESTEK DÜĞÜMLERİ -->
-  <div class="page" id="page-support">
+  <!-- KAYNAK HAVUZU -->
+  <div class="page" id="page-pool">
+    <!-- Özet bar -->
+    <div class="g4" style="margin-bottom:14px" id="pool-top-stats">
+      <div class="sc"><div class="sc-val" id="ps-agents">0</div><div class="sc-lbl">🔗 Aktif Agent</div></div>
+      <div class="sc"><div class="sc-val" id="ps-cache">0MB</div><div class="sc-lbl">🧠 RAM Cache</div></div>
+      <div class="sc"><div class="sc-val" id="ps-disk">0GB</div><div class="sc-lbl">💾 Disk Deposu</div></div>
+      <div class="sc"><div class="sc-val" id="ps-cpu">0</div><div class="sc-lbl">⚡ CPU Core</div></div>
+    </div>
+
+    <!-- Aksiyonlar -->
     <div class="card" style="margin-bottom:14px">
-      <div class="card-hd">🔗 Bağlı Destek Düğümleri</div>
-      <p style="font-size:12px;color:var(--t2);margin-bottom:14px">
-        Diğer Render hesaplarında çalışan destek servisleri buraya otomatik bağlanır.
-      </p>
-      <div id="nodes-list"><div style="color:var(--t2);text-align:center;padding:20px">Henüz bağlı destek düğümü yok.</div></div>
+      <div class="card-hd">🛠️ Havuz İşlemleri</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px">
+        <button class="btn b-purp" onclick="poolAction('archive','Eski region arşivleniyor...')">📦 Region Arşivle (5+ gün)</button>
+        <button class="btn b-purp" onclick="poolAction('proxy','Proxy başlatılıyor...')">🔀 Proxy Başlat</button>
+        <button class="btn b-ghost" onclick="poolAction('flush','Cache temizleniyor...')">🗑️ Cache Temizle</button>
+        <button class="btn b-ghost" onclick="loadPoolStatus()">↺ Yenile</button>
+      </div>
+    </div>
+
+    <!-- Agent listesi -->
+    <div id="pool-agents-list">
+      <div style="text-align:center;padding:40px;color:var(--t2)">
+        <div style="font-size:36px;margin-bottom:12px">🔗</div>
+        <div style="font-size:14px;font-weight:600;margin-bottom:8px">Henüz agent bağlı değil</div>
+        <div style="font-size:12px">Başka bir Render hesabına <strong>agent.py</strong> + <strong>agent.Dockerfile</strong> yükleyin</div>
+      </div>
     </div>
   </div>
 
-  </div>
+  </div><!-- /pages -->
 </div>
 </div>
 
 <div class="notif-wrap" id="notif-wrap"></div>
 
 <script>
-const socket = io({ transports: ['websocket', 'polling'] });
-let curPage='dashboard', curFile=null, curDir='', mcAddr='', allNodes=[];
+const socket = io({transports:['websocket','polling']});
+let curPage='dashboard', curFile=null, curDir='', mcAddr='', poolData={total:0,healthy:0,resources:{},agents:[]};
 
-socket.on('connect',              ()   => notify('Panele bağlandı', 'ok'));
-socket.on('disconnect',           ()   => notify('Bağlantı kesildi', 'err'));
-socket.on('console_line',         data => addLine(data));
-socket.on('console_history',      lines=> { document.getElementById('con-out').innerHTML=''; lines.forEach(l=>addLine(l,false)); conBottom(); });
-socket.on('server_status',        data => updateStatus(data));
-socket.on('players_update',       list => updatePlayers(list));
-socket.on('stats_update',         data => updateStats(data));
-socket.on('tunnel_update',        data => setTunnel(data));
-socket.on('support_nodes_update', list => updateNodes(list));
-socket.on('download_progress',    d    => notify(`⬇ İndiriliyor: %${d.pct}`, 'info'));
+socket.on('connect',        ()   => notify('Panele bağlandı','ok'));
+socket.on('disconnect',     ()   => notify('Bağlantı kesildi','err'));
+socket.on('console_line',   d    => addLine(d));
+socket.on('console_history',ls   => {document.getElementById('con-out').innerHTML='';ls.forEach(l=>addLine(l,false));conBottom()});
+socket.on('server_status',  d    => updateStatus(d));
+socket.on('players_update', l    => updatePlayers(l));
+socket.on('stats_update',   d    => updateStats(d));
+socket.on('tunnel_update',  d    => setTunnel(d));
+socket.on('pool_update',    d    => updatePool(d));
+socket.on('download_progress', d => notify(`⬇ %${d.pct}`,'info'));
 
-document.querySelectorAll('.nav-item').forEach(el => {
-  el.addEventListener('click', () => { const p=el.dataset.page; if(p) navTo(p,el); });
-});
+document.querySelectorAll('.nav-item').forEach(el=>el.addEventListener('click',()=>{const p=el.dataset.page;if(p)navTo(p,el)}));
+const TITLES={dashboard:'📊 Dashboard',console:'💻 Konsol',players:'👥 Oyuncular',whitelist:'📋 Beyaz Liste',banlist:'🔨 Ban Listesi',plugins:'🔌 Pluginler',files:'📁 Dosyalar',worlds:'🌍 Dünyalar',backups:'💾 Yedekler',settings:'⚙️ Ayarlar',perf:'📈 Performans',pool:'🔗 Kaynak Havuzu'};
+const LOADERS={players:refreshPlayers,whitelist:loadWhitelist,banlist:loadBanlist,plugins:loadPlugins,files:()=>fmLoad(curDir),worlds:loadWorlds,backups:loadBackups,settings:loadSettings,perf:loadPerf,pool:loadPoolStatus};
 
-function navTo(page, el) {
+function navTo(page,el){
   document.querySelectorAll('.page').forEach(p=>{p.classList.remove('active');p.style.display='';});
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
-  const pg=document.getElementById('page-'+page); if(!pg) return;
-  pg.classList.add('active');
-  if(page==='console') pg.style.display='flex';
-  const nav=el||document.querySelector(`.nav-item[data-page="${page}"]`);
-  if(nav) nav.classList.add('active');
-  const titles={dashboard:'📊 Dashboard',console:'💻 Konsol',players:'👥 Oyuncular',
-    whitelist:'📋 Beyaz Liste',banlist:'🔨 Ban Listesi',plugins:'🔌 Pluginler',
-    files:'📁 Dosya Yöneticisi',worlds:'🌍 Dünyalar',backups:'💾 Yedekler',
-    settings:'⚙️ Ayarlar',perf:'📈 Performans',support:'🔗 Destek Düğümleri'};
-  document.getElementById('page-title').textContent=titles[page]||page;
-  curPage=page;
-  const loaders={players:refreshPlayers,whitelist:loadWhitelist,banlist:loadBanlist,
-    plugins:loadPlugins,files:()=>fmLoad(curDir),worlds:loadWorlds,backups:loadBackups,
-    settings:loadSettings,perf:loadPerf,support:()=>renderNodes(allNodes)};
-  if(loaders[page]) loaders[page]();
+  const pg=document.getElementById('page-'+page);if(!pg)return;
+  pg.classList.add('active');if(page==='console')pg.style.display='flex';
+  const nav=el||document.querySelector(`.nav-item[data-page="${page}"]`);if(nav)nav.classList.add('active');
+  document.getElementById('page-title').textContent=TITLES[page]||page;
+  curPage=page;if(LOADERS[page])LOADERS[page]();
 }
 
-function addLine(data,scroll=true) {
-  const el=document.getElementById('con-out');
-  const div=document.createElement('div');
-  const l=data.line||'';
+function addLine(data,scroll=true){
+  const el=document.getElementById('con-out');const div=document.createElement('div');const l=data.line||'';
   let cls='cl-def';
-  if(l.includes('[Panel]')) cls='cl-panel';
-  else if(/error|exception/i.test(l)) cls='cl-err';
-  else if(/warn/i.test(l)) cls='cl-warn';
-  else if(l.includes('INFO')) cls='cl-info';
-  div.className=cls; div.textContent=`[${data.ts}] ${l}`;
-  el.appendChild(div);
-  if(scroll) el.scrollTop=el.scrollHeight;
-  const dl=document.getElementById('d-log');
-  if(dl){const s=document.createElement('div');s.textContent=div.textContent;s.className=cls;
-    dl.appendChild(s);while(dl.children.length>25)dl.removeChild(dl.firstChild);dl.scrollTop=dl.scrollHeight;}
+  if(l.includes('[Pool]'))cls='cl-pool';
+  else if(l.includes('[Panel]'))cls='cl-panel';
+  else if(/error|exception/i.test(l))cls='cl-err';
+  else if(/warn/i.test(l))cls='cl-warn';
+  else if(l.includes('INFO'))cls='cl-info';
+  div.className=cls;div.textContent=`[${data.ts}] ${l}`;el.appendChild(div);
+  if(scroll)el.scrollTop=el.scrollHeight;
+  const dl=document.getElementById('d-log');if(dl){const s=document.createElement('div');s.textContent=div.textContent;s.className=cls;dl.appendChild(s);while(dl.children.length>30)dl.removeChild(dl.firstChild);dl.scrollTop=dl.scrollHeight;}
 }
-
 function conClear(){document.getElementById('con-out').innerHTML='';}
 function conBottom(){const e=document.getElementById('con-out');e.scrollTop=e.scrollHeight;}
 function conSend(){const inp=document.getElementById('con-inp');const c=inp.value.trim();if(!c)return;socket.emit('send_command',{cmd:c});inp.value='';}
 document.addEventListener('DOMContentLoaded',()=>{document.getElementById('con-inp').addEventListener('keydown',e=>{if(e.key==='Enter')conSend();});});
 
-function updateStatus(data) {
-  const map={stopped:['dot-red','Durduruldu','br'],starting:['dot-yellow','Başlıyor...','by'],
-    downloading:['dot-yellow','İndiriliyor..','by'],running:['dot-green','Çalışıyor','bg'],stopping:['dot-yellow','Duruyor...','by']};
-  const [dc,label,bc]=map[data.status]||map.stopped;
+function updateStatus(d){
+  const map={stopped:['dot-red','Durduruldu','br'],starting:['dot-yellow','Başlıyor...','by'],downloading:['dot-yellow','İndiriliyor','by'],running:['dot-green','Çalışıyor','bg'],stopping:['dot-yellow','Duruyor','by']};
+  const[dc,label,bc]=map[d.status]||map.stopped;
   document.getElementById('status-dot').className='dot '+dc;
   document.getElementById('status-text').textContent=label;
-  const badge=document.getElementById('d-status');
-  if(badge){badge.className='badge '+bc;badge.textContent=label;}
-  const verEl=document.getElementById('sb-ver');
-  if(verEl&&data.version&&data.version!=='—') verEl.textContent='Paper MC • '+data.version;
-  const dvEl=document.getElementById('d-ver');
-  if(dvEl) dvEl.textContent=data.version||'—';
+  const b=document.getElementById('d-status');if(b){b.className='badge '+bc;b.textContent=label;}
+  const v=document.getElementById('sb-ver');if(v&&d.version&&d.version!=='—')v.textContent='Paper MC • '+d.version;
+  const dv=document.getElementById('d-ver');if(dv)dv.textContent=d.version||'—';
 }
-
-function updateStats(data) {
-  if(data.ram_mb!==undefined){document.getElementById('d-ram').textContent=data.ram_mb;document.getElementById('tb-ram').textContent=data.ram_mb+' MB';}
-  if(data.tps!==undefined){document.getElementById('d-tps').textContent=data.tps;document.getElementById('tb-tps').textContent=data.tps;document.getElementById('d-tps3').textContent=`${data.tps} / ${data.tps5||'—'} / ${data.tps15||'—'}`;}
-  if(data.online_players!==undefined){document.getElementById('d-pl').textContent=data.online_players;document.getElementById('tb-pl').textContent=data.online_players;}
+function updateStats(d){
+  if(d.ram_mb!==undefined){document.getElementById('d-ram').textContent=d.ram_mb;document.getElementById('tb-ram').textContent=d.ram_mb+'MB';}
+  if(d.tps!==undefined){document.getElementById('d-tps').textContent=d.tps;document.getElementById('tb-tps').textContent=d.tps;document.getElementById('d-tps3').textContent=`${d.tps}/${d.tps5||'—'}/${d.tps15||'—'}`;}
+  if(d.online_players!==undefined){document.getElementById('d-pl').textContent=d.online_players;document.getElementById('tb-pl').textContent=d.online_players;}
 }
+function setTunnel(d){
+  if(!d.host&&!d.url)return;
+  mcAddr=d.host||d.url.replace('https://','');
+  document.getElementById('mc-addr-bar').classList.remove('hidden');
+  document.getElementById('mc-addr-text').textContent=mcAddr;
+  const da=document.getElementById('d-addr');if(da)da.textContent=mcAddr;
+  notify('📌 MC: '+mcAddr,'ok');
+}
+function copyAddr(){if(mcAddr){navigator.clipboard.writeText(mcAddr);notify('Kopyalandı!','ok');}}
 
-function updateNodes(list) {
-  allNodes = list || [];
-  const count = allNodes.length;
-  document.getElementById('d-nodes').textContent=count;
-  document.getElementById('tb-nodes').textContent=count;
-  document.getElementById('d-nodeinfo').textContent=count+' destek düğümü bağlı';
-  document.getElementById('node-count').textContent=count;
-  const bar=document.getElementById('support-bar');
-  const barTxt=document.getElementById('support-bar-text');
-  if(count>0){
+function updatePool(d){
+  poolData=d||{total:0,healthy:0,resources:{},agents:[]};
+  const h=poolData.healthy||0,res=poolData.resources||{};
+  const cacheMB=res.cache_used_mb||0,diskGB=res.disk_free_gb||0,cpu=res.cpu_cores||0;
+  // topbar
+  document.getElementById('tb-agents').textContent=h;
+  document.getElementById('tb-cache').textContent=cacheMB+'MB';
+  document.getElementById('pool-badge').textContent=h;
+  document.getElementById('d-agents').textContent=h;
+  document.getElementById('d-poolinfo').textContent=h>0?`${h} agent | Cache:${cacheMB}MB | Disk:${diskGB}GB`:'Agent bağlı değil';
+  // pool bar
+  const bar=document.getElementById('pool-bar'),bt=document.getElementById('pool-bar-text'),br=document.getElementById('pool-res-bar');
+  if(h>0){
     bar.classList.remove('hidden');
-    barTxt.textContent=allNodes.map(n=>`${n.host||n.node_id} (${n.nbd_gb||0}GB)`).join(' · ');
-  } else { bar.classList.add('hidden'); }
-  if(curPage==='support') renderNodes(allNodes);
+    bt.textContent=(poolData.agents||[]).map(a=>a.node_id.split('-')[0]).join(' · ');
+    br.textContent=`Cache:${cacheMB}MB  Disk:${diskGB}GB  CPU:${cpu}c`;
+  } else bar.classList.add('hidden');
+  // dashboard summary card
+  const sc=document.getElementById('pool-summary-card');
+  if(sc){sc.style.display=h>0?'block':'none';}
+  const ds={cache:`${cacheMB}MB`,disk:`${diskGB}GB`,cpu:`${cpu}`,proxy:`${(poolData.agents||[]).filter(a=>a.proxy&&a.proxy.active).length}`};
+  ['cache','disk','cpu','proxy'].forEach(k=>{const el=document.getElementById('ds-'+k);if(el)el.textContent=ds[k];});
+  // pool page
+  ['agents','cache','disk','cpu'].forEach(k=>{
+    const el=document.getElementById('ps-'+k);
+    if(el)el.textContent=k==='agents'?h:k==='cache'?cacheMB+'MB':k==='disk'?diskGB+'GB':cpu;
+  });
+  if(curPage==='pool')renderPoolAgents(poolData.agents||[]);
 }
 
-function renderNodes(list) {
-  const el=document.getElementById('nodes-list');
-  if(!el) return;
-  if(!list||!list.length){el.innerHTML='<div style="color:var(--t2);text-align:center;padding:20px">Henüz bağlı destek düğümü yok.<br><span style="font-size:11px">Başka bir Render hesabına aynı kodu yükleyin.</span></div>';return;}
-  el.innerHTML=list.map(n=>`
-    <div class="node-card">
-      <div class="node-header">
-        <div class="dot ${n.status==='connected'?'dot-green':'dot-yellow'}"></div>
-        <strong style="font-size:13px">${n.host||n.node_id}</strong>
-        <span class="badge bp" style="margin-left:auto">${n.nbd_gb||0} GB</span>
-        <span class="badge ${n.status==='connected'?'bg':'by'}">${n.status==='connected'?'Bağlı':'Bağlanıyor'}</span>
+function renderPoolAgents(agents){
+  const el=document.getElementById('pool-agents-list');if(!el)return;
+  if(!agents.length){el.innerHTML='<div style="text-align:center;padding:40px;color:var(--t2)"><div style="font-size:36px;margin-bottom:12px">🔗</div><div style="font-size:14px;font-weight:600">Henüz agent bağlı değil</div></div>';return;}
+  el.innerHTML=agents.map(a=>{
+    const ram=a.ram||{},disk=a.disk||{},cpu=a.cpu||{},proxy=a.proxy||{};
+    const cacheUsed=ram.cache_mb||0,ramFree=ram.free_mb||0,diskFree=disk.free_gb||0,diskStore=disk.store_gb||0,cores=cpu.cores||0,load=cpu.load1||0;
+    return `<div class="agent-card">
+      <div class="agent-hd">
+        <div class="dot ${a.healthy?'dot-green':'dot-red'}"></div>
+        <strong style="font-size:13px;font-family:var(--mono)">${a.node_id}</strong>
+        <span class="badge ${a.healthy?'bg':'br'}" style="margin-left:8px">${a.healthy?'Sağlıklı':'Erişilemiyor'}</span>
+        ${proxy.active?'<span class="badge bp" style="margin-left:4px">🔀 Proxy Aktif</span>':''}
+        <span style="margin-left:auto;font-size:10px;color:var(--t3)">${a.url||''}</span>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:11px;color:var(--t2)">
-        <div>💾 Disk: <span style="color:var(--t1)">${n.nbd_gb||0}GB</span></div>
-        <div>🧠 RAM: <span style="color:var(--t1)">${n.ram_mb||0}MB</span></div>
-        <div>🕐 <span style="color:var(--t1)">${n.connected_at?new Date(n.connected_at*1000).toLocaleTimeString('tr'):'—'}</span></div>
+      <div class="agent-res">
+        <div class="res-box">
+          <div class="res-val" style="color:var(--a1)">${cacheUsed}MB</div>
+          <div class="res-lbl">🧠 RAM Cache</div>
+          <div style="font-size:9px;color:var(--t3);margin-top:2px">${ramFree}MB boş</div>
+        </div>
+        <div class="res-box">
+          <div class="res-val" style="color:var(--a3)">${diskStore}GB</div>
+          <div class="res-lbl">💾 Disk Deposu</div>
+          <div style="font-size:9px;color:var(--t3);margin-top:2px">${diskFree}GB boş</div>
+        </div>
+        <div class="res-box">
+          <div class="res-val" style="color:var(--a2)">${cores}</div>
+          <div class="res-lbl">⚡ CPU Core</div>
+          <div style="font-size:9px;color:var(--t3);margin-top:2px">Load: ${load}</div>
+        </div>
+        <div class="res-box">
+          <div class="res-val" style="color:${proxy.active?'var(--green)':'var(--t3)'}">${proxy.active?'Açık':'Kapalı'}</div>
+          <div class="res-lbl">🔀 Proxy</div>
+          <div style="font-size:9px;color:var(--t3);margin-top:2px">${proxy.connections||0} bağlantı</div>
+        </div>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
-async function srvAction(action){const r=await api('/api/'+action,{});notify(r.msg||action+' yapıldı',r.ok?'ok':'err');}
-
-function setTunnel(data){
-  if(!data.host&&!data.url)return;
-  mcAddr=data.host||data.url.replace('https://','');
-  const bar=document.getElementById('mc-addr-bar');
-  const txt=document.getElementById('mc-addr-text');
-  const daddr=document.getElementById('d-addr');
-  if(bar) bar.classList.remove('hidden');
-  if(txt) txt.textContent=mcAddr;
-  if(daddr) daddr.textContent=mcAddr;
-  notify('📌 MC Adres: '+mcAddr,'ok');
+async function loadPoolStatus(){
+  const d=await fetch('/api/pool/status').then(r=>r.json()).catch(()=>({}));
+  updatePool(d);
 }
-function copyAddr(){if(mcAddr){navigator.clipboard.writeText(mcAddr);notify('Adres kopyalandı!','ok');}}
 
+async function poolAction(action,msg){
+  notify(msg,'info');
+  let url,body={};
+  if(action==='archive'){url='/api/pool/archive/regions';body={older_than_days:5};}
+  else if(action==='proxy'){url='/api/pool/proxy/start';body={host:'127.0.0.1',port:25565};}
+  else if(action==='flush'){url='/api/pool/cache/flush';body={};}
+  else return;
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).catch(()=>({ok:false}));
+  notify(r.ok?(action==='archive'?`✅ ${r.archived||0} region arşivlendi (${r.freed_mb||0}MB)`:`✅ ${action} tamam`):'❌ İşlem başarısız',r.ok?'ok':'err');
+  loadPoolStatus();
+}
+
+async function srvAction(a){const r=await api('/api/'+a,{});notify(r.msg||a,'ok');}
 function updatePlayers(list){
   document.getElementById('d-pl').textContent=list.length;
   document.getElementById('tb-pl').textContent=list.length;
-  const plEl=document.getElementById('d-pllist');
-  if(plEl) plEl.innerHTML=list.length?list.map(p=>`<div style="padding:3px 0">🟢 ${p.name}</div>`).join(''):'<span style="color:var(--t2)">Çevrimiçi oyuncu yok</span>';
-  const tbody=document.getElementById('pl-body');
-  if(!tbody)return;
-  if(!list.length){tbody.innerHTML='<tr><td colspan="3" style="color:var(--t2);text-align:center;padding:14px">Çevrimiçi oyuncu yok</td></tr>';return;}
-  tbody.innerHTML=list.map(p=>`<tr><td><strong>${p.name}</strong></td><td><span class="badge bg">Online</span></td>
-    <td style="display:flex;gap:4px;flex-wrap:wrap">
-      <button class="btn btn-sm b-dang" onclick="quickAct('kick','${p.name}')">Kick</button>
-      <button class="btn btn-sm b-dang" onclick="quickAct('ban','${p.name}')">Ban</button>
-      <button class="btn btn-sm b-succ" onclick="quickAct('op','${p.name}')">OP</button>
-      <button class="btn btn-sm b-ghost" onclick="setGM('creative','${p.name}')">Creative</button>
-      <button class="btn btn-sm b-ghost" onclick="quickAct('heal','${p.name}')">Heal</button>
-    </td></tr>`).join('');
+  const el=document.getElementById('d-pllist');
+  if(el)el.innerHTML=list.length?list.map(p=>`<div style="padding:3px 0">🟢 ${p.name}</div>`).join(''):'<span style="color:var(--t2)">Çevrimiçi yok</span>';
+  const tb=document.getElementById('pl-body');if(!tb)return;
+  tb.innerHTML=list.length?list.map(p=>`<tr><td><strong>${p.name}</strong></td><td><span class="badge bg">Online</span></td><td style="display:flex;gap:4px">
+    <button class="btn btn-sm b-dang" onclick="quickAct('kick','${p.name}')">Kick</button>
+    <button class="btn btn-sm b-dang" onclick="quickAct('ban','${p.name}')">Ban</button>
+    <button class="btn btn-sm b-succ" onclick="quickAct('op','${p.name}')">OP</button>
+    <button class="btn btn-sm b-ghost" onclick="setGM('creative','${p.name}')">Creative</button>
+  </td></tr>`).join(''):'<tr><td colspan="3" style="color:var(--t2);text-align:center;padding:14px">Çevrimiçi oyuncu yok</td></tr>';
 }
 async function refreshPlayers(){const d=await api('/api/players');updatePlayers(d.players||[]);}
-async function quickAct(action,player){await api('/api/players/'+action,{player});notify(`${player} → ${action}`,'ok');}
-function plAct(action){const p=document.getElementById('pl-name').value.trim();if(!p)return notify('Oyuncu adı girin','err');quickAct(action,p);}
-function setGM(mode,player){const p=player||document.getElementById('pl-name').value.trim();if(!p)return notify('Oyuncu adı girin','err');api('/api/players/gamemode',{player:p,mode});notify(`${p} → ${mode}`,'ok');}
-function sendMsg(){const p=document.getElementById('msg-pl').value.trim();const m=document.getElementById('msg-txt').value.trim();if(!p||!m)return notify('Oyuncu ve mesaj gerekli','err');api('/api/players/msg',{player:p,message:m});notify('Mesaj gönderildi','ok');}
-function giveItem(){const player=document.getElementById('pl-name').value.trim()||'@a';const item=document.getElementById('give-item').value.trim();const count=document.getElementById('give-count').value||1;if(!item)return notify('Item adı girin','err');api('/api/players/give',{player,item,count});notify(`Give: ${count}x ${item} → ${player}`,'ok');}
-function broadcast(){const msg=prompt('Duyuru mesajı:');if(msg){cmd('say '+msg);notify('Duyuru gönderildi','ok');}}
+async function quickAct(a,p){await api('/api/players/'+a,{player:p});notify(`${p} → ${a}`,'ok');}
+function plAct(a){const p=document.getElementById('pl-name').value.trim();if(!p)return notify('Oyuncu adı girin','err');quickAct(a,p);}
+function setGM(mode,player){const p=player||document.getElementById('pl-name').value.trim();if(!p)return notify('Oyuncu adı girin','err');api('/api/players/gamemode',{player:p,mode});notify(`${p}→${mode}`,'ok');}
+function sendMsg(){const p=document.getElementById('msg-pl').value.trim(),m=document.getElementById('msg-txt').value.trim();if(!p||!m)return notify('Oyuncu ve mesaj gerekli','err');api('/api/players/msg',{player:p,message:m});notify('Gönderildi','ok');}
+function giveItem(){const player=document.getElementById('pl-name').value.trim()||'@a',item=document.getElementById('give-item').value.trim(),count=document.getElementById('give-count').value||1;if(!item)return notify('Item girin','err');api('/api/players/give',{player,item,count});notify(`Give: ${count}x ${item}`,'ok');}
 
-async function loadWhitelist(){const d=await fetch('/api/whitelist').then(r=>r.json());const tb=document.getElementById('wl-body');tb.innerHTML=d.length?d.map(p=>`<tr><td>${p.name||p}</td><td style="font-family:var(--mono);font-size:10px;color:var(--t2)">${p.uuid||'—'}</td><td><button class="btn btn-sm b-dang" onclick="wlRemove('${p.name||p}')">Kaldır</button></td></tr>`).join(''):'<tr><td colspan="3" style="color:var(--t2);text-align:center;padding:12px">Beyaz liste boş</td></tr>';}
+async function loadWhitelist(){const d=await fetch('/api/whitelist').then(r=>r.json());const tb=document.getElementById('wl-body');tb.innerHTML=d.length?d.map(p=>`<tr><td>${p.name||p}</td><td style="font-family:var(--mono);font-size:10px;color:var(--t2)">${p.uuid||'—'}</td><td><button class="btn btn-sm b-dang" onclick="wlRm('${p.name||p}')">Kaldır</button></td></tr>`).join(''):'<tr><td colspan="3" style="color:var(--t2);text-align:center;padding:12px">Beyaz liste boş</td></tr>';}
 async function wlAdd(){const p=document.getElementById('wl-name').value.trim();if(!p)return;await api('/api/whitelist/add',{player:p});notify(p+' eklendi','ok');loadWhitelist();}
-async function wlRemove(p){await api('/api/whitelist/remove',{player:p});notify(p+' kaldırıldı','ok');loadWhitelist();}
-async function loadBanlist(){const d=await fetch('/api/banlist').then(r=>r.json());const tb=document.getElementById('ban-body');tb.innerHTML=d.length?d.map(p=>`<tr><td>${p.name}</td><td style="color:var(--t2);font-size:11px">${p.reason||'—'}</td><td style="font-size:10px;color:var(--t3)">${(p.created||'').slice(0,10)}</td><td><button class="btn btn-sm b-succ" onclick="pardon('${p.name}')">Affet</button></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Ban listesi boş</td></tr>';}
-async function banPlayer(){const p=document.getElementById('ban-name').value.trim();const r=document.getElementById('ban-reason').value.trim()||'Banned by admin';if(!p)return;await api('/api/players/ban',{player:p,reason:r});notify(p+' banlandı','ok');loadBanlist();}
+async function wlRm(p){await api('/api/whitelist/remove',{player:p});notify(p+' kaldırıldı','ok');loadWhitelist();}
+async function loadBanlist(){const d=await fetch('/api/banlist').then(r=>r.json());const tb=document.getElementById('ban-body');tb.innerHTML=d.length?d.map(p=>`<tr><td>${p.name}</td><td style="color:var(--t2);font-size:11px">${p.reason||'—'}</td><td style="font-size:10px;color:var(--t3)">${(p.created||'').slice(0,10)}</td><td><button class="btn btn-sm b-succ" onclick="pardon('${p.name}')">Affet</button></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Boş</td></tr>';}
+async function banPlayer(){const p=document.getElementById('ban-name').value.trim(),r=document.getElementById('ban-reason').value.trim()||'Banned';if(!p)return;await api('/api/players/ban',{player:p,reason:r});notify(p+' banlandı','ok');loadBanlist();}
 async function pardon(p){await api('/api/players/pardon',{player:p});notify(p+' affedildi','ok');loadBanlist();}
 
-async function loadPlugins(){const d=await fetch('/api/plugins').then(r=>r.json());const tb=document.getElementById('plug-body');tb.innerHTML=d.length?d.map(p=>`<tr><td><strong>${p.name}</strong></td><td style="font-size:10px;color:var(--t2)">${fmtSize(p.size)}</td><td><span class="badge ${p.enabled?'bg':'br'}">${p.enabled?'Aktif':'Devre Dışı'}</span></td><td style="display:flex;gap:4px"><button class="btn btn-sm b-warn" onclick="togglePlugin('${p.file}')">${p.enabled?'Kapat':'Aç'}</button><button class="btn btn-sm b-dang" onclick="deletePlugin('${p.file}')">🗑</button></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Plugin yok.</td></tr>';}
-async function uploadPlugin(input){const fd=new FormData();for(const f of input.files)fd.append(f.name,f);const r=await fetch('/api/plugins/upload',{method:'POST',body:fd});const d=await r.json();notify(d.msg||'Yüklendi','ok');loadPlugins();}
-function dropPlugin(e){e.preventDefault();const fd=new FormData();for(const f of e.dataTransfer.files)if(f.name.endsWith('.jar'))fd.append(f.name,f);fetch('/api/plugins/upload',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{notify(d.msg||'Yüklendi','ok');loadPlugins();});}
-async function deletePlugin(file){if(!confirm(file+' silinsin mi?'))return;await api('/api/plugins/delete',{file});notify('Plugin silindi','ok');loadPlugins();}
+async function loadPlugins(){const d=await fetch('/api/plugins').then(r=>r.json());const tb=document.getElementById('plug-body');tb.innerHTML=d.length?d.map(p=>`<tr><td><strong>${p.name}</strong></td><td style="font-size:10px;color:var(--t2)">${fmtSize(p.size)}</td><td><span class="badge ${p.enabled?'bg':'br'}">${p.enabled?'Aktif':'Kapalı'}</span></td><td style="display:flex;gap:4px"><button class="btn btn-sm b-warn" onclick="togglePlugin('${p.file}')">${p.enabled?'Kapat':'Aç'}</button><button class="btn btn-sm b-dang" onclick="deletePlugin('${p.file}')">🗑</button></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Plugin yok</td></tr>';}
+async function uploadPlugin(input){const fd=new FormData();for(const f of input.files)fd.append(f.name,f);const r=await fetch('/api/plugins/upload',{method:'POST',body:fd}).then(r=>r.json());notify(r.msg||'Yüklendi','ok');loadPlugins();}
+async function deletePlugin(file){if(!confirm(file+'?'))return;await api('/api/plugins/delete',{file});notify('Silindi','ok');loadPlugins();}
 async function togglePlugin(file){await api('/api/plugins/toggle',{file});loadPlugins();}
-async function searchPlugins(){const q=document.getElementById('plug-q').value.trim();if(!q)return;const res=document.getElementById('plug-results');res.innerHTML='<div style="color:var(--t2);padding:10px">Aranıyor...</div>';const d=await fetch('/api/plugins/search?q='+encodeURIComponent(q)).then(r=>r.json());if(d.error){res.innerHTML='<div style="color:var(--red);padding:10px">Hata: '+d.error+'</div>';return;}if(!d.length){res.innerHTML='<div style="color:var(--t2);padding:10px">Sonuç bulunamadı</div>';return;}res.innerHTML=d.map(p=>`<div style="display:flex;justify-content:space-between;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05)"><div><div style="font-size:13px;font-weight:600">${p.name}</div><div style="font-size:11px;color:var(--t2);margin-top:2px;max-width:320px">${p.description}</div><div style="font-size:10px;color:var(--t3);margin-top:2px">👤 ${p.owner} · ⬇ ${(p.downloads||0).toLocaleString()}</div></div><a class="btn btn-sm b-prim" href="${p.url}" target="_blank">🔗 Aç</a></div>`).join('');}
+async function searchPlugins(){const q=document.getElementById('plug-q').value.trim();if(!q)return;const res=document.getElementById('plug-results');res.innerHTML='<div style="color:var(--t2);padding:10px">Aranıyor...</div>';const d=await fetch('/api/plugins/search?q='+encodeURIComponent(q)).then(r=>r.json());if(d.error){res.innerHTML='<div style="color:var(--red);padding:10px">'+d.error+'</div>';return;}if(!d.length){res.innerHTML='<div style="color:var(--t2);padding:10px">Bulunamadı</div>';return;}res.innerHTML=d.map(p=>`<div style="display:flex;justify-content:space-between;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05)"><div><div style="font-size:13px;font-weight:600">${p.name}</div><div style="font-size:11px;color:var(--t2);margin-top:2px">${p.description}</div><div style="font-size:10px;color:var(--t3);margin-top:2px">👤 ${p.owner} · ⬇ ${(p.downloads||0).toLocaleString()}</div></div><a class="btn btn-sm b-prim" href="${p.url}" target="_blank">🔗 Aç</a></div>`).join('');}
 
-async function fmLoad(path=''){curDir=path;document.getElementById('fm-bread').textContent='/'+path;const items=await fetch('/api/files?path='+encodeURIComponent(path)).then(r=>r.json());const el=document.getElementById('fm-list');el.innerHTML=items.map(f=>`<div class="fm-item" onclick="fmClick('${f.path}','${f.type}','${f.name.replace(/'/g,"\\'")}')"><span class="fm-ico">${f.type==='dir'?'📁':fmIco(f.ext)}</span><span class="fm-name">${f.name}</span><span class="fm-size">${f.type==='dir'?'':fmtSize(f.size)}</span></div>`).join('')||'<div style="padding:12px;color:var(--t2);font-size:12px">Klasör boş</div>';}
-function fmIco(ext){const m={'.properties':'⚙️','.json':'📋','.yml':'📋','.yaml':'📋','.jar':'☕','.txt':'📄','.log':'📜','.sh':'🖥️','.zip':'📦','.png':'🖼️','.dat':'🗃️','.conf':'⚙️','.toml':'⚙️'};return m[ext]||'📄';}
+async function fmLoad(path=''){curDir=path;document.getElementById('fm-bread').textContent='/'+path;const items=await fetch('/api/files?path='+encodeURIComponent(path)).then(r=>r.json());const el=document.getElementById('fm-list');el.innerHTML=items.map(f=>`<div class="fm-item" onclick="fmClick('${f.path}','${f.type}','${f.name.replace(/'/g,"\\'")}')"><span class="fm-ico">${f.type==='dir'?'📁':fmIco(f.ext)}</span><span class="fm-name">${f.name}</span><span class="fm-size">${f.type==='dir'?'':fmtSize(f.size)}</span></div>`).join('')||'<div style="padding:12px;color:var(--t2);font-size:12px">Boş</div>';}
+function fmIco(ext){const m={'.properties':'⚙️','.json':'📋','.yml':'📋','.yaml':'📋','.jar':'☕','.txt':'📄','.log':'📜','.sh':'🖥️','.zip':'📦','.png':'🖼️','.dat':'🗃️'};return m[ext]||'📄';}
 function fmUp(){const parts=curDir.split('/').filter(Boolean);parts.pop();fmLoad(parts.join('/'));}
 function fmRefresh(){fmLoad(curDir);}
-async function fmClick(path,type,name){document.querySelectorAll('.fm-item').forEach(i=>i.classList.remove('sel'));event.currentTarget.classList.add('sel');curFile=path;if(type==='dir'){fmLoad(path);return;}document.getElementById('fm-fname').textContent=name;const textExts=['.properties','.json','.yml','.yaml','.txt','.log','.sh','.conf','.toml','.cfg','.xml','.md','.java','.py','.js'];const ext='.'+name.split('.').pop().toLowerCase();if(textExts.includes(ext)){const d=await fetch('/api/files/read?path='+encodeURIComponent(path)).then(r=>r.json());document.getElementById('fm-area').value=d.content||'';document.getElementById('fm-save').disabled=false;}else{document.getElementById('fm-area').value='(Bu dosya türü metin editöründe açılamaz)';document.getElementById('fm-save').disabled=true;}}
-async function fmSave(){if(!curFile)return;const content=document.getElementById('fm-area').value;await api('/api/files/write',{path:curFile,content});notify('Kaydedildi','ok');document.getElementById('fm-save').disabled=true;}
+async function fmClick(path,type,name){document.querySelectorAll('.fm-item').forEach(i=>i.classList.remove('sel'));event.currentTarget.classList.add('sel');curFile=path;if(type==='dir'){fmLoad(path);return;}document.getElementById('fm-fname').textContent=name;const textExts=['.properties','.json','.yml','.yaml','.txt','.log','.sh','.conf','.toml','.cfg','.xml','.md'];const ext='.'+name.split('.').pop().toLowerCase();if(textExts.includes(ext)){const d=await fetch('/api/files/read?path='+encodeURIComponent(path)).then(r=>r.json());document.getElementById('fm-area').value=d.content||'';document.getElementById('fm-save').disabled=false;}else{document.getElementById('fm-area').value='(Binary dosya)';document.getElementById('fm-save').disabled=true;}}
+async function fmSave(){if(!curFile)return;const c=document.getElementById('fm-area').value;await api('/api/files/write',{path:curFile,content:c});notify('Kaydedildi','ok');document.getElementById('fm-save').disabled=true;}
 function fmDownload(){if(curFile)window.open('/api/files/download?path='+encodeURIComponent(curFile));}
-async function fmDelete(){if(!curFile||!confirm(curFile+' silinsin mi?'))return;await api('/api/files/delete',{path:curFile});notify('Silindi','ok');fmLoad(curDir);curFile=null;document.getElementById('fm-area').value='';document.getElementById('fm-fname').textContent='Dosya seçin...';}
+async function fmDelete(){if(!curFile||!confirm(curFile+'?'))return;await api('/api/files/delete',{path:curFile});notify('Silindi','ok');fmLoad(curDir);curFile=null;document.getElementById('fm-area').value='';}
 async function fmUpload(input){const fd=new FormData();fd.append('path',curDir);for(const f of input.files)fd.append(f.name,f);await fetch('/api/files/upload',{method:'POST',body:fd});notify('Yüklendi','ok');fmLoad(curDir);}
-function fmNewModal(){const name=prompt('Dosya veya klasör adı:');if(!name)return;if(name.includes('.'))api('/api/files/write',{path:curDir+'/'+name,content:''}).then(()=>fmLoad(curDir));else api('/api/files/mkdir',{path:curDir+'/'+name}).then(()=>fmLoad(curDir));}
+function fmNewModal(){const name=prompt('Dosya/klasör adı:');if(!name)return;if(name.includes('.'))api('/api/files/write',{path:curDir+'/'+name,content:''}).then(()=>fmLoad(curDir));else api('/api/files/mkdir',{path:curDir+'/'+name}).then(()=>fmLoad(curDir));}
 
-async function loadWorlds(){const d=await fetch('/api/worlds').then(r=>r.json());const el=document.getElementById('worlds-list');el.innerHTML=d.length?d.map(w=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid rgba(255,255,255,.05)"><div><div style="font-weight:600">🌍 ${w.name}</div><div style="font-size:11px;color:var(--t2);margin-top:2px">Boyut: ${fmtSize(w.size)}</div></div><div style="display:flex;gap:8px"><button class="btn btn-sm b-prim" onclick="backupWorld('${w.name}')">💾 Yedekle</button><button class="btn btn-sm b-dang" onclick="deleteWorld('${w.name}')">🗑 Sil</button></div></div>`).join(''):'<div style="color:var(--t2)">Dünya bulunamadı</div>';}
-async function backupWorld(name){notify('Yedekleniyor...','info');const d=await api('/api/worlds/backup',{world:name});notify(d.ok?`Yedeklendi: ${d.file}`:'Hata',d.ok?'ok':'err');loadBackups();}
-async function deleteWorld(name){if(!confirm(name+' silinsin mi?'))return;const d=await api('/api/worlds/delete',{world:name});notify(d.ok?'Silindi':d.error,d.ok?'ok':'err');loadWorlds();}
-async function loadBackups(){const d=await fetch('/api/backups').then(r=>r.json());const tb=document.getElementById('backup-body');tb.innerHTML=d.length?d.map(b=>`<tr><td>${b.name}</td><td style="font-size:11px;color:var(--t2)">${fmtSize(b.size)}</td><td style="font-size:11px;color:var(--t3)">${new Date(b.created*1000).toLocaleString('tr')}</td><td><a class="btn btn-sm b-prim" href="/api/files/download?path=${encodeURIComponent(b.path)}">⬇ İndir</a></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Yedek yok</td></tr>';}
+async function loadWorlds(){const d=await fetch('/api/worlds').then(r=>r.json());const el=document.getElementById('worlds-list');el.innerHTML=d.length?d.map(w=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid rgba(255,255,255,.05)"><div><div style="font-weight:600">🌍 ${w.name}</div><div style="font-size:11px;color:var(--t2);margin-top:2px">${fmtSize(w.size)}</div></div><div style="display:flex;gap:8px"><button class="btn btn-sm b-prim" onclick="bkWorld('${w.name}')">💾 Yedek</button><button class="btn btn-sm b-dang" onclick="delWorld('${w.name}')">🗑</button></div></div>`).join(''):'<div style="color:var(--t2)">Bulunamadı</div>';}
+async function bkWorld(name){notify('Yedekleniyor...','info');const d=await api('/api/worlds/backup',{world:name});notify(d.ok?'Yedeklendi':'Hata',d.ok?'ok':'err');loadBackups();}
+async function delWorld(name){if(!confirm(name+'?'))return;const d=await api('/api/worlds/delete',{world:name});notify(d.ok?'Silindi':d.error,d.ok?'ok':'err');loadWorlds();}
+async function loadBackups(){const d=await fetch('/api/backups').then(r=>r.json());const tb=document.getElementById('backup-body');tb.innerHTML=d.length?d.map(b=>`<tr><td>${b.name}</td><td style="font-size:11px;color:var(--t2)">${fmtSize(b.size)}</td><td style="font-size:11px;color:var(--t3)">${new Date(b.created*1000).toLocaleString('tr')}</td><td><a class="btn btn-sm b-prim" href="/api/files/download?path=${encodeURIComponent(b.path)}">⬇</a></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Yedek yok</td></tr>';}
 
-const SET_LABELS={'server-port':'Sunucu Portu','max-players':'Max Oyuncu','online-mode':'Online Mode','gamemode':'Oyun Modu','difficulty':'Zorluk','motd':'Sunucu Adı (MOTD)','view-distance':'Görüş Mesafesi','simulation-distance':'Simülasyon Mesafesi','spawn-protection':'Spawn Koruması','allow-flight':'Uçuşa İzin','white-list':'Beyaz Liste','enable-command-block':'Komut Bloğu','pvp':'PvP','allow-nether':'Nether Boyutu','level-name':'Dünya Adı','max-tick-time':'Max Tick Süresi (ms)'};
+const SET_LABELS={'server-port':'Port','max-players':'Max Oyuncu','online-mode':'Online Mode','gamemode':'Oyun Modu','difficulty':'Zorluk','motd':'MOTD','view-distance':'Görüş','simulation-distance':'Simülasyon','spawn-protection':'Spawn Koruma','allow-flight':'Uçuş','white-list':'Beyaz Liste','enable-command-block':'Komut Bloğu','pvp':'PvP','allow-nether':'Nether','level-name':'Dünya Adı'};
 async function loadSettings(){const d=await fetch('/api/settings').then(r=>r.json());const el=document.getElementById('settings-grid');el.innerHTML=Object.entries(d).map(([k,v])=>`<div class="set-item"><div class="set-lbl">${SET_LABELS[k]||k}</div>${v==='true'||v==='false'?`<select class="set-inp" id="s-${k}"><option value="true" ${v==='true'?'selected':''}>true</option><option value="false" ${v==='false'?'selected':''}>false</option></select>`:`<input class="set-inp" id="s-${k}" value="${v.replace(/</g,'&lt;')}">`}</div>`).join('');}
-async function saveSettings(){const d=await fetch('/api/settings').then(r=>r.json());const updated={};for(const k of Object.keys(d)){const el=document.getElementById('s-'+k);if(el)updated[k]=el.value;}const r=await api('/api/settings',updated);notify(r.msg||'Kaydedildi','ok');setTimeout(()=>srvAction('restart'),1500);}
+async function saveSettings(){const d=await fetch('/api/settings').then(r=>r.json());const u={};for(const k of Object.keys(d)){const el=document.getElementById('s-'+k);if(el)u[k]=el.value;}const r=await api('/api/settings',u);notify(r.msg||'Kaydedildi','ok');setTimeout(()=>srvAction('restart'),1500);}
 
-async function loadPerf(){const d=await fetch('/api/performance').then(r=>r.json());if(d.cpu!==undefined){document.getElementById('p-cpu').textContent=d.cpu+'%';document.getElementById('pb-cpu').style.width=d.cpu+'%';}if(d.ram_pct!==undefined){document.getElementById('p-ram').textContent=`${d.ram_used_mb}MB / ${d.ram_total_mb}MB`;document.getElementById('pb-ram').style.width=d.ram_pct+'%';}if(d.disk_pct!==undefined){document.getElementById('p-disk').textContent=`${d.disk_used_gb}GB / ${d.disk_total_gb}GB`;document.getElementById('pb-disk').style.width=d.disk_pct+'%';}if(d.mc&&d.mc.ram){document.getElementById('p-mcram').textContent=d.mc.ram+' MB';document.getElementById('p-mccpu').textContent=d.mc.cpu+'%';}document.getElementById('p-tps1').textContent=`${d.tps||'—'} / ${d.tps5||'—'} / ${d.tps15||'—'}`;document.getElementById('p-swap').textContent=`${d.swap_total_mb||0}MB toplam, ${d.swap_free_mb||0}MB boş`;document.getElementById('p-nodes').textContent=`${d.support_nodes||0} düğüm bağlı`;}
+async function loadPerf(){const d=await fetch('/api/performance').then(r=>r.json());if(d.cpu!==undefined){document.getElementById('p-cpu').textContent=d.cpu+'%';document.getElementById('pb-cpu').style.width=d.cpu+'%';}if(d.ram_pct!==undefined){document.getElementById('p-ram').textContent=`${d.ram_used_mb}/${d.ram_total_mb}MB`;document.getElementById('pb-ram').style.width=d.ram_pct+'%';}if(d.disk_pct!==undefined){document.getElementById('p-disk').textContent=`${d.disk_used_gb}/${d.disk_total_gb}GB`;document.getElementById('pb-disk').style.width=d.disk_pct+'%';}if(d.mc&&d.mc.ram)document.getElementById('p-mcram').textContent=d.mc.ram+' MB';document.getElementById('p-tps1').textContent=`${d.tps||'—'} / ${d.tps5||'—'} / ${d.tps15||'—'}`;document.getElementById('p-swap').textContent=`${d.swap_total_mb||0}MB / ${d.swap_free_mb||0}MB boş`;document.getElementById('p-agents').textContent=`${d.pool_agents||0} agent`;document.getElementById('p-pcache').textContent=`${d.pool_cache_mb||0}MB`;document.getElementById('p-pdisk').textContent=`${d.pool_disk_gb||0}GB`;}
 setInterval(()=>{if(curPage==='perf')loadPerf();},5000);
 
 function cmd(c){socket.emit('send_command',{cmd:c});notify('→ '+c,'info');}
@@ -1845,22 +1735,29 @@ async function api(url,body={}){const r=await fetch(url,{method:'POST',headers:{
 function fmtSize(b){if(b>1e9)return(b/1e9).toFixed(2)+'GB';if(b>1e6)return(b/1e6).toFixed(1)+'MB';if(b>1e3)return(b/1e3).toFixed(0)+'KB';return b+'B';}
 function notify(msg,type='ok'){const wrap=document.getElementById('notif-wrap');const div=document.createElement('div');div.className='notif n-'+type;div.textContent=msg;wrap.appendChild(div);setTimeout(()=>div.remove(),3500);}
 
-async function init(){const d=await fetch('/api/status').then(r=>r.json()).catch(()=>({}));updateStatus(d);updateStats(d);if(d.players)updatePlayers(d.players);if(d.tunnel&&d.tunnel.host)setTunnel(d.tunnel);if(d.support_nodes)updateNodes(d.support_nodes);}
+async function init(){
+  const d=await fetch('/api/status').then(r=>r.json()).catch(()=>({}));
+  updateStatus(d);updateStats(d);
+  if(d.players)updatePlayers(d.players);
+  if(d.tunnel&&d.tunnel.host)setTunnel(d.tunnel);
+  if(d.pool)updatePool(d.pool);
+}
 init();
 </script>
-</body>
-</html>"""
+</body></html>"""
 
 
 # ══════════════════════════════════════════════════════════════
 #  BAŞLATMA
 # ══════════════════════════════════════════════════════════════
 
-threading.Thread(target=_ram_monitor,   daemon=True).start()
-threading.Thread(target=_ram_watchdog,  daemon=True).start()
+threading.Thread(target=_ram_monitor,        daemon=True).start()
+threading.Thread(target=_ram_watchdog,       daemon=True).start()
+threading.Thread(target=_pool_health_watchdog, daemon=True).start()
+threading.Thread(target=_pool_auto_optimize, daemon=True).start()
 
 if __name__ == "__main__":
     MC_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"[MC Panel] :{PANEL_PORT} başlatılıyor...")
+    print(f"[MC Panel v10.0] :{PANEL_PORT} başlatılıyor...")
     socketio.run(app, host="0.0.0.0", port=PANEL_PORT,
                  debug=False, use_reloader=False, log_output=False)
