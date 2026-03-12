@@ -1,27 +1,26 @@
 """
-⛏️  Minecraft Server Boot — RENDER BYPASS v9.3
+⛏️  Minecraft Server Boot — RENDER BYPASS v9.4
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v9.3 Değişiklikler:
-  - wstunnel: TCP over WebSocket/HTTPS (trycloudflare uyumlu)
-  - cloudflared access tcp KALDIRILDI (trycloudflare sadece HTTP/HTTPS)
-  - Min 3 destek düğümü NBD hazır olmadan MC başlamaz (BARIYER)
-  - Her düğüm: ayrı wstunnel port + /dev/nbdX + swapon
-  - Paralel bağlantı thread'leri (çoklu düğüm)
-  Akış:
-    Destek: nbd-server → wstunnel server(8080) → cloudflared HTTP tüneli
-    Ana:    cloudflare URL → wstunnel client → nbd-client(10810+) → swapon
+v9.4 Değişiklikler:
+  - wstunnel KALDIRILDI (binary kurulum güvenilmez)
+  - Python websockets köprüsü eklendi (pip, saf Python)
+  - Destek: nbd-server → ws_bridge_server(8080) → cloudflared HTTP
+  - Ana:    wss://host → ws_bridge_client → nbd-client(10810+) → swapon
+  - Min 3 NBD düğümü hazır olmadan MC başlamaz
+  - Daha fazla debug logu — sessiz hata yok
 """
 
 import os, sys, subprocess, time, socket, resource, threading, re, glob, json
+import asyncio, ssl as _ssl
 import psutil
 import urllib.request as _ur
 
 RENDER_RAM_LIMIT_MB  = 512
 RENDER_DISK_LIMIT_GB = 18.0
-MIN_SUPPORT_NODES    = 3       # MC başlamadan beklenen min NBD bağlantı sayısı
-WSTUNNEL_PORT        = 8080    # Destek: wstunnel server dinleme portu
+MIN_SUPPORT_NODES    = 3
+WS_BRIDGE_PORT       = 8080    # Destek: ws_bridge_server dinleme portu
 NBD_SERVER_PORT      = 10809   # Destek: nbd-server portu
-NBD_CLIENT_BASE      = 10810   # Ana: local wstunnel portları (10810, 10811, 10812...)
+NBD_CLIENT_BASE      = 10810   # Ana: local köprü portları (10810, 10811, ...)
 
 MAIN_SERVER_URL = "https://wc-tsgd.onrender.com"
 MY_URL  = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -84,12 +83,12 @@ base_env = {
 }
 
 print("\n" + "━"*56)
-print("  ⛏️   Minecraft Server — RENDER BYPASS v9.3")
+print("  ⛏️   Minecraft Server — RENDER BYPASS v9.4")
 print(f"      MOD       : {'🟢 ANA' if IS_MAIN else '🔵 DESTEK'}")
 print(f"      MY_URL    : {MY_URL or '(boş → ANA)'}")
 print(f"      RAM       : {CONTAINER_RAM_MB}MB")
 if IS_MAIN:
-    print(f"      MIN DESTEK: {MIN_SUPPORT_NODES} düğüm (wstunnel NBD)")
+    print(f"      MIN DESTEK: {MIN_SUPPORT_NODES} düğüm (Python WS köprü)")
 print("━"*56 + "\n")
 
 
@@ -256,13 +255,113 @@ def _panel_log(msg):
         pass
 
 
+def _ensure_ws_deps():
+    """websockets pip paketi kurulu mu kontrol et, yoksa kur."""
+    try:
+        import websockets  # noqa
+        return True
+    except ImportError:
+        pass
+    print("  [ws] websockets paketi kuruluyor...")
+    r = sh("pip install websockets --break-system-packages -q 2>&1")
+    if r.returncode == 0:
+        print("  [ws] ✅ websockets kuruldu")
+        return True
+    # fallback: pip3
+    r2 = sh("pip3 install websockets --break-system-packages -q 2>&1")
+    if r2.returncode == 0:
+        print("  [ws] ✅ websockets (pip3) kuruldu")
+        return True
+    print(f"  [ws] ❌ websockets kurulamadı: {r.stdout.decode()[:150]}")
+    return False
+
+
+def _start_ws_tcp_bridge_client(local_port: int, remote_wss: str, stop_ev: threading.Event):
+    """
+    Python asyncio köprüsü:
+      TCP :local_port  ←→  WSS remote_wss
+    nbd-client local_port'a bağlanır, veriler WSS üzerinden geçer.
+    stop_ev set edilince durur.
+    """
+    import importlib
+    try:
+        ws_mod = importlib.import_module("websockets")
+    except ImportError:
+        print(f"  [ws] ❌ websockets import başarısız")
+        stop_ev.set()
+        return
+
+    async def pipe(reader, writer):
+        while True:
+            d = await reader.read(65536)
+            if not d:
+                break
+            writer.write(d)
+            await writer.drain()
+
+    async def handle_client(tcp_r, tcp_w):
+        try:
+            ssl_ctx = _ssl.create_default_context()
+            async with ws_mod.connect(remote_wss, ssl=ssl_ctx,
+                                      ping_interval=20, ping_timeout=30,
+                                      max_size=2**24) as ws:
+                # WebSocket <-> TCP yönlendirme
+                async def tcp_to_ws():
+                    try:
+                        while True:
+                            data = await tcp_r.read(65536)
+                            if not data:
+                                break
+                            await ws.send(data)
+                    except Exception:
+                        pass
+                    finally:
+                        await ws.close()
+
+                async def ws_to_tcp():
+                    try:
+                        async for msg in ws:
+                            if isinstance(msg, str):
+                                msg = msg.encode()
+                            tcp_w.write(msg)
+                            await tcp_w.drain()
+                    except Exception:
+                        pass
+                    finally:
+                        tcp_w.close()
+
+                await asyncio.gather(tcp_to_ws(), ws_to_tcp(),
+                                     return_exceptions=True)
+        except Exception as e:
+            print(f"  [ws] ❌ WebSocket bağlantı hatası: {e}")
+
+    async def run_server():
+        server = await asyncio.start_server(
+            handle_client, "127.0.0.1", local_port
+        )
+        print(f"  [ws] ✅ TCP→WSS köprüsü :127.0.0.1:{local_port} → {remote_wss}")
+        async with server:
+            while not stop_ev.is_set():
+                await asyncio.sleep(0.5)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(run_server())
+    except Exception as e:
+        print(f"  [ws] köprü hata: {e}")
+    finally:
+        loop.close()
+        stop_ev.set()
+
+
 def connect_worker_nbd(host: str, node_id: str = "") -> bool:
     """
-    wstunnel client bağlantısı:
-      wss://host  (cloudflared HTTPS tüneli)
-      → wstunnel server (WSTUNNEL_PORT = 8080)
+    Python WebSocket köprüsü:
+      wss://host (cloudflared HTTPS tüneli)
+      → ws_bridge_server (WS_BRIDGE_PORT = 8080)
       → nbd-server (NBD_SERVER_PORT = 10809)
-    Sonra nbd-client yerel porta bağlanır ve disk swap olarak eklenir.
+    Sonra nbd-client yerel porta bağlanır, disk swap olarak eklenir.
     """
     if not node_id:
         node_id = host
@@ -273,27 +372,34 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
         if not port:
             print("  [nbd] ⚠️  Boş slot yok (max 16)")
             return False
-        _nbd_nodes[node_id] = {"port": port, "dev": dev, "connected": False, "proc": None}
+        _nbd_nodes[node_id] = {"port": port, "dev": dev, "connected": False, "stop": None}
 
     cnt_before = nbd_connected_count()
     print(f"\n  [nbd] 🔌 Bağlanılıyor: {node_id}")
-    print(f"        wstunnel : wss://{host} → 127.0.0.1:{port}")
-    print(f"        nbd dev  : {dev}")
+    print(f"        wss     : wss://{host}")
+    print(f"        local   : 127.0.0.1:{port} → {dev}")
+
+    if not _ensure_ws_deps():
+        with _nbd_lock:
+            _nbd_nodes.pop(node_id, None)
+        return False
 
     sh("modprobe nbd max_part=0 2>/dev/null")
 
-    # wstunnel client: yerel TCP → WSS → uzak wstunnel server → nbd-server
-    wst_proc = subprocess.Popen(
-        ["wstunnel", "client",
-         "-L", f"tcp://127.0.0.1:{port}:127.0.0.1:{NBD_SERVER_PORT}",
-         f"wss://{host}"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    # Python WS→TCP köprüsünü ayrı thread'de başlat
+    stop_ev  = threading.Event()
+    wss_url  = f"wss://{host}"
+    bridge_t = threading.Thread(
+        target=_start_ws_tcp_bridge_client,
+        args=(port, wss_url, stop_ev),
+        daemon=True
     )
-    time.sleep(4)
+    bridge_t.start()
 
-    if wst_proc.poll() is not None:
-        out = wst_proc.stdout.read().decode()[:200]
-        print(f"  [nbd] ❌ wstunnel çöktü: {out}")
+    # Köprü hazır olana kadar bekle
+    if not wait_port(port, timeout=15):
+        print(f"  [nbd] ❌ WS köprüsü {port} portu açılmadı (15sn)")
+        stop_ev.set()
         with _nbd_lock:
             _nbd_nodes.pop(node_id, None)
         return False
@@ -301,8 +407,8 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
     # nbd-client bağlan
     r = sh(f"nbd-client 127.0.0.1 {port} {dev} -N disk -b 4096 -t 60 2>&1")
     if r.returncode != 0:
-        print(f"  [nbd] ❌ nbd-client hatası: {r.stdout.decode()[:150]}")
-        wst_proc.terminate()
+        print(f"  [nbd] ❌ nbd-client hatası: {r.stdout.decode()[:200]}")
+        stop_ev.set()
         with _nbd_lock:
             _nbd_nodes.pop(node_id, None)
         return False
@@ -314,14 +420,14 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
     if r2.returncode != 0:
         print(f"  [nbd] ❌ swapon hatası: {r2.stderr.decode()[:100]}")
         sh(f"nbd-client -d {dev} 2>/dev/null")
-        wst_proc.terminate()
+        stop_ev.set()
         with _nbd_lock:
             _nbd_nodes.pop(node_id, None)
         return False
 
     with _nbd_lock:
         _nbd_nodes[node_id]["connected"] = True
-        _nbd_nodes[node_id]["proc"]      = wst_proc
+        _nbd_nodes[node_id]["stop"]      = stop_ev
 
     cnt = nbd_connected_count()
     swp = psutil.swap_memory()
@@ -366,10 +472,7 @@ def _connect_node_loop(host: str, node_id: str):
 
 
 def _ensure_main_tools():
-    """
-    Ana sunucuda wstunnel ve nbd-client kurulu olduğundan emin ol.
-    (Destek sunucusu kendi araçlarını ayrıca kurar.)
-    """
+    """Ana sunucuda nbd-client ve websockets kurulu olduğundan emin ol."""
     import shutil as _s
     missing = [t for t in ["nbd-client"] if not _s.which(t)]
     if missing:
@@ -377,22 +480,7 @@ def _ensure_main_tools():
         sh("apt-get update -qq 2>/dev/null && "
            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
            f"--no-install-recommends {' '.join(missing)} 2>/dev/null")
-
-    if not _s.which("wstunnel"):
-        print("  [ana] wstunnel kuruluyor (ana sunucu)...")
-        r = sh(
-            "curl -fsSL 'https://github.com/erebe/wstunnel/releases/download/v7.8.0/"
-            "wstunnel_7.8.0_linux_amd64.tar.gz' "
-            "| tar -xz -C /tmp/ 2>/dev/null && "
-            "mv /tmp/wstunnel /usr/local/bin/wstunnel && "
-            "chmod +x /usr/local/bin/wstunnel"
-        )
-        if r.returncode == 0:
-            print("  [ana] ✅ wstunnel kuruldu")
-        else:
-            print(f"  [ana] ❌ wstunnel kurulamadı: {r.stderr.decode()[:150]}")
-    else:
-        print("  [ana] ✅ wstunnel mevcut")
+    _ensure_ws_deps()
 
 
 def try_connect_all_workers():
@@ -401,7 +489,7 @@ def try_connect_all_workers():
     paralel thread'lerle bağla. Yeni düğümler için sürekli polling.
     WORKER_HOST env: virgülle ayrılmış ön-tanımlı hostlar.
     """
-    # ❶ Önce araçları kur (wstunnel, nbd-client)
+    # ❶ Önce araçları kur (nbd-client (websockets pip))
     _ensure_main_tools()
 
     print("  [worker] Panel bekleniyor...")
@@ -568,25 +656,6 @@ def _start_mc_tunnel():
 #  DESTEK SUNUCUSU
 # ══════════════════════════════════════════════════════════════
 
-def _install_wstunnel():
-    import shutil as _s
-    if _s.which("wstunnel"):
-        return True
-    print("  [destek] wstunnel indiriliyor...")
-    r = sh(
-        "curl -fsSL 'https://github.com/erebe/wstunnel/releases/download/v7.8.0/"
-        "wstunnel_7.8.0_linux_amd64.tar.gz' "
-        "| tar -xz -C /tmp/ 2>/dev/null && "
-        "mv /tmp/wstunnel /usr/local/bin/wstunnel && "
-        "chmod +x /usr/local/bin/wstunnel"
-    )
-    if r.returncode == 0:
-        print("  [destek] ✅ wstunnel kuruldu")
-        return True
-    print(f"  [destek] ❌ wstunnel kurulamadı: {r.stderr.decode()[:100]}")
-    return False
-
-
 def support_install_tools():
     import shutil as _s
     missing = [t for t in ["nbd-server", "nbd-client", "socat"]
@@ -598,7 +667,72 @@ def support_install_tools():
             f"--no-install-recommends {' '.join(missing)} 2>/dev/null"
         )
         print(f"  [destek] ✅ Kuruldu: {', '.join(missing)}")
-    _install_wstunnel()
+    _ensure_ws_deps()
+
+
+def support_start_ws_bridge():
+    """
+    Python asyncio WebSocket server:
+      Gelen WS bağlantısını nbd-server TCP portuna (10809) köprüler.
+      cloudflared HTTP tüneli üzerinden erişilir — trycloudflare uyumlu!
+    """
+    _ensure_ws_deps()
+
+    async def ws_to_nbd(websocket):
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", NBD_SERVER_PORT)
+        except Exception as e:
+            print(f"  [ws-server] ❌ nbd-server bağlantısı kurulamadı: {e}")
+            return
+
+        async def nbd_to_ws():
+            try:
+                while True:
+                    data = await reader.read(65536)
+                    if not data:
+                        break
+                    await websocket.send(data)
+            except Exception:
+                pass
+            finally:
+                await websocket.close()
+
+        async def ws_to_nbd_inner():
+            try:
+                async for msg in websocket:
+                    if isinstance(msg, str):
+                        msg = msg.encode()
+                    writer.write(msg)
+                    await writer.drain()
+            except Exception:
+                pass
+            finally:
+                writer.close()
+
+        await asyncio.gather(nbd_to_ws(), ws_to_nbd_inner(), return_exceptions=True)
+
+    async def run_ws_server():
+        import importlib
+        ws_mod = importlib.import_module("websockets")
+        async with ws_mod.serve(ws_to_nbd, "0.0.0.0", WS_BRIDGE_PORT,
+                                max_size=2**24, ping_interval=20):
+            print(f"  [destek] ✅ WS köprü sunucusu :0.0.0.0:{WS_BRIDGE_PORT}")
+            await asyncio.Future()  # sonsuza kadar çalış
+
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_ws_server())
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    # Sunucunun ayağa kalkması için bekle
+    time.sleep(2)
+    if wait_port(WS_BRIDGE_PORT, timeout=10):
+        print(f"  [destek] ✅ WS köprüsü :{WS_BRIDGE_PORT} hazır")
+        return True
+    print(f"  [destek] ❌ WS köprüsü :{WS_BRIDGE_PORT} başlamadı")
+    return False
 
 
 def support_create_disk():
@@ -662,37 +796,16 @@ def support_start_nbd(disk_gb):
     return False
 
 
-def support_start_wstunnel():
-    """
-    wstunnel server: WebSocket bağlantısını nbd-server'a köprüler.
-    cloudflared HTTP tüneli üzerinden erişilir (trycloudflare uyumlu).
-    """
-    print(f"  [destek] 🔌 wstunnel server :{WSTUNNEL_PORT} başlatılıyor...")
-    proc = subprocess.Popen(
-        ["wstunnel", "server",
-         f"ws://0.0.0.0:{WSTUNNEL_PORT}",
-         "--restrict-to", f"127.0.0.1:{NBD_SERVER_PORT}"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    time.sleep(2)
-    if proc.poll() is None:
-        print(f"  [destek] ✅ wstunnel server (:{WSTUNNEL_PORT})")
-        return True
-    out = proc.stdout.read().decode()[:200]
-    print(f"  [destek] ❌ wstunnel başlatılamadı: {out}")
-    return False
-
-
 def support_start_tunnel(disk_gb):
     """
-    cloudflared HTTP tüneli: HTTPS → wstunnel(8080) → nbd-server(10809)
-    trycloudflare uyumlu — cloudflared access tcp gerektirmez!
+    cloudflared HTTP tüneli: HTTPS → ws_bridge(8080) → nbd-server(10809)
+    trycloudflare uyumlu — sadece HTTP/HTTPS, WebSocket upgrade desteklenir.
     """
     log = "/tmp/cf_support.log"
     print("  [destek] 🌐 Cloudflare HTTP tüneli açılıyor...")
     subprocess.Popen(
         ["cloudflared", "tunnel",
-         "--url", f"http://localhost:{WSTUNNEL_PORT}",
+         "--url", f"http://localhost:{WS_BRIDGE_PORT}",
          "--no-autoupdate", "--loglevel", "info"],
         stdout=open(log, "w"), stderr=subprocess.STDOUT,
     )
@@ -804,7 +917,7 @@ def run_support_mode():
 
     disk_gb = support_create_disk()
     support_start_nbd(disk_gb)
-    support_start_wstunnel()
+    support_start_ws_bridge()
     threading.Thread(target=support_start_tunnel,
                      args=(disk_gb,), daemon=True).start()
     threading.Thread(target=_support_ram_watchdog, daemon=True).start()
@@ -837,7 +950,7 @@ def run_support_mode():
             disk_limit=RENDER_DISK_LIMIT_GB,
             disk_pct=disk_pct,
             disk_color=dc,
-            wst_port=WSTUNNEL_PORT,
+            wst_port=WS_BRIDGE_PORT,
             nbd_port=NBD_SERVER_PORT,
         )
 
@@ -868,7 +981,7 @@ SUPPORT_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="8">
-<title>Destek Sunucusu v9.3</title>
+<title>Destek Sunucusu v9.4</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{background:#0a0b12;color:#eef0f8;font-family:'Segoe UI',sans-serif;
@@ -905,7 +1018,7 @@ h1{{font-size:19px;font-weight:700;margin-bottom:4px;color:#7c6aff}}
 </style></head><body>
 <div class="card">
   <div style="font-size:40px;margin-bottom:8px">&#128309;</div>
-  <div class="badge"><div class="dot"></div> DESTEK MODU AKTIF - v9.3</div>
+  <div class="badge"><div class="dot"></div> DESTEK MODU AKTIF - v9.4</div>
   <h1>Destek Sunucusu</h1>
   <div class="sub">Node: {node_id} - 8sn sonra yenilenir</div>
   <div class="grid">
@@ -928,7 +1041,7 @@ h1{{font-size:19px;font-weight:700;margin-bottom:4px;color:#7c6aff}}
   </div>
   <div class="arch">
     nbd-server :<span>{nbd_port}</span>
-    -&gt; wstunnel ws:<span>{wst_port}</span>
+    -&gt; Python WS Bridge :<span>{wst_port}</span>
     -&gt; cloudflared HTTPS -&gt; Ana Sunucu
   </div>
   <a class="link" href="{main_url}" target="_blank">Ana Sunucuya Git</a>
@@ -943,9 +1056,9 @@ optimize_all(mode)
 
 if IS_MAIN:
     print(f"\n{'━'*56}")
-    print(f"  ANA SUNUCU v9.3 — Panel :{PORT}")
+    print(f"  ANA SUNUCU v9.4 — Panel :{PORT}")
     print(f"  MC, {MIN_SUPPORT_NODES} NBD dugumu hazir olmadan BASLAMAZ")
-    print(f"  Protokol: cloudflared HTTPS -> wstunnel WSS -> nbd-client")
+    print(f"  Protokol: cloudflared HTTPS → Python WS → nbd-client")
     print(f"{'━'*56}\n")
     panel_proc = start_panel()
     threading.Thread(target=try_connect_all_workers, daemon=True).start()
