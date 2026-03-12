@@ -153,11 +153,6 @@ def _ram_monitor():
 # ══════════════════════════════════════════════════════════════
 
 def download_paper():
-    """
-    Paper MC indir.
-    DÜZELTME: requests yerine urllib kullanıyoruz.
-    Sebep: eventlet.monkey_patch() + requests + SSL = sonsuz özyineleme hatası.
-    """
     import urllib.request as urlreq
     import ssl
 
@@ -261,12 +256,10 @@ def write_server_config():
 
 
 def _setup_swap():
-    """Disk'ten swap alanı oluştur — RAM'i genişlet"""
     import psutil, subprocess, os
     try:
         disk = psutil.disk_usage("/")
         free_gb = disk.free / 1024 / 1024 / 1024
-        # Boş diskin %40'ını swap yap, max 16GB
         swap_gb = min(16, int(free_gb * 0.40))
         if swap_gb < 1:
             log("[Panel] ⚠️  Swap: yeterli disk yok")
@@ -279,7 +272,6 @@ def _setup_swap():
             subprocess.run(["chmod", "600", swap_file], check=True)
             subprocess.run(["mkswap", swap_file], check=True)
         subprocess.run(["swapon", swap_file], check=False)
-        # swappiness=100 → kernel swap'ı agresif kullanır, RAM'i boş tutar
         for path, val in [
             ("/proc/sys/vm/swappiness",             "100"),
             ("/proc/sys/vm/vfs_cache_pressure",     "200"),
@@ -297,32 +289,23 @@ def _setup_swap():
 
 
 def _ram_watchdog():
-    """
-    RAM Bekçisi — HARD LİMİT: OS + MC toplam 511MB
-    Swap ağırlıklı çalışır, fiziksel RAM 511MB'yi asla geçmez.
-    Restart YOK — sadece GC + mob/entity temizliği.
-    """
     import psutil, os, signal
-    HARD_MB  = 511   # asla geçilmeyecek fiziksel RAM limiti
-    CRIT_MB  = 500   # GC + entity temizle
-    WARN_MB  = 490   # uyarı + save-all
+    HARD_MB  = 511
+    CRIT_MB  = 500
+    WARN_MB  = 490
     last_warn = 0
 
     def _container_mem_mb():
-        """Container'ın gerçek bellek kullanımı — cgroup'tan oku"""
-        # cgroup v2
         try:
             with open("/sys/fs/cgroup/memory.current") as f:
                 return int(f.read().strip()) // 1024 // 1024
         except Exception:
             pass
-        # cgroup v1
         try:
             with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as f:
                 return int(f.read().strip()) // 1024 // 1024
         except Exception:
             pass
-        # Fallback: sadece MC process RSS
         try:
             if mc_process and mc_process.poll() is None:
                 return int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
@@ -362,37 +345,46 @@ def _ram_watchdog():
 
 
 def get_jvm_args():
-    import psutil, subprocess
+    import psutil
     mem      = psutil.virtual_memory()
     swp      = psutil.swap_memory()
     total_mb = int(mem.total / 1024 / 1024)
-    swap_mb  = int(swp.free  / 1024 / 1024)
+    swap_mb  = int(swp.total / 1024 / 1024)   # toplam swap (free değil total)
 
-    # Hard limit: OS+MC fiziksel toplam ≤ 511MB
-    # OS=100MB → MC fiziksel max=411MB
-    # JVM heap ağırlığı swap'ta olsun → Xms küçük, Xmx büyük
-    mc_ram_limit = 411                   # fiziksel RAM'den MC'ye max (MB)
-    xmx_mb = mc_ram_limit + swap_mb      # asıl büyük alan swap'tan
-    xms_mb = 64                          # küçük başlat → JVM swap'ı tercih eder
-
-    # ulimit ile process'in fiziksel belleğini de kısıtla (ekstra güvenlik)
-    try:
-        import resource
-        limit = 511 * 1024 * 1024   # 511MB byte cinsinden
-        resource.setrlimit(resource.RLIMIT_AS, (limit * 4, limit * 4))
-    except Exception:
-        pass
+    # Disk'ten swap oluşturulduysa bunu kullan
+    # Xmx = (RAM - 512MB OS payı) + swap'ın yarısı, max 8GB
+    usable_ram = max(0, total_mb - 512)
+    usable_swap = swap_mb // 2
+    xmx_mb = min(8192, usable_ram + usable_swap)
+    xmx_mb = max(512, xmx_mb)   # en az 512MB
+    xms_mb = min(512, xmx_mb)   # xms = xmx ile aynı ya da 512
 
     xmx = f"{xmx_mb}M"
     xms = f"{xms_mb}M"
-    log(f"[Panel] 🧠 RAM={total_mb}MB(max511)  Swap={swap_mb}MB  Xms={xms}  Xmx={xmx}  [swap ağırlıklı]")
+    log(f"[Panel] 🧠 RAM={total_mb}MB  Swap={swap_mb}MB  Xms={xms}  Xmx={xmx}")
     return [
         "java",
         f"-Xms{xms}", f"-Xmx{xmx}",
+        # Compressed class space — varsayılan 1GB, küçük tut
+        "-XX:CompressedClassSpaceSize=128m",
+        "-XX:MaxMetaspaceSize=256m",
+        # G1GC — sunucu için optimize
         "-XX:+UseG1GC",
         "-XX:+ParallelRefProcEnabled",
         "-XX:MaxGCPauseMillis=200",
-        # UseLargePages kaldırıldı — Render ortamı desteklemiyor
+        "-XX:+UnlockExperimentalVMOptions",
+        "-XX:+DisableExplicitGC",
+        "-XX:G1NewSizePercent=30",
+        "-XX:G1MaxNewSizePercent=40",
+        "-XX:G1HeapRegionSize=8m",
+        "-XX:G1ReservePercent=20",
+        "-XX:G1HeapWastePercent=5",
+        "-XX:G1MixedGCCountTarget=4",
+        "-XX:InitiatingHeapOccupancyPercent=15",
+        "-XX:G1MixedGCLiveThresholdPercent=90",
+        "-XX:SurvivorRatio=32",
+        "-XX:MaxTenuringThreshold=1",
+        "-XX:+UseStringDeduplication",
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8",
         "-Duser.timezone=Europe/Istanbul",
@@ -408,6 +400,9 @@ def start_server():
         return False, "Server zaten çalışıyor"
 
     MC_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Swap kurulumu — disk alanını RAM'e çevir ──────────────
+    _setup_swap()
 
     if not MC_JAR.exists():
         server_state["status"] = "downloading"
@@ -427,7 +422,7 @@ def start_server():
 
     jvm = get_jvm_args()
     log(f"[Panel] 🚀 Server başlatılıyor (RAM: {MC_RAM})...")
-    log(f"[Panel] JVM: {' '.join(jvm[:4])} ...")
+    log(f"[Panel] JVM: {' '.join(jvm[:6])} ...")
 
     try:
         mc_process = subprocess.Popen(
@@ -1550,12 +1545,10 @@ input[type=file] { display: none; }
       </div>
     </div>
     <div class="card">
-      <div class="card-hd">⚡ JVM Optimizasyonları (Aikar's Flags)</div>
+      <div class="card-hd">⚡ JVM Optimizasyonları</div>
       <div style="font-family:var(--mono);font-size:11px;color:var(--t2);line-height:1.8">
-        G1GC · ParallelRefProc · MaxGCPause=200ms · AlwaysPreTouch ·
-        G1NewSize=30% · G1MaxNew=40% · G1HeapRegion=8M ·
-        SurvivorRatio=32 · MaxTenuring=1 · UseStringDeduplication ·
-        UseLargePages · HugePage=2MB
+        G1GC · ParallelRefProc · MaxGCPause=200ms · CompressedClassSpace=32MB ·
+        MaxMetaspace=128MB · G1NewSize=20% · G1MaxNew=35% · G1HeapRegion=4M
       </div>
     </div>
   </div>
