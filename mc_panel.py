@@ -279,12 +279,16 @@ def _setup_swap():
             subprocess.run(["chmod", "600", swap_file], check=True)
             subprocess.run(["mkswap", swap_file], check=True)
         subprocess.run(["swapon", swap_file], check=False)
-        # swappiness'i düşür: RAM bitmeden swap kullanma
-        try:
-            with open("/proc/sys/vm/swappiness", "w") as f:
-                f.write("10")
-        except Exception:
-            pass
+        # swappiness=100 → kernel swap'ı agresif kullanır, RAM'i boş tutar
+        for path, val in [
+            ("/proc/sys/vm/swappiness",             "100"),
+            ("/proc/sys/vm/vfs_cache_pressure",     "200"),
+            ("/proc/sys/vm/overcommit_memory",      "1"),
+        ]:
+            try:
+                with open(path, "w") as f: f.write(val)
+            except Exception:
+                pass
         mem = psutil.virtual_memory()
         swp = psutil.swap_memory()
         log(f"[Panel] ✅ Swap aktif: RAM={int(mem.total/1024/1024)}MB + Swap={int(swp.total/1024/1024)}MB = toplam {int((mem.total+swp.total)/1024/1024)}MB")
@@ -341,19 +345,16 @@ def _ram_watchdog():
                 send_command("kill @e[type=item]")
                 send_command("kill @e[type=experience_orb]")
                 send_command("kill @e[type=arrow]")
-                log(f"[RAM🚨] Container: {used_mb}MB → HARD LİMİT! Cache+entity temizlendi")
 
             elif used_mb >= CRIT_MB:
                 send_command("save-all")
                 send_command("kill @e[type=item]")
                 send_command("kill @e[type=experience_orb]")
-                log(f"[RAM⚠️] Container: {used_mb}MB → entity temizlendi")
 
             elif used_mb >= WARN_MB:
                 now = time.time()
                 if now - last_warn > 30:
                     send_command("save-all")
-                    log(f"[RAM💛] Container: {used_mb}MB → save-all")
                     last_warn = now
 
         except Exception:
@@ -361,19 +362,30 @@ def _ram_watchdog():
 
 
 def get_jvm_args():
-    import psutil
+    import psutil, subprocess
     mem      = psutil.virtual_memory()
     swp      = psutil.swap_memory()
     total_mb = int(mem.total / 1024 / 1024)
     swap_mb  = int(swp.free  / 1024 / 1024)
-    # Fiziksel RAM hard limit: 511MB (OS+MC toplam)
-    # OS = 100MB sabit → MC fiziksel = 411MB max
-    # Swap tamamen MC'ye → Xmx = 411 + swap
-    xmx_mb = 411 + swap_mb
-    xms_mb = 64   # Küçük tut → JVM önce swap kullanır, RAM'e baskı yapmaz
+
+    # Hard limit: OS+MC fiziksel toplam ≤ 511MB
+    # OS=100MB → MC fiziksel max=411MB
+    # JVM heap ağırlığı swap'ta olsun → Xms küçük, Xmx büyük
+    mc_ram_limit = 411                   # fiziksel RAM'den MC'ye max (MB)
+    xmx_mb = mc_ram_limit + swap_mb      # asıl büyük alan swap'tan
+    xms_mb = 64                          # küçük başlat → JVM swap'ı tercih eder
+
+    # ulimit ile process'in fiziksel belleğini de kısıtla (ekstra güvenlik)
+    try:
+        import resource
+        limit = 511 * 1024 * 1024   # 511MB byte cinsinden
+        resource.setrlimit(resource.RLIMIT_AS, (limit * 4, limit * 4))
+    except Exception:
+        pass
+
     xmx = f"{xmx_mb}M"
     xms = f"{xms_mb}M"
-    log(f"[Panel] 🧠 Fiziksel={total_mb}MB  OS=100MB  MC_limit=411MB  Swap={swap_mb}MB  Xms={xms}  Xmx={xmx}")
+    log(f"[Panel] 🧠 RAM={total_mb}MB(max511)  Swap={swap_mb}MB  Xms={xms}  Xmx={xmx}  [swap ağırlıklı]")
     return [
         "java",
         f"-Xms{xms}", f"-Xmx{xmx}",
