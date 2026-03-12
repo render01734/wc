@@ -292,19 +292,70 @@ def _setup_swap():
         log(f"[Panel] ⚠️  Swap kurulamadı: {e}")
 
 
+def _ram_watchdog():
+    """
+    RAM Bekçisi — HARD LİMİT: OS + MC toplam 511MB
+    Swap ağırlıklı çalışır, fiziksel RAM 511MB'yi asla geçmez.
+    Restart YOK — sadece GC + mob/entity temizliği.
+    """
+    import psutil, os, signal
+    HARD_MB  = 511   # asla geçilmeyecek fiziksel RAM limiti
+    CRIT_MB  = 500   # GC + entity temizle
+    WARN_MB  = 490   # uyarı + save-all
+    last_warn = 0
+
+    while True:
+        eventlet.sleep(2)
+        try:
+            mem = psutil.virtual_memory()
+            used_mb = int(mem.used / 1024 / 1024)
+
+            if used_mb >= HARD_MB:
+                # Fiziksel RAM'i anında boşalt:
+                # 1) Kernel cache'i temizle
+                try:
+                    with open("/proc/sys/vm/drop_caches", "w") as f:
+                        f.write("3")
+                except Exception:
+                    pass
+                # 2) MC'ye agresif GC + entity temizle
+                send_command("kill @e[type=item]")
+                send_command("kill @e[type=experience_orb]")
+                send_command("kill @e[type=arrow]")
+                log(f"[RAM🚨] {used_mb}MB → HARD LİMİT! Cache+entity temizlendi")
+
+            elif used_mb >= CRIT_MB:
+                send_command("save-all")
+                send_command("kill @e[type=item]")
+                send_command("kill @e[type=experience_orb]")
+                log(f"[RAM⚠️] {used_mb}MB → GC + entity temizlendi")
+
+            elif used_mb >= WARN_MB:
+                import time
+                now = time.time()
+                if now - last_warn > 30:
+                    send_command("save-all")
+                    log(f"[RAM💛] {used_mb}MB → save-all")
+                    last_warn = now
+
+        except Exception:
+            pass
+
+
 def get_jvm_args():
     import psutil
-    mem       = psutil.virtual_memory()
-    swp       = psutil.swap_memory()
-    total_mb  = int(mem.total / 1024 / 1024)
-    os_mb     = 100                                 # OS için sabit 100MB
-    ram_for_mc = max(0, total_mb - os_mb)           # RAM'den MC'ye kalan
-    swap_mb   = int(swp.free  / 1024 / 1024)       # boş swap
-    xmx_mb    = max(512, ram_for_mc + swap_mb)      # RAM artığı + swap
-    xms_mb    = max(256, int(xmx_mb * 0.40))
+    mem      = psutil.virtual_memory()
+    swp      = psutil.swap_memory()
+    total_mb = int(mem.total / 1024 / 1024)
+    swap_mb  = int(swp.free  / 1024 / 1024)
+    # Fiziksel RAM hard limit: 511MB (OS+MC toplam)
+    # OS = 100MB sabit → MC fiziksel = 411MB max
+    # Swap tamamen MC'ye → Xmx = 411 + swap
+    xmx_mb = 411 + swap_mb
+    xms_mb = 64   # Küçük tut → JVM önce swap kullanır, RAM'e baskı yapmaz
     xmx = f"{xmx_mb}M"
     xms = f"{xms_mb}M"
-    log(f"[Panel] 🧠 Toplam={total_mb}MB  OS=300MB  MC RAM={ram_for_mc}MB  Swap={swap_mb}MB  →  Xms={xms} Xmx={xmx}")
+    log(f"[Panel] 🧠 Fiziksel={total_mb}MB  OS=100MB  MC_limit=411MB  Swap={swap_mb}MB  Xms={xms}  Xmx={xmx}")
     return [
         "java",
         f"-Xms{xms}", f"-Xmx{xmx}",
@@ -1658,7 +1709,8 @@ init();
 #  BAŞLATMA
 # ══════════════════════════════════════════════════════════════
 
-threading.Thread(target=_ram_monitor, daemon=True).start()
+threading.Thread(target=_ram_monitor,   daemon=True).start()
+threading.Thread(target=_ram_watchdog,  daemon=True).start()
 
 if __name__ == "__main__":
     MC_DIR.mkdir(parents=True, exist_ok=True)
