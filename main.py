@@ -1,24 +1,20 @@
 """
-⛏️  Minecraft Server Boot — RENDER BYPASS v9.6
+⛏️  Minecraft Server Boot — RENDER BYPASS v10.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v9.6 Değişiklikler:
-  - MIN_SUPPORT_NODES = 0 → MC hemen başlar, NBD opsiyonel
-  - NBD /dev/nbd* oluşturulamazsa: uyar ve atla (crash yok)
-  - modprobe başarısız olsa bile MC durdurmaz
-  - Destek düğümleri bağlandıkça arka planda swap eklemeye çalışır
+v10.0: NBD tamamen kaldırıldı → Resource Pool ile değiştirildi
+  Destek sunucuları şunları sağlar (kernel modülü gerekmez):
+    • RAM Cache   → Chunk/entity verisi JVM dışında saklanır
+    • File Store  → Eski region'lar arşivlenir, disk açılır → swap büyür
+    • CPU Worker  → Sıkıştırma, hash, istatistik görevleri
+    • TCP Proxy   → Oyuncu bağlantı yükü dağıtılır
 """
 
 import os, sys, subprocess, time, socket, resource, threading, re, glob, json
-import ssl as _ssl, hashlib as _hashlib, base64 as _base64, struct as _struct
 import psutil
 import urllib.request as _ur
 
-RENDER_RAM_LIMIT_MB  = 512
 RENDER_DISK_LIMIT_GB = 18.0
-MIN_SUPPORT_NODES    = 0      # ← FIX v9.6: 0 = MC hemen başlar, NBD opsiyonel
-WS_BRIDGE_PORT       = 8080
-NBD_SERVER_PORT      = 10809
-NBD_CLIENT_BASE      = 10810
+RENDER_RAM_LIMIT_MB  = 512
 
 MAIN_SERVER_URL = "https://wc-tsgd.onrender.com"
 MY_URL  = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -28,13 +24,8 @@ IS_MAIN = (MY_URL == MAIN_SERVER_URL
 PORT    = int(os.environ.get("PORT", "5000"))
 MC_PORT = 25565
 MC_RAM  = os.environ.get("MC_RAM", "2G")
+INF     = resource.RLIM_INFINITY
 
-SUPPORT_NODE_ID  = (MY_URL.replace("https://", "").replace(".onrender.com", "") or "support")
-SUPPORT_NBD_FILE = "/nbd_disk.img"
-INF = resource.RLIM_INFINITY
-
-
-# ── Helpers ───────────────────────────────────────────────────
 
 def read_cgroup_ram_limit_mb():
     for path in ["/sys/fs/cgroup/memory.max",
@@ -51,18 +42,6 @@ def read_cgroup_ram_limit_mb():
     return RENDER_RAM_LIMIT_MB
 
 
-def read_actual_disk_used_gb():
-    try:
-        total = sum(
-            os.path.getsize(f)
-            for f in ["/nbd_disk.img", "/swapfile", "/tmp/nbd_ram.img"]
-            if os.path.exists(f)
-        )
-        return 4.0 + total / 1024**3
-    except:
-        return 4.0
-
-
 CONTAINER_RAM_MB = read_cgroup_ram_limit_mb()
 
 base_env = {
@@ -77,25 +56,24 @@ base_env = {
     "MC_RAM": MC_RAM,
     "PORT": str(PORT),
     "CONTAINER_RAM_MB": str(CONTAINER_RAM_MB),
-    "MIN_SUPPORT_NODES": str(MIN_SUPPORT_NODES),
 }
 
 print("\n" + "━"*56)
-print("  ⛏️   Minecraft Server — RENDER BYPASS v9.6")
-print(f"      MOD       : {'🟢 ANA' if IS_MAIN else '🔵 DESTEK'}")
+print("  ⛏️   Minecraft Server — RENDER BYPASS v10.0")
+print(f"      MOD       : {'🟢 ANA' if IS_MAIN else '🔵 AGENT'}")
 print(f"      MY_URL    : {MY_URL or '(boş → ANA)'}")
 print(f"      RAM       : {CONTAINER_RAM_MB}MB")
-if IS_MAIN:
-    print(f"      NBD       : Opsiyonel (MIN={MIN_SUPPORT_NODES})")
 print("━"*56 + "\n")
 
 
+# ─────────────────────────────────────────────
+#  YARDIMCILAR
+# ─────────────────────────────────────────────
+
 def w(path, val):
     try:
-        open(path, "w").write(str(val))
-        return True
-    except:
-        return False
+        open(path, "w").write(str(val)); return True
+    except: return False
 
 
 def sh(cmd):
@@ -106,24 +84,34 @@ def wait_port(port, timeout=60):
     for _ in range(timeout * 10):
         try:
             s = socket.create_connection(("127.0.0.1", int(port)), 0.1)
-            s.close()
-            return True
+            s.close(); return True
         except OSError:
             time.sleep(0.1)
     return False
 
 
-def calc_swap_mb():
-    used = read_actual_disk_used_gb()
-    return int(min(3.0, max(0.0, RENDER_DISK_LIMIT_GB - used - 7.0)) * 1024)
+def _panel_log(msg):
+    try:
+        _ur.urlopen(_ur.Request(
+            f"http://localhost:{PORT}/api/internal/status_msg",
+            data=json.dumps({"msg": msg}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        ), timeout=2)
+    except: pass
 
 
-def calc_nbd_gb():
-    used = read_actual_disk_used_gb()
-    return min(11.0, max(0.5, RENDER_DISK_LIMIT_GB - used - 3.0))
+def read_disk_used_gb():
+    try:
+        return 4.0 + sum(
+            os.path.getsize(f) for f in ["/swapfile", "/swapfile2"]
+            if os.path.exists(f)
+        ) / 1024**3
+    except: return 4.0
 
 
-# ── cgroup / swap / kernel ─────────────────────────────────────
+# ─────────────────────────────────────────────
+#  BYPASS / SWAP / KERNEL
+# ─────────────────────────────────────────────
 
 def bypass_cgroups():
     n = 0
@@ -139,57 +127,48 @@ def bypass_cgroups():
         ("/sys/fs/cgroup/memory/memory.oom_control", "0"),
         ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "-1"),
     ]:
-        if w(path, val):
-            n += 1
+        if w(path, val): n += 1
     for cg in glob.glob("/sys/fs/cgroup/*/") + glob.glob("/sys/fs/cgroup/*/*/"):
-        for fn, v in [
-            ("memory.max", "max"), ("memory.swap.max", "max"),
-            ("memory.high", "max"), ("memory.oom_control", "0"),
-            ("cpu.max", "max"), ("pids.max", "max"),
-        ]:
+        for fn, v in [("memory.max","max"),("memory.swap.max","max"),
+                      ("memory.high","max"),("memory.oom_control","0"),
+                      ("cpu.max","max"),("pids.max","max")]:
             w(cg + fn, v)
     w("/proc/sys/vm/oom_kill_allocating_task", "0")
     w("/proc/sys/vm/panic_on_oom", "0")
-    try:
-        w(f"/proc/{os.getpid()}/oom_score_adj", "-1000")
-    except:
-        pass
+    try: w(f"/proc/{os.getpid()}/oom_score_adj", "-1000")
+    except: pass
     print(f"  ✅ {n} cgroup limiti kaldırıldı")
 
 
-def setup_swap(mode="main"):
+def setup_swap():
     sh("modprobe zram num_devices=1 2>/dev/null")
     w("/sys/block/zram0/comp_algorithm", "lz4")
     if w("/sys/block/zram0/disksize", "128M"):
         if sh("mkswap /dev/zram0 && swapon -p 100 /dev/zram0").returncode == 0:
             print("  ✅ zram: 128MB")
-    if mode == "main":
-        mb = calc_swap_mb()
-        if mb >= 256:
-            sf = "/swapfile"
-            if os.path.exists(sf):
-                sh(f"swapoff {sf} 2>/dev/null")
-            try:
-                os.remove(sf)
-            except:
-                pass
-            r = sh(f"fallocate -l {mb}M {sf}")
-            if r.returncode != 0:
-                sh(f"dd if=/dev/zero of={sf} bs=64M count={max(1, mb//64)} status=none")
-            sh(f"chmod 600 {sf} && mkswap -f {sf}")
-            if sh(f"swapon -p 0 {sf}").returncode == 0:
-                print(f"  ✅ Swap dosyası: {mb}MB")
+    used  = read_disk_used_gb()
+    sw_mb = int(min(3.0, max(0.0, RENDER_DISK_LIMIT_GB - used - 7.0)) * 1024)
+    if sw_mb >= 256:
+        sf = "/swapfile"
+        if os.path.exists(sf): sh(f"swapoff {sf} 2>/dev/null")
+        try: os.remove(sf)
+        except: pass
+        r = sh(f"fallocate -l {sw_mb}M {sf}")
+        if r.returncode != 0:
+            sh(f"dd if=/dev/zero of={sf} bs=64M count={max(1,sw_mb//64)} status=none")
+        sh(f"chmod 600 {sf} && mkswap -f {sf}")
+        if sh(f"swapon -p 0 {sf}").returncode == 0:
+            print(f"  ✅ Swap: {sw_mb}MB")
     for p, v in [
-        ("/proc/sys/vm/swappiness", "100"),
+        ("/proc/sys/vm/swappiness",         "100"),
         ("/proc/sys/vm/vfs_cache_pressure", "200"),
-        ("/proc/sys/vm/overcommit_memory", "1"),
-        ("/proc/sys/vm/overcommit_ratio", "100"),
-        ("/proc/sys/vm/page-cluster", "0"),
-        ("/proc/sys/vm/drop_caches", "3"),
+        ("/proc/sys/vm/overcommit_memory",  "1"),
+        ("/proc/sys/vm/overcommit_ratio",   "100"),
+        ("/proc/sys/vm/page-cluster",       "0"),
+        ("/proc/sys/vm/drop_caches",        "3"),
         ("/proc/sys/vm/watermark_boost_factor", "0"),
-        ("/proc/sys/vm/min_free_kbytes", "32768"),
-    ]:
-        w(p, v)
+        ("/proc/sys/vm/min_free_kbytes",    "32768"),
+    ]: w(p, v)
 
 
 def optimize_kernel():
@@ -198,564 +177,22 @@ def optimize_kernel():
         (resource.RLIMIT_NPROC,   (INF, INF)),
         (resource.RLIMIT_MEMLOCK, (INF, INF)),
     ]:
-        try:
-            resource.setrlimit(res, val)
-        except:
-            pass
+        try: resource.setrlimit(res, val)
+        except: pass
 
 
 def optimize_all(mode="main"):
     print(f"\n{'═'*56}\n  🔓 BYPASS ({mode.upper()})\n{'═'*56}\n")
     bypass_cgroups()
-    setup_swap(mode)
+    setup_swap()
     optimize_kernel()
     swp = psutil.swap_memory()
     print(f"  ✅ Swap:{swp.total//1024//1024}MB  RAM:{CONTAINER_RAM_MB}MB\n{'═'*56}")
 
 
-# ══════════════════════════════════════════════════════════════
-#  ANA SUNUCU — NBD bağlantıları (wstunnel üzerinden)
-# ══════════════════════════════════════════════════════════════
-
-_nbd_nodes = {}
-_nbd_lock  = threading.Lock()
-
-
-def _next_free_slot():
-    used_ports = {v["port"] for v in _nbd_nodes.values()}
-    used_devs  = {v["dev"]  for v in _nbd_nodes.values()}
-    for i in range(16):
-        p = NBD_CLIENT_BASE + i
-        d = f"/dev/nbd{i}"
-        if p not in used_ports and d not in used_devs:
-            return p, d
-    return None, None
-
-
-def nbd_connected_count():
-    with _nbd_lock:
-        return sum(1 for v in _nbd_nodes.values() if v.get("connected"))
-
-
-def _panel_log(msg):
-    try:
-        _ur.urlopen(
-            _ur.Request(
-                f"http://localhost:{PORT}/api/internal/status_msg",
-                data=json.dumps({"msg": msg}).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            ),
-            timeout=2,
-        )
-    except:
-        pass
-
-
-_WS_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-
-
-def _ws_handshake_server(sock) -> bool:
-    data = b""
-    try:
-        while b"\r\n\r\n" not in data:
-            chunk = sock.recv(4096)
-            if not chunk:
-                return False
-            data += chunk
-    except OSError:
-        return False
-    m = re.search(rb"Sec-WebSocket-Key:\s*(.+?)\r\n", data, re.IGNORECASE)
-    if not m:
-        return False
-    key = m.group(1).strip()
-    accept = _base64.b64encode(
-        _hashlib.sha1(key + _WS_MAGIC).digest()
-    ).decode()
-    resp = (
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
-    ).encode()
-    sock.sendall(resp)
-    return True
-
-
-def _ws_handshake_client(sock, host: str, path: str = "/") -> bool:
-    key = _base64.b64encode(os.urandom(16)).decode()
-    req = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        "Sec-WebSocket-Version: 13\r\n\r\n"
-    ).encode()
-    sock.sendall(req)
-    resp = b""
-    try:
-        while b"\r\n\r\n" not in resp:
-            chunk = sock.recv(4096)
-            if not chunk:
-                return False
-            resp += chunk
-    except OSError:
-        return False
-    return b"101" in resp
-
-
-def _ws_recv(sock) -> bytes:
-    def recv_exact(n: int) -> bytes:
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = sock.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError("WS bağlantı kesildi")
-            buf.extend(chunk)
-        return bytes(buf)
-
-    hdr = recv_exact(2)
-    opcode = hdr[0] & 0x0F
-    masked = bool(hdr[1] & 0x80)
-    length = hdr[1] & 0x7F
-
-    if opcode == 8:
-        raise ConnectionError("WS close frame")
-    if opcode == 9:
-        sock.sendall(bytes([0x8A, 0x00]))
-        return _ws_recv(sock)
-    if opcode == 10:
-        return _ws_recv(sock)
-
-    if length == 126:
-        length = _struct.unpack(">H", recv_exact(2))[0]
-    elif length == 127:
-        length = _struct.unpack(">Q", recv_exact(8))[0]
-
-    mask_key = recv_exact(4) if masked else b"\x00\x00\x00\x00"
-    payload  = bytearray(recv_exact(length))
-    if masked:
-        for i in range(length):
-            payload[i] ^= mask_key[i % 4]
-    return bytes(payload)
-
-
-def _ws_send(sock, data: bytes, masked: bool = False):
-    length = len(data)
-    if length < 126:
-        hdr = bytes([0x82, (0x80 | length) if masked else length])
-    elif length < 65536:
-        hdr = bytes([0x82, 0xFE if masked else 126]) + _struct.pack(">H", length)
-    else:
-        hdr = bytes([0x82, 0xFF if masked else 127]) + _struct.pack(">Q", length)
-
-    if masked:
-        mask = os.urandom(4)
-        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
-        sock.sendall(hdr + mask + payload)
-    else:
-        sock.sendall(hdr + data)
-
-
-def _pipe_both(sock_a, sock_b,
-               a_recv, b_recv,
-               a_send, b_send,
-               label: str, stop_ev: threading.Event):
-    def a_to_b():
-        try:
-            while not stop_ev.is_set():
-                data = a_recv(sock_a)
-                if not data:
-                    break
-                b_send(sock_b, data)
-        except Exception:
-            pass
-        finally:
-            stop_ev.set()
-
-    def b_to_a():
-        try:
-            while not stop_ev.is_set():
-                data = b_recv(sock_b)
-                if not data:
-                    break
-                a_send(sock_a, data)
-        except Exception:
-            pass
-        finally:
-            stop_ev.set()
-
-    t1 = threading.Thread(target=a_to_b, daemon=True)
-    t2 = threading.Thread(target=b_to_a, daemon=True)
-    t1.start(); t2.start()
-    stop_ev.wait()
-    t1.join(timeout=2); t2.join(timeout=2)
-
-
-# ─── Destek: WS sunucu köprüsü ──────────────────────────────
-
-def support_start_ws_bridge():
-    def handle_client(ws_sock):
-        try:
-            if not _ws_handshake_server(ws_sock):
-                return
-            nbd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            nbd.settimeout(10)
-            nbd.connect(("127.0.0.1", NBD_SERVER_PORT))
-            nbd.settimeout(None)
-            stop_ev = threading.Event()
-            ws_sock.settimeout(None)
-            _pipe_both(
-                ws_sock, nbd,
-                a_recv=lambda s: _ws_recv(s),
-                b_recv=lambda s: s.recv(65536),
-                a_send=lambda s, d: _ws_send(s, d, masked=False),
-                b_send=lambda s, d: s.sendall(d),
-                label="ws-srv", stop_ev=stop_ev,
-            )
-        except Exception as e:
-            pass
-        finally:
-            try: ws_sock.close()
-            except: pass
-
-    def server_loop():
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            srv.bind(("0.0.0.0", WS_BRIDGE_PORT))
-            srv.listen(8)
-            srv.settimeout(1.0)
-            print(f"  [destek] ✅ WS köprü sunucusu :0.0.0.0:{WS_BRIDGE_PORT}")
-            while True:
-                try:
-                    ws_sock, addr = srv.accept()
-                    threading.Thread(
-                        target=handle_client, args=(ws_sock,), daemon=True
-                    ).start()
-                except socket.timeout:
-                    continue
-        except Exception as e:
-            print(f"  [ws-srv] sunucu hatası: {e}")
-        finally:
-            srv.close()
-
-    t = threading.Thread(target=server_loop, daemon=True)
-    t.start()
-    if wait_port(WS_BRIDGE_PORT, timeout=8):
-        print(f"  [destek] ✅ WS köprüsü :{WS_BRIDGE_PORT} hazır")
-        return True
-    return False
-
-
-# ─── Ana: WS istemci köprüsü ─────────────────────────────────
-
-def _ws_bridge_client_loop(local_port: int, remote_host: str, stop_ev: threading.Event):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        srv.bind(("127.0.0.1", local_port))
-        srv.listen(4)
-        srv.settimeout(1.0)
-    except Exception as e:
-        print(f"  [ws-cli] ❌ Port {local_port} açılamadı: {e}")
-        stop_ev.set()
-        return
-
-    def handle_tcp(tcp_sock):
-        try:
-            ssl_ctx = _ssl.create_default_context()
-            ws_raw  = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            ws_raw.settimeout(20)
-            ws_raw  = ssl_ctx.wrap_socket(ws_raw, server_hostname=remote_host)
-            ws_raw.connect((remote_host, 443))
-            ws_raw.settimeout(None)
-            if not _ws_handshake_client(ws_raw, remote_host):
-                ws_raw.close(); tcp_sock.close()
-                return
-            conn_stop = threading.Event()
-            _pipe_both(
-                tcp_sock, ws_raw,
-                a_recv=lambda s: s.recv(65536),
-                b_recv=lambda s: _ws_recv(s),
-                a_send=lambda s, d: s.sendall(d),
-                b_send=lambda s, d: _ws_send(s, d, masked=True),
-                label="ws-cli", stop_ev=conn_stop,
-            )
-        except Exception as e:
-            pass
-        finally:
-            try: tcp_sock.close()
-            except: pass
-
-    while not stop_ev.is_set():
-        try:
-            tcp_sock, addr = srv.accept()
-            threading.Thread(target=handle_tcp, args=(tcp_sock,), daemon=True).start()
-        except socket.timeout:
-            continue
-        except Exception as e:
-            if not stop_ev.is_set():
-                time.sleep(1)
-    srv.close()
-
-
-def connect_worker_nbd(host: str, node_id: str = "") -> bool:
-    """
-    FIX v9.6: NBD bağlantısı başarısız olursa False döner ama crash etmez.
-    /dev/nbd* oluşturulamazsa uyarı verir, MC'yi engellemez.
-    """
-    if not node_id:
-        node_id = host
-    with _nbd_lock:
-        if _nbd_nodes.get(node_id, {}).get("connected"):
-            return True
-        port, dev = _next_free_slot()
-        if not port:
-            _panel_log("  [nbd] ⚠️  Boş slot yok (max 16)")
-            return False
-        _nbd_nodes[node_id] = {"port": port, "dev": dev, "connected": False, "stop": None}
-
-    cnt_before = nbd_connected_count()
-    dev_num = int(dev.replace("/dev/nbd", ""))
-    msg = f"[nbd] 🔌 Bağlanılıyor: {node_id} | local:{port} → {dev}"
-    print(f"\n  {msg}")
-    _panel_log(f"[Panel] {msg}")
-
-    # ── nbd kernel modülü (başarısız olsa devam et) ──
-    import shutil as _s2
-    mod_ok = False
-    for mp in ["/sbin/modprobe", "/usr/sbin/modprobe", "modprobe"]:
-        r_mod = sh(f"{mp} nbd max_part=0 2>&1")
-        if r_mod.returncode == 0:
-            mod_ok = True
-            break
-
-    if not mod_ok:
-        if os.path.exists("/sys/module/nbd"):
-            mod_ok = True
-        else:
-            _panel_log(f"[Panel] ⚠️  nbd modülü yüklenemedi — bu Render'da normaldir")
-            # mknod dene
-            for i in range(16):
-                dp = f"/dev/nbd{i}"
-                if not os.path.exists(dp):
-                    sh(f"mknod {dp} b 43 {i} 2>/dev/null")
-
-    # /dev/nbdX yoksa ve oluşturulamıyorsa: NBD atla
-    if not os.path.exists(dev):
-        r_mk = sh(f"mknod {dev} b 43 {dev_num} 2>&1")
-        if not os.path.exists(dev):
-            err = r_mk.stdout.decode()[:120]
-            _panel_log(
-                f"[Panel] ⚠️  NBD atlandı: {dev} oluşturulamadı ({err.strip()}) "
-                f"— Render kernel'inde nbd modülü yok. MC yine de çalışacak."
-            )
-            with _nbd_lock:
-                _nbd_nodes.pop(node_id, None)
-            return False   # False döner ama MC durdurmaz (MIN_SUPPORT_NODES=0)
-
-    _panel_log(f"[Panel] ✅ {dev} cihazı hazır")
-
-    # ── nbd-client kurulu mu? ──
-    import shutil as _s
-    if not _s.which("nbd-client"):
-        _panel_log("[Panel] ⚙️  nbd-client kuruluyor...")
-        sh("apt-get update -qq 2>/dev/null && "
-           "DEBIAN_FRONTEND=noninteractive apt-get install -y "
-           "--no-install-recommends nbd-client 2>/dev/null")
-        if not _s.which("nbd-client"):
-            _panel_log("[Panel] ⚠️  nbd-client kurulamadı — NBD atlanıyor")
-            with _nbd_lock:
-                _nbd_nodes.pop(node_id, None)
-            return False
-
-    # ── WS istemci köprüsü başlat ──
-    stop_ev = threading.Event()
-    bridge_t = threading.Thread(
-        target=_ws_bridge_client_loop,
-        args=(port, host, stop_ev),
-        daemon=True
-    )
-    bridge_t.start()
-
-    if not wait_port(port, timeout=20):
-        _panel_log(f"[Panel] ⚠️  WS köprü portu {port} açılmadı — NBD atlanıyor")
-        stop_ev.set()
-        with _nbd_lock:
-            _nbd_nodes.pop(node_id, None)
-        return False
-
-    _panel_log(f"[Panel] ✅ WS köprüsü :{port} hazır, 5sn bekleniyor...")
-    time.sleep(5)
-
-    sh(f"nbd-client -d {dev} 2>/dev/null")
-    time.sleep(1)
-
-    _panel_log(f"[Panel] 🔗 nbd-client bağlanıyor: 127.0.0.1:{port} → {dev}")
-
-    r = sh(f"nbd-client 127.0.0.1 {port} {dev} -N disk -b 4096 -t 30 2>&1")
-    if r.returncode != 0:
-        out = r.stdout.decode()[:300]
-        _panel_log(f"[Panel] ⚠️  nbd-client başarısız ({node_id}): {out[:100]} — atlanıyor")
-        stop_ev.set()
-        with _nbd_lock:
-            _nbd_nodes.pop(node_id, None)
-        return False
-
-    _panel_log(f"[Panel] ✅ nbd-client bağlandı: {dev}")
-
-    sh(f"mkswap {dev} 2>/dev/null")
-    prio = max(1, 10 - cnt_before)
-    r2 = sh(f"swapon -p {prio} {dev} 2>&1")
-    if r2.returncode != 0:
-        err = r2.stdout.decode()[:150]
-        _panel_log(f"[Panel] ⚠️  swapon {dev} başarısız: {err}")
-        sh(f"nbd-client -d {dev} 2>/dev/null")
-        stop_ev.set()
-        with _nbd_lock:
-            _nbd_nodes.pop(node_id, None)
-        return False
-
-    with _nbd_lock:
-        _nbd_nodes[node_id]["connected"] = True
-        _nbd_nodes[node_id]["stop"]      = stop_ev
-
-    cnt = nbd_connected_count()
-    swp = psutil.swap_memory()
-    msg2 = (f"🔗 NBD ✅ {node_id}: {dev} (prio:{prio}) | "
-            f"Swap:{swp.total//1024//1024}MB | {cnt} düğüm")
-    print(f"  [nbd] {msg2}")
-    _panel_log(f"[Panel] {msg2}")
-
-    try:
-        _ur.urlopen(
-            _ur.Request(
-                f"http://localhost:{PORT}/api/internal/nbd_status",
-                data=json.dumps({
-                    "nbd_connected": True, "host": host,
-                    "node_id": node_id, "dev": dev,
-                }).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            ),
-            timeout=3,
-        )
-    except:
-        pass
-    return True
-
-
-def _connect_node_loop(host: str, node_id: str):
-    import random
-    time.sleep(random.uniform(0.5, 2.5))
-    attempt = 0
-    while True:
-        attempt += 1
-        if connect_worker_nbd(host, node_id):
-            return
-        wait = min(120, 30 * attempt)   # v9.6: daha seyrek tekrar (30s * attempt)
-        print(f"  [nbd] {node_id} NBD bağlanamadı (#{attempt}), {wait}sn sonra tekrar...")
-        _panel_log(f"[Panel] ℹ️  NBD {node_id} #{attempt} — {wait}sn sonra tekrar (MC çalışmaya devam ediyor)")
-        time.sleep(wait)
-
-
-def _ensure_main_tools():
-    import shutil as _s
-    missing = [t for t in ["nbd-client"] if not _s.which(t)]
-    if missing:
-        sh("apt-get update -qq 2>/dev/null && "
-           "DEBIAN_FRONTEND=noninteractive apt-get install -y "
-           f"--no-install-recommends {' '.join(missing)} 2>/dev/null")
-    _panel_log("[Panel] ⚙️  Ana sunucu araçları kontrol edildi")
-
-
-def try_connect_all_workers():
-    _ensure_main_tools()
-
-    print("  [worker] Panel bekleniyor...")
-    for _ in range(60):
-        try:
-            _ur.urlopen(f"http://localhost:{PORT}/", timeout=2)
-            break
-        except:
-            time.sleep(1)
-
-    seen = set()
-
-    env_hosts = [h.strip() for h in
-                 os.environ.get("WORKER_HOST", "").split(",") if h.strip()]
-    for host in env_hosts:
-        nid = host.replace(".trycloudflare.com", "")
-        seen.add(host)
-        threading.Thread(target=_connect_node_loop,
-                         args=(host, nid), daemon=True).start()
-
-    print("  [worker] Yeni düğümler için polling (sonsuz)...")
-    while True:
-        try:
-            resp  = _ur.urlopen(f"http://localhost:{PORT}/api/worker/status", timeout=5)
-            nodes = json.loads(resp.read()).get("nodes", [])
-            for node in nodes:
-                host = node.get("host", "")
-                nid  = node.get("node_id", host)
-                if host and host not in seen:
-                    seen.add(host)
-                    print(f"  [worker] Yeni düğüm: {nid}")
-                    threading.Thread(target=_connect_node_loop,
-                                     args=(host, nid), daemon=True).start()
-        except:
-            pass
-        time.sleep(5)
-
-
-def _wait_for_support_nodes():
-    """
-    FIX v9.6: MIN_SUPPORT_NODES=0 ise anında geçer.
-    MC NBD olmadan da başlar.
-    """
-    if MIN_SUPPORT_NODES == 0:
-        swp = psutil.swap_memory()
-        msg = (f"✅ NBD zorunluluğu yok (MIN=0) — MC hemen başlatılıyor! "
-               f"Swap:{swp.total//1024//1024}MB")
-        print(f"\n  {msg}\n")
-        _panel_log(f"[Sistem] {msg}")
-        return
-
-    print(f"\n{'═'*56}")
-    print(f"  ⏳ MC başlamadan önce {MIN_SUPPORT_NODES} destek düğümü bekleniyor...")
-    print(f"{'═'*56}\n")
-    _panel_log(
-        f"[Sistem] ⏳ {MIN_SUPPORT_NODES} destek düğümü bekleniyor..."
-    )
-
-    last_log = 0
-    start    = time.time()
-    while True:
-        cnt = nbd_connected_count()
-        if cnt >= MIN_SUPPORT_NODES:
-            swp = psutil.swap_memory()
-            msg = (
-                f"✅ {cnt}/{MIN_SUPPORT_NODES} destek düğümü hazır! "
-                f"Swap:{swp.total//1024//1024}MB — MC başlatılıyor!"
-            )
-            print(f"\n  {msg}\n")
-            _panel_log(f"[Sistem] {msg}")
-            return
-        now = time.time()
-        if now - last_log >= 20:
-            swp     = psutil.swap_memory()
-            elapsed = int(now - start)
-            msg = (
-                f"[Sistem] ⏳ {cnt}/{MIN_SUPPORT_NODES} düğüm | "
-                f"Swap:{swp.total//1024//1024}MB | {elapsed}sn"
-            )
-            print(f"  {msg}")
-            _panel_log(msg)
-            last_log = now
-        time.sleep(3)
-
+# ─────────────────────────────────────────────
+#  ANA SUNUCU — MC başlatma
+# ─────────────────────────────────────────────
 
 def start_panel():
     print(f"\n🚀 Panel :{PORT} başlatılıyor...")
@@ -766,414 +203,100 @@ def start_panel():
 
 
 def auto_start_sequence():
-    time.sleep(3)
-    _panel_log("[Sistem] 🟢 v9.6 hazır — MC başlatma sırası başlıyor...")
-
-    _wait_for_support_nodes()   # MIN=0 ise anında geçer
-
+    time.sleep(4)
+    _panel_log("[Sistem] 🟢 v10.0 başladı — MC başlatılıyor...")
     try:
-        _ur.urlopen(
-            _ur.Request(
-                f"http://localhost:{PORT}/api/start",
-                data=json.dumps({"_internal": True}).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            ),
-            timeout=10,
-        )
+        _ur.urlopen(_ur.Request(
+            f"http://localhost:{PORT}/api/start",
+            data=json.dumps({"_internal": True}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        ), timeout=10)
         print("  ✅ MC başlatma komutu gönderildi")
     except Exception as e:
         print(f"  ⚠️  MC start hatası: {e}")
 
     if wait_port(MC_PORT, 300):
         print("  ✅ MC Server hazır!")
+        _panel_log("[Sistem] ✅ MC Server oyuncuları bekliyor!")
     else:
         print("  ⚠️  MC port timeout (300sn)")
-
     _start_mc_tunnel()
 
 
 def _start_mc_tunnel():
     log = "/tmp/cf_mc.log"
     subprocess.Popen(
-        ["cloudflared", "tunnel",
-         "--url", f"tcp://localhost:{MC_PORT}",
+        ["cloudflared", "tunnel", "--url", f"tcp://localhost:{MC_PORT}",
          "--no-autoupdate", "--loglevel", "info"],
         stdout=open(log, "w"), stderr=subprocess.STDOUT,
     )
     for _ in range(120):
         try:
-            urls = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com",
-                              open(log).read())
+            urls = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", open(log).read())
             if urls:
                 url  = urls[0]
                 host = url.replace("https://", "")
                 print(f"\n  ✅ MC Tüneli: {host}\n")
                 try:
-                    _ur.urlopen(
-                        _ur.Request(
-                            f"http://localhost:{PORT}/api/internal/tunnel",
-                            data=json.dumps({"url": url, "host": host}).encode(),
-                            headers={"Content-Type": "application/json"},
-                            method="POST",
-                        ),
-                        timeout=3,
-                    )
-                except:
-                    pass
+                    _ur.urlopen(_ur.Request(
+                        f"http://localhost:{PORT}/api/internal/tunnel",
+                        data=json.dumps({"url": url, "host": host}).encode(),
+                        headers={"Content-Type": "application/json"}, method="POST",
+                    ), timeout=3)
+                except: pass
                 return
-        except:
-            pass
+        except: pass
         time.sleep(0.5)
 
 
-# ══════════════════════════════════════════════════════════════
-#  DESTEK SUNUCUSU
-# ══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
+#  AGENT MODU (eski destek sunucusu yerine)
+# ─────────────────────────────────────────────
 
-def support_install_tools():
-    import shutil as _s
-    missing = [t for t in ["nbd-server", "nbd-client", "socat"]
-               if not _s.which(t)]
-    if missing:
-        sh(
-            "apt-get update -qq 2>/dev/null && "
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
-            f"--no-install-recommends {' '.join(missing)} 2>/dev/null"
-        )
-        print(f"  [destek] ✅ Kuruldu: {', '.join(missing)}")
-    return False
-
-
-def support_create_disk():
-    nbd_gb = calc_nbd_gb()
-    nbd_mb = int(nbd_gb * 1024)
-    if nbd_gb < 0.5:
-        return 0.0
-    if os.path.exists(SUPPORT_NBD_FILE):
-        existing = os.path.getsize(SUPPORT_NBD_FILE) / 1024**3
-        if existing >= nbd_gb * 0.85:
-            print(f"  [destek] ✅ NBD disk: {existing:.1f}GB (mevcut)")
-            return existing
-        try:
-            os.remove(SUPPORT_NBD_FILE)
-        except:
-            pass
-    r = sh(f"fallocate -l {nbd_mb}M {SUPPORT_NBD_FILE}")
-    if r.returncode != 0:
-        for i in range(nbd_mb // 512):
-            if read_actual_disk_used_gb() > RENDER_DISK_LIMIT_GB - 3.0:
-                break
-            sh(f"dd if=/dev/zero of={SUPPORT_NBD_FILE} "
-               f"bs=512M count=1 seek={i} conv=notrunc 2>/dev/null")
-    actual = (
-        os.path.getsize(SUPPORT_NBD_FILE) / 1024**3
-        if os.path.exists(SUPPORT_NBD_FILE) else 0.0
-    )
-    if actual > 0:
-        print(f"  [destek] ✅ NBD disk: {actual:.1f}GB")
-    return actual
-
-
-def support_start_nbd(disk_gb):
-    support_install_tools()
-    for mp in ["/sbin/modprobe", "/usr/sbin/modprobe", "modprobe"]:
-        if sh(f"{mp} nbd max_part=0 2>/dev/null").returncode == 0:
-            break
-    for i in range(4):
-        dp = f"/dev/nbd{i}"
-        if not os.path.exists(dp):
-            sh(f"mknod {dp} b 43 {i} 2>/dev/null")
-    os.makedirs("/etc/nbd-server", exist_ok=True)
-    cfg = f"[generic]\n    port = {NBD_SERVER_PORT}\n    allowlist = true\n"
-    if disk_gb > 0 and os.path.exists(SUPPORT_NBD_FILE):
-        cfg += f"\n[disk]\n    exportname = {SUPPORT_NBD_FILE}\n    readonly = false\n"
-    open("/etc/nbd-server/config", "w").write(cfg)
-    proc = subprocess.Popen(
-        ["nbd-server", "-C", "/etc/nbd-server/config"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    time.sleep(2)
-    if proc.poll() is None:
-        print(f"  [destek] ✅ nbd-server (:{NBD_SERVER_PORT})")
-        return True
-    import shutil as _s
-    if _s.which("socat") and os.path.exists(SUPPORT_NBD_FILE):
-        subprocess.Popen(
-            ["socat",
-             f"TCP-LISTEN:{NBD_SERVER_PORT},reuseaddr,fork",
-             f"FILE:{SUPPORT_NBD_FILE},rdwr"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-        time.sleep(1)
-        print(f"  [destek] ✅ socat fallback (:{NBD_SERVER_PORT})")
-        return True
-    return False
-
-
-def support_start_tunnel(disk_gb):
-    log = "/tmp/cf_support.log"
-    print("  [destek] 🌐 Cloudflare HTTP tüneli açılıyor...")
-    subprocess.Popen(
-        ["cloudflared", "tunnel",
-         "--url", f"http://localhost:{WS_BRIDGE_PORT}",
-         "--no-autoupdate", "--loglevel", "info"],
-        stdout=open(log, "w"), stderr=subprocess.STDOUT,
-    )
-    for _ in range(240):
-        try:
-            urls = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com",
-                              open(log).read())
-            if urls:
-                url  = urls[0]
-                host = url.replace("https://", "")
-                print(f"\n  [destek] ✅ Tünel: {host}\n")
-                threading.Thread(target=_support_register_loop,
-                                 args=(url, host, disk_gb), daemon=True).start()
-                threading.Thread(target=_support_heartbeat,
-                                 args=(url, host, disk_gb), daemon=True).start()
-                return url
-        except:
-            pass
-        time.sleep(0.5)
-    print("  [destek] ⚠️  Tünel URL'si alınamadı")
-    return ""
-
-
-def _support_register_loop(url, host, disk_gb):
-    payload = json.dumps({
-        "worker_host":   host,
-        "worker_url":    url,
-        "nbd_gb":        round(disk_gb, 1),
-        "node_id":       SUPPORT_NODE_ID,
-        "ram_limit_mb":  CONTAINER_RAM_MB,
-        "disk_limit_gb": RENDER_DISK_LIMIT_GB,
-    }).encode()
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            _ur.urlopen(
-                _ur.Request(
-                    f"{MAIN_SERVER_URL}/api/worker/register",
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                ),
-                timeout=20,
-            )
-            print(f"  [destek] ✅ Kayıt başarılı (deneme #{attempt})")
-            return
-        except Exception as e:
-            print(f"  [destek] ⚠️  Kayıt #{attempt}: {e} — 30sn sonra...")
-            time.sleep(30)
-
-
-def _support_heartbeat(url, host, disk_gb):
-    while True:
-        time.sleep(25)
-        try:
-            try:
-                vmrss = int([l for l in open("/proc/self/status")
-                             if l.startswith("VmRSS:")][0].split()[1])
-                rss_mb = vmrss // 1024
-            except:
-                rss_mb = 0
-            data = json.dumps({
-                "node_id":       SUPPORT_NODE_ID,
-                "worker_host":   host,
-                "worker_url":    url,
-                "nbd_gb":        round(disk_gb, 1),
-                "rss_mb":        rss_mb,
-                "disk_used_gb":  round(read_actual_disk_used_gb(), 1),
-                "ram_limit_mb":  CONTAINER_RAM_MB,
-                "disk_limit_gb": RENDER_DISK_LIMIT_GB,
-            }).encode()
-            _ur.urlopen(
-                _ur.Request(
-                    f"{MAIN_SERVER_URL}/api/worker/heartbeat",
-                    data=data,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                ),
-                timeout=10,
-            )
-        except:
-            pass
-
-
-def _support_ram_watchdog():
-    while True:
-        time.sleep(8)
-        try:
-            vmrss = int([l for l in open("/proc/self/status")
-                         if l.startswith("VmRSS:")][0].split()[1])
-            pct = vmrss / 1024 / CONTAINER_RAM_MB * 100
-            if pct > 95:
-                w("/proc/sys/vm/drop_caches", "3")
-            elif pct > 90:
-                w("/proc/sys/vm/drop_caches", "1")
-        except:
-            pass
-
-
-def run_support_mode():
-    from flask import Flask, jsonify
+def run_agent_mode():
+    agent_path = "/app/agent.py"
+    ram_cache_mb = max(200, CONTAINER_RAM_MB - 150)
 
     print(f"\n{'═'*56}")
-    print(f"  🔵 DESTEK MODU v9.6")
+    print(f"  🔵 AGENT MODU v10.0")
     print(f"  Ana sunucu : {MAIN_SERVER_URL}")
-    print(f"  Node ID    : {SUPPORT_NODE_ID}")
+    print(f"  RAM Cache  : {ram_cache_mb}MB")
     print(f"{'═'*56}\n")
 
-    disk_gb = support_create_disk()
-    support_start_nbd(disk_gb)
-    support_start_ws_bridge()
-    threading.Thread(target=support_start_tunnel,
-                     args=(disk_gb,), daemon=True).start()
-    threading.Thread(target=_support_ram_watchdog, daemon=True).start()
+    if not os.path.exists(agent_path):
+        print("  [agent] ⚠️  /app/agent.py bulunamadı!")
+        # Basit sağlık sunucusu
+        from flask import Flask, jsonify
+        app2 = Flask(__name__)
+        @app2.route("/"); @app2.route("/health")
+        def h(): return jsonify({"status":"ok","mode":"agent-stub"})
+        app2.run(host="0.0.0.0", port=PORT, debug=False)
+        return
 
-    support_app = Flask(__name__)
-
-    @support_app.route("/")
-    @support_app.route("/health")
-    def health():
-        try:
-            vmrss = int([l for l in open("/proc/self/status")
-                         if l.startswith("VmRSS:")][0].split()[1])
-            rss_mb = vmrss // 1024
-        except:
-            rss_mb = 0
-        used     = read_actual_disk_used_gb()
-        ram_pct  = min(100, int(rss_mb / CONTAINER_RAM_MB * 100))
-        disk_pct = min(100, int(used / RENDER_DISK_LIMIT_GB * 100))
-        rc = "#ff4757" if ram_pct  > 85 else "#00e5ff"
-        dc = "#ff4757" if disk_pct > 85 else "#00e5ff"
-        return SUPPORT_HTML.format(
-            main_url=MAIN_SERVER_URL,
-            node_id=SUPPORT_NODE_ID,
-            disk_gb=f"{disk_gb:.1f}",
-            rss_mb=rss_mb,
-            ram_limit=CONTAINER_RAM_MB,
-            ram_pct=ram_pct,
-            ram_color=rc,
-            disk_used=round(used, 1),
-            disk_limit=RENDER_DISK_LIMIT_GB,
-            disk_pct=disk_pct,
-            disk_color=dc,
-            wst_port=WS_BRIDGE_PORT,
-            nbd_port=NBD_SERVER_PORT,
-        )
-
-    @support_app.route("/api/worker/status")
-    def api_status():
-        try:
-            vmrss = int([l for l in open("/proc/self/status")
-                         if l.startswith("VmRSS:")][0].split()[1])
-            rss_mb = vmrss // 1024
-        except:
-            rss_mb = 0
-        return jsonify({
-            "mode":          "support",
-            "node_id":       SUPPORT_NODE_ID,
-            "disk_gb":       round(disk_gb, 1),
-            "rss_mb":        rss_mb,
-            "ram_limit_mb":  CONTAINER_RAM_MB,
-            "disk_used_gb":  round(read_actual_disk_used_gb(), 1),
-            "disk_limit_gb": RENDER_DISK_LIMIT_GB,
-        })
-
-    print(f"[Destek] Flask :{PORT} başlatılıyor...")
-    support_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    env = {
+        **os.environ,
+        "PORT":         str(PORT),
+        "MAIN_URL":     MAIN_SERVER_URL,
+        "RAM_CACHE_MB": str(ram_cache_mb),
+    }
+    proc = subprocess.Popen([sys.executable, agent_path], env=env)
+    proc.wait()
 
 
-SUPPORT_HTML = """<!DOCTYPE html>
-<html lang="tr"><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="8">
-<title>Destek Sunucusu v9.6</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#0a0b12;color:#eef0f8;font-family:'Segoe UI',sans-serif;
-      min-height:100vh;display:flex;align-items:center;justify-content:center}}
-.card{{background:#0f1120;border:1px solid rgba(124,106,255,.3);
-       border-radius:16px;padding:28px 32px;max-width:520px;width:92%;text-align:center}}
-h1{{font-size:19px;font-weight:700;margin-bottom:4px;color:#7c6aff}}
-.sub{{font-size:11px;color:#8892a4;margin-bottom:16px}}
-.grid{{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-bottom:14px}}
-.s{{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);
-    border-radius:10px;padding:12px 10px}}
-.sv{{font-size:17px;font-weight:700;font-family:monospace}}
-.sl{{font-size:10px;color:#8892a4;margin-top:2px}}
-.bw{{background:rgba(255,255,255,.06);border-radius:4px;height:4px;
-     margin-top:5px;overflow:hidden}}
-.b{{height:100%;border-radius:4px}}
-.lr{{display:flex;justify-content:space-between;font-size:10px;
-     color:#8892a4;margin-top:4px}}
-.badge{{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;
-        border-radius:20px;font-size:10px;font-weight:700;
-        background:rgba(124,106,255,.12);border:1px solid rgba(124,106,255,.3);
-        color:#7c6aff;margin-bottom:13px}}
-.dot{{width:7px;height:7px;border-radius:50%;background:#7c6aff;
-      box-shadow:0 0 5px #7c6aff;animation:blink 1.5s infinite}}
-@keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
-.arch{{font-size:10px;color:#8892a4;background:rgba(255,255,255,.03);
-       border-radius:6px;padding:8px 10px;text-align:left;
-       margin-bottom:10px;line-height:1.8}}
-.arch span{{color:#00e5ff;font-family:monospace}}
-.link{{display:inline-block;margin-top:6px;padding:9px 22px;
-       background:linear-gradient(135deg,#7c6aff,#00e5ff);
-       color:#000;border-radius:8px;font-weight:700;
-       text-decoration:none;font-size:12px}}
-</style></head><body>
-<div class="card">
-  <div style="font-size:40px;margin-bottom:8px">&#128309;</div>
-  <div class="badge"><div class="dot"></div> DESTEK MODU AKTIF - v9.6</div>
-  <h1>Destek Sunucusu</h1>
-  <div class="sub">Node: {node_id} - 8sn sonra yenilenir</div>
-  <div class="grid">
-    <div class="s">
-      <div class="sv" style="color:{ram_color}">{rss_mb}MB</div>
-      <div class="sl">RAM Kullanimi</div>
-      <div class="bw"><div class="b" style="width:{ram_pct}%;background:{ram_color}"></div></div>
-      <div class="lr"><span>%{ram_pct}</span><span>/{ram_limit}MB</span></div>
-    </div>
-    <div class="s">
-      <div class="sv" style="color:{disk_color}">{disk_used}GB</div>
-      <div class="sl">Disk Kullanimi</div>
-      <div class="bw"><div class="b" style="width:{disk_pct}%;background:{disk_color}"></div></div>
-      <div class="lr"><span>%{disk_pct}</span><span>/{disk_limit}GB</span></div>
-    </div>
-    <div class="s" style="grid-column:1/-1">
-      <div class="sv" style="color:#00e5ff">{disk_gb}GB</div>
-      <div class="sl">Paylasilan NBD Diski</div>
-    </div>
-  </div>
-  <div class="arch">
-    nbd-server :<span>{nbd_port}</span>
-    -&gt; Python WS Bridge :<span>{wst_port}</span>
-    -&gt; cloudflared HTTPS -&gt; Ana Sunucu
-  </div>
-  <a class="link" href="{main_url}" target="_blank">Ana Sunucuya Git</a>
-</div></body></html>"""
-
-
-# ══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
 #  BAŞLATMA
-# ══════════════════════════════════════════════════════════════
-mode = "main" if IS_MAIN else "support"
-optimize_all(mode)
+# ─────────────────────────────────────────────
+
+optimize_all("main" if IS_MAIN else "agent")
 
 if IS_MAIN:
     print(f"\n{'━'*56}")
-    print(f"  ANA SUNUCU v9.6 — Panel :{PORT}")
-    print(f"  MC, NBD beklemeden HEMEN başlar (MIN=0)")
-    print(f"  NBD düğümleri bağlandıkça arka planda swap eklenir")
+    print(f"  ANA SUNUCU v10.0 — Panel :{PORT}")
+    print(f"  NBD YOK → Resource Pool (HTTP) aktif")
+    print(f"  Agent'lar bağlandıkça: RAM cache + disk store + proxy devreye girer")
     print(f"{'━'*56}\n")
     panel_proc = start_panel()
-    threading.Thread(target=try_connect_all_workers, daemon=True).start()
     threading.Thread(target=auto_start_sequence, daemon=True).start()
     panel_proc.wait()
 else:
-    run_support_mode()
+    run_agent_mode()
