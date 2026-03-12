@@ -309,7 +309,8 @@ def _setup_swap():
         swp = psutil.swap_memory()
         disk = psutil.disk_usage("/")
         free_gb = disk.free / 1024 / 1024 / 1024
-        swap_gb = min(64, int(free_gb * 0.80))
+        swap_gb = min(8, int(free_gb * 0.50))
+        swap_gb = max(2, swap_gb)
         swap_mb = swap_gb * 1024
 
         if swp.total >= swap_mb * 1024 * 1024 * 0.9:
