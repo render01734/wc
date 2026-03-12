@@ -140,37 +140,24 @@ def bypass_cgroups():
     print(f"  ✅ {n} cgroup limiti kaldırıldı")
 
 
-def _find_free_loop():
-    """losetup -f ile ilk boş loop device'ı bul."""
-    r = sh("losetup -f 2>/dev/null")
-    if r.returncode == 0:
-        dev = r.stdout.decode().strip()
-        if dev.startswith("/dev/loop"):
-            return dev
-    # Fallback: /dev/loop2..7 içinde boş olanı dene
-    for i in range(2, 8):
-        dev = f"/dev/loop{i}"
-        r = sh(f"losetup {dev} 2>/dev/null")
-        if b"No such" not in r.stderr and b"not a block" not in r.stderr:
-            # Zaten kullanılıyor, sonrakine bak
-            continue
-        if sh(f"losetup -j {dev} 2>/dev/null").stdout.strip() == b"":
-            return dev  # Boş
-    return ""
-
-
-def _make_loop_swap(sf: str, sw_mb: int, priority: int = 0) -> bool:
+def _loop_swap(sf: str, sw_mb: int, priority: int = 0) -> bool:
     """
-    Docker overlay2'de doğrudan swapon çalışmaz.
-    Yöntem: fallocate → losetup -f (boş device bul) → mkswap → swapon
+    Garantili loop-device swap.
+    Yöntem:
+      1. modprobe loop (kernel modülü yükle — yoksa loop device olmaz)
+      2. mknod /dev/loop0..7 (device node yoksa oluştur)
+      3. losetup --find --show <dosya>  → atomik: boş device bul VE bağla
+      4. mkswap + swapon
     """
-    # Eski kaydı temizle
+    # Mevcut swap/loop temizle
     sh(f"swapoff {sf} 2>/dev/null")
+    for i in range(8):
+        sh(f"swapoff /dev/loop{i} 2>/dev/null")
+
+    # Dosyayı sil + yeniden oluştur
     try:
         if os.path.exists(sf): os.remove(sf)
     except: pass
-
-    # Dosya oluştur
     r = sh(f"fallocate -l {sw_mb}M {sf}")
     if r.returncode != 0:
         r = sh(f"dd if=/dev/zero of={sf} bs=64M count={max(1,sw_mb//64)} status=none")
@@ -178,26 +165,43 @@ def _make_loop_swap(sf: str, sw_mb: int, priority: int = 0) -> bool:
         return False
     sh(f"chmod 600 {sf}")
 
-    # Boş loop device bul
-    loop_dev = _find_free_loop()
-    if loop_dev:
-        sh(f"losetup -d {loop_dev} 2>/dev/null")
-        if sh(f"losetup {loop_dev} {sf}").returncode == 0:
-            target = loop_dev
-        else:
-            target = sf
-    else:
-        target = sf
+    # Loop modülü yükle
+    sh("modprobe loop 2>/dev/null")
+    sh("modprobe loop max_loop=8 2>/dev/null")
 
-    sh(f"mkswap -f {target}")
-    r = sh(f"swapon -p {priority} {target}")
+    # /dev/loop0..7 node yoksa oluştur
+    for i in range(8):
+        dev = f"/dev/loop{i}"
+        if not os.path.exists(dev):
+            sh(f"mknod {dev} b 7 {i} 2>/dev/null")
+
+    # losetup --find --show: boş device'ı otomatik bulur VE bağlar, path döner
+    r = sh(f"losetup --find --show {sf} 2>/dev/null")
     if r.returncode == 0:
-        print(f"  ✅ Disk Swap: {sw_mb}MB ({target})")
-        return True
-    err = r.stderr.decode().strip()[:80]
-    print(f"  ⚠️  swapon başarısız ({target}): {err}")
-    if loop_dev and target == loop_dev:
+        loop_dev = r.stdout.decode().strip()
+        print(f"  [swap] loop device: {loop_dev}")
+    else:
+        # Fallback: loop0'ı zorla temizle ve kullan
+        sh("losetup -d /dev/loop0 2>/dev/null")
+        r2 = sh(f"losetup /dev/loop0 {sf} 2>/dev/null")
+        loop_dev = "/dev/loop0" if r2.returncode == 0 else ""
+
+    if loop_dev:
+        sh(f"mkswap -f {loop_dev}")
+        r3 = sh(f"swapon -p {priority} {loop_dev}")
+        if r3.returncode == 0:
+            print(f"  ✅ Disk Swap: {sw_mb}MB ({loop_dev})")
+            return True
         sh(f"losetup -d {loop_dev} 2>/dev/null")
+
+    # Son çare: tmpfs-üzerinde değil dosya üzerinde dene (bazı overlay sürümlerinde çalışır)
+    sh(f"mkswap -f {sf}")
+    r4 = sh(f"swapon -p {priority} {sf}")
+    if r4.returncode == 0:
+        print(f"  ✅ Disk Swap: {sw_mb}MB (doğrudan dosya)")
+        return True
+
+    print(f"  ⚠️  Disk Swap başarısız ({sw_mb}MB): {r4.stderr.decode()[:60]}")
     return False
 
 
@@ -216,16 +220,14 @@ def setup_swap():
     if not zram_ok:
         print("  ⚠️  zram başlatılamadı")
 
-    # ── 2. Disk Swap ─────────────────────────────────────────
-    # Docker overlay2'de doğrudan swapon çalışmaz → loop device şart.
-    # losetup -f ile ilk BOŞ loop device seçilir (loop0 meşgul olabilir).
+    # ── 2. Disk Swap (loop-device zorunlu) ───────────────────
     swapped = False
     for sw_mb in [4096, 2048, 1024, 512]:
-        if _make_loop_swap("/swapfile", sw_mb, priority=0):
+        if _loop_swap("/swapfile", sw_mb, priority=0):
             swapped = True
             break
     if not swapped:
-        print("  ⚠️  Disk swap kurulamadı — yalnızca zram aktif")
+        print("  ⚠️  Disk swap kurulamadı")
 
     for p, v in [
         ("/proc/sys/vm/swappiness",         "100"),

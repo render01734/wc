@@ -189,88 +189,17 @@ def _pool_summary() -> dict:
     }
 
 
-
-def _find_free_loop() -> str:
-    """İlk boş /dev/loopN döndür. loop0 Docker overlay tarafından kullanılıyor olabilir."""
-    r = subprocess.run("losetup -f 2>/dev/null", shell=True, capture_output=True)
-    dev = r.stdout.decode().strip()
-    if r.returncode == 0 and dev.startswith("/dev/loop"):
-        return dev
-    for i in range(2, 8):
-        d = f"/dev/loop{i}"
-        occupied = subprocess.run(
-            f"losetup {d} 2>&1", shell=True, capture_output=True
-        ).stdout.decode()
-        if "not a block" in occupied or "No such" in occupied:
-            return d
-    return ""
-
-
-def _setup_loop_swap(path: str, size_mb: int, priority: int = 0, tag: str = "Swap") -> bool:
-    """
-    Docker overlay2: swapon /dosya çalışmaz.
-    Düzeltme: losetup -f → boş device bul → mkswap → swapon
-    """
-    import shutil as _sh
-    # Temizle
-    subprocess.run(f"swapoff {path} 2>/dev/null", shell=True)
-    try:
-        p = Path(path)
-        if p.exists(): p.unlink()
-    except: pass
-
-    # Dosya oluştur
-    r = subprocess.run(f"fallocate -l {size_mb}M {path} 2>/dev/null",
-                       shell=True, capture_output=True)
-    if r.returncode != 0:
-        subprocess.run(
-            f"dd if=/dev/zero of={path} bs=64M count={max(1, size_mb//64)} status=none",
-            shell=True, capture_output=True
-        )
-
-    p = Path(path)
-    if not p.exists() or p.stat().st_size < size_mb * 1024 * 700:
-        log(f"[{tag}] ⚠️  Swap dosyası oluşturulamadı ({size_mb}MB)")
-        return False
-
-    subprocess.run(f"chmod 600 {path}", shell=True)
-
-    # Boş loop device bul
-    loop_dev = _find_free_loop()
-    if loop_dev:
-        subprocess.run(f"losetup -d {loop_dev} 2>/dev/null", shell=True)
-        ok = subprocess.run(f"losetup {loop_dev} {path}", shell=True, capture_output=True)
-        target = loop_dev if ok.returncode == 0 else path
-    else:
-        target = path
-
-    subprocess.run(f"mkswap -f {target} 2>/dev/null", shell=True, capture_output=True)
-    r = subprocess.run(f"swapon -p {priority} {target} 2>/dev/null",
-                       shell=True, capture_output=True)
-
-    if r.returncode == 0:
-        import psutil
-        sw = psutil.swap_memory()
-        log(f"[{tag}] ✅ Swap aktif: {size_mb}MB ({target}) | Toplam: {sw.total//1024//1024}MB")
-        return True
-    else:
-        err = r.stderr.decode()[:80]
-        log(f"[{tag}] ⚠️  swapon başarısız ({target}): {err}")
-        if loop_dev and target == loop_dev:
-            subprocess.run(f"losetup -d {loop_dev} 2>/dev/null", shell=True)
-        return False
-
-
 def _auto_archive_old_regions(older_than_days: int = 0):
     """
-    Region dosyalarını agent disk deposuna yükle → yerel disk açılır →
-    açılan diskten swap oluşturulur.
-    older_than_days=0 → yaş filtresi yok, tüm bölgeler gönderilir.
+    Ana sunucudaki eski region dosyalarını en fazla boş diski olan
+    agent'a yükler. Ardından açılan disk alanını swap'a dönüştürür.
+    resource_pool._most_disk() + store_region() kullanır.
     """
     import shutil as _sh
     best_agent = _pool._most_disk()
     if not best_agent:
-        return 0, 0.0   # Agent yok
+        return 0, 0.0
+    # Disk boş olsa bile arşivle — Agent diskini kullanmak Swap için yer açar
 
     archived = 0
     freed_mb = 0
@@ -305,7 +234,7 @@ def _auto_archive_old_regions(older_than_days: int = 0):
         try:
             if Path(sf2).exists(): Path(sf2).unlink()
         except: pass
-        _setup_loop_swap(sf2, sw_mb, priority=1, tag="Pool")
+        _loop_swap_panel(sf2, sw_mb, priority=1, tag="Pool")
         log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB) → swap: {sw_mb}MB")
 
     return archived, freed_mb
@@ -313,33 +242,32 @@ def _auto_archive_old_regions(older_than_days: int = 0):
 
 def _pool_auto_optimize():
     """
-    1) Agent bağlanana kadar bekle (maks 90sn)
-    2) Hemen loop-device swap kur (3GB)
-    3) Hemen region arşivleme başlat
-    4) Sonra her 300sn tekrar
+    1) Agent gelene kadar bekle (maks 90sn)
+    2) Hemen swap kur (modprobe loop + losetup --find --show)
+    3) Region arşivle
+    4) Her 300sn tekrar
     """
-    # Agent bağlantısını bekle
     for _ in range(90):
         if _pool.agent_count() > 0:
             log(f"[Pool] ✅ {_pool.agent_count()} agent hazır → Swap + arşiv başlıyor")
             break
         time.sleep(1)
-    else:
-        log("[Pool] ⚠️  90sn içinde agent bağlanamadı")
-        return  # Tekrar denemek için tekrar çalışmasına izin ver
 
-    # Swap yok ise hemen kur
     import psutil as _psu2
     if _psu2.swap_memory().total < 512 * 1024 * 1024:
-        log("[Pool] 🔄 Swap yok → loop-device swap kuruluyor (3GB)...")
-        _setup_loop_swap("/swapfile2", 3072, priority=1, tag="Pool-Boot")
+        log("[Pool] 🔄 Swap yok → kurulum başlıyor (3GB)...")
+        ok = _loop_swap_panel("/swapfile2", 3072, priority=1, tag="Pool-Boot")
+        if not ok:
+            # Fallback: daha küçük
+            for sz in [1024, 512]:
+                if _loop_swap_panel("/swapfile2", sz, priority=1, tag="Pool-Boot"):
+                    break
 
-    # İlk arşivleme (acil — tüm regionlar)
     try:
-        res = _auto_archive_old_regions(older_than_days=0)
+        result = _auto_archive_old_regions(older_than_days=0)
+        if result:
+            log(f"[Pool] 📦 İlk arşiv: {result[0]} region, {result[1]:.0f}MB")
         socketio.emit("pool_update", _pool_summary())
-        if res:
-            log(f"[Pool] 📦 İlk arşiv: {res[0]} region, {res[1]:.0f}MB")
     except Exception as e:
         log(f"[Pool] ⚠️  İlk arşiv hatası: {e}")
 
@@ -394,13 +322,11 @@ def download_paper():
 def write_server_config():
     (MC_DIR / "eula.txt").write_text("eula=true\n")
     props = MC_DIR / "server.properties"
-    # Her başlatmada yeniden yaz — view-distance güncel kalsın
     props.write_text(
         f"server-port={MC_PORT}\nmax-players=20\nonline-mode=false\n"
         "gamemode=survival\ndifficulty=normal\nlevel-name=world\n"
         "motd=\\u00A7a\\u00A7lRender MC Server\n"
-        "view-distance=4\n"           # 8→4: startup chunk yükü %75 azalır
-        "simulation-distance=3\n"     # 6→3
+        "view-distance=4\nsimulation-distance=3\n"
         "spawn-protection=0\nallow-flight=true\n"
         "enable-rcon=false\nmax-tick-time=60000\nwhite-list=false\n"
         "enable-command-block=true\npvp=true\ngenerate-structures=true\n"
@@ -420,6 +346,64 @@ def write_server_config():
     )
 
 
+def _loop_swap_panel(sf: str, sw_mb: int, priority: int = 0, tag: str = "Swap") -> bool:
+    """
+    mc_panel.py içinden swap kurma.
+    main.py'deki _loop_swap ile aynı mantık:
+    modprobe loop → mknod → losetup --find --show → mkswap → swapon
+    """
+    subprocess.run(f"swapoff {sf} 2>/dev/null", shell=True)
+    for i in range(8):
+        subprocess.run(f"swapoff /dev/loop{i} 2>/dev/null", shell=True)
+    try:
+        p = Path(sf)
+        if p.exists(): p.unlink()
+    except: pass
+
+    r = subprocess.run(f"fallocate -l {sw_mb}M {sf}", shell=True, capture_output=True)
+    if r.returncode != 0:
+        subprocess.run(f"dd if=/dev/zero of={sf} bs=64M count={max(1,sw_mb//64)} status=none",
+                       shell=True, capture_output=True)
+
+    p = Path(sf)
+    if not p.exists() or p.stat().st_size < sw_mb * 1024 * 700:
+        log(f"[{tag}] ⚠️  Dosya oluşturulamadı ({sw_mb}MB)")
+        return False
+    subprocess.run(f"chmod 600 {sf}", shell=True)
+
+    # Kernel modülü + node'lar
+    subprocess.run("modprobe loop 2>/dev/null", shell=True)
+    for i in range(8):
+        dev = f"/dev/loop{i}"
+        if not Path(dev).exists():
+            subprocess.run(f"mknod {dev} b 7 {i} 2>/dev/null", shell=True)
+
+    # Atomik bul+bağla
+    r = subprocess.run(f"losetup --find --show {sf} 2>/dev/null",
+                       shell=True, capture_output=True)
+    loop_dev = r.stdout.decode().strip() if r.returncode == 0 else ""
+
+    if not loop_dev:
+        subprocess.run("losetup -d /dev/loop0 2>/dev/null", shell=True)
+        r2 = subprocess.run(f"losetup /dev/loop0 {sf} 2>/dev/null",
+                            shell=True, capture_output=True)
+        loop_dev = "/dev/loop0" if r2.returncode == 0 else ""
+
+    target = loop_dev if loop_dev else sf
+    subprocess.run(f"mkswap -f {target}", shell=True, capture_output=True)
+    r = subprocess.run(f"swapon -p {priority} {target}", shell=True, capture_output=True)
+    if r.returncode == 0:
+        import psutil
+        sw = psutil.swap_memory()
+        log(f"[{tag}] ✅ Swap aktif: {sw_mb}MB ({target}) | Toplam: {sw.total//1024//1024}MB")
+        return True
+    err = r.stderr.decode()[:80]
+    log(f"[{tag}] ⚠️  swapon başarısız ({target}): {err}")
+    if loop_dev:
+        subprocess.run(f"losetup -d {loop_dev} 2>/dev/null", shell=True)
+    return False
+
+
 def get_jvm_args():
     import psutil as _ps
     container_ram_mb = int(os.environ.get("CONTAINER_RAM_MB", "512"))
@@ -433,34 +417,28 @@ def get_jvm_args():
                     container_ram_mb = mb; break
         except: pass
 
-    swp      = _ps.swap_memory()
-    sw_mb    = int(swp.total / 1024 / 1024)
+    swp         = _ps.swap_memory()
+    sw_mb       = int(swp.total / 1024 / 1024)
     agent_count = _pool.agent_count()
 
-    # Render privileged: vm.overcommit_memory=1 → Kernel allocation'ı reddetmez.
-    # Paper MC 1.21 class loading için minimum 380MB heap gerekiyor.
-    # Swap olsa da olmasa da overcommit ile 400MB güvenle verilebilir —
-    # JVM sayfaları fiziksel RAM'e ancak gerçekten dokunulduğunda yükler.
+    # Paper MC 1.21 class-loading minimum: ~380MB heap.
+    # Swap varsa JVM agresif büyüyebilir; yoksa overcommit ile 400MB ver.
     if sw_mb >= 2048:
         xmx_mb = 600
     elif sw_mb >= 512:
         xmx_mb = 480
     else:
-        # Swap yok: overcommit varsa 400MB ver (OOM killer = son çare)
-        # Olmasa bile 380MB — 300MB kesinlikle yetersiz (class loading OOM)
-        xmx_mb = 400
+        xmx_mb = 400   # overcommit açık → OOM olmadan çalışır
 
     xms_mb = 32
 
     log(f"[Panel] 🧠 Container={container_ram_mb}MB Swap={sw_mb}MB Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
     return [
         "java", f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
-        # Non-heap sınırları — Paper 1.21 için optimize
-        "-XX:MaxMetaspaceSize=128m",       # 96→128: class loading OOM önlenir
+        "-XX:MaxMetaspaceSize=128m",
         "-XX:CompressedClassSpaceSize=32m",
         "-XX:ReservedCodeCacheSize=32m",
-        "-Xss320k",                        # Thread stack küçült
-        # G1GC
+        "-Xss320k",
         "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled",
         "-XX:MaxGCPauseMillis=200",
         "-XX:ConcGCThreads=1", "-XX:ParallelGCThreads=2",
@@ -474,7 +452,6 @@ def get_jvm_args():
         "-XX:+UseStringDeduplication",
         "-XX:+UseCompressedOops",
         "-XX:+OptimizeStringConcat",
-        # TieredStopAtLevel=1 KALDIRILDI — startup memory'i artırıyor
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8", "-Dcom.mojang.eula.agree=true",
         "-Xlog:disable",
