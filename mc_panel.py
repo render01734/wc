@@ -23,6 +23,18 @@ from pathlib import Path
 import eventlet
 eventlet.monkey_patch()
 
+# ── Render.com 512MB limiti — Python panel adres alanını sınırla ─────────────
+# Panel (Python) + JVM birlikte 512MB paylaşır.
+# Bu limit sadece Python process'e uygulanır (JVM ayrı subprocess).
+import resource as _resource
+try:
+    _PANEL_LIMIT = 480 * 1024 * 1024   # 480MB — 32MB buffer
+    _s, _h = _resource.getrlimit(_resource.RLIMIT_AS)
+    if _h == _resource.RLIM_INFINITY or _h > _PANEL_LIMIT:
+        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _PANEL_LIMIT))
+except Exception:
+    pass  # Bazı ortamlarda izin yok — devam et
+
 from flask import Flask, request, jsonify, send_file, abort, Response
 from flask_socketio import SocketIO, emit
 
@@ -168,10 +180,18 @@ def _build_userswap():
         log(f"[UserSwap] ⚠️  {e}")
         return False
 
+import gc as _gc_module
+
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
                     ping_timeout=60, ping_interval=25)
+
+@app.after_request
+def _gc_after_req(resp):
+    """Her response sonrası gen0 GC — panel RAM sürünmesini önle."""
+    _gc_module.collect(0)
+    return resp
 
 
 # ══════════════════════════════════════════════════════════════
@@ -236,31 +256,11 @@ def _tps_monitor():
 
 def _stdout_reader():
     global mc_process
-    _remap_done = False
-    _remap_in_progress = False
     while mc_process and mc_process.poll() is None:
         try:
             line = mc_process.stdout.readline()
-            if not line:
-                continue
-            txt = line.decode("utf-8", errors="replace")
-            log(txt)
-
-            # Remap aşaması tespiti
-            if "Remapping server" in txt and not _remap_in_progress:
-                _remap_in_progress = True
-                log("[Panel] 🔄 ReobfServer remapping başladı — UserSwap RAM'i karşılıyor...")
-
-            # Remap tamamlandı → cache'i agent diskine yedekle
-            if _remap_in_progress and not _remap_done:
-                if ("Applying patches" in txt or
-                    "Loading libraries" in txt or
-                    "[00:00:" in txt):  # Paper log başladı = remap bitti
-                    _remap_done = True
-                    _remap_in_progress = False
-                    log("[Panel] ✅ Remapping tamamlandı — cache agent disklere yedekleniyor...")
-                    threading.Thread(target=_save_remap_cache, daemon=True).start()
-
+            if line:
+                log(line.decode("utf-8", errors="replace"))
         except Exception:
             break
     server_state["status"] = "stopped"
@@ -321,92 +321,6 @@ def _pool_summary() -> dict:
             for a in s["agents"]
         ],
     }
-
-
-
-# ══════════════════════════════════════════════════════════════
-#  PAPER REMAP CACHE  — agent diskine yedekle / geri yükle
-# ══════════════════════════════════════════════════════════════
-# Paper MC ilk başlatmada server.jar'ı remap eder → cache/patched_*.jar
-# Bu ~400MB heap kullanır ve ~2dk sürer.
-# cache/ dosyaları agent diskinde saklanırsa sonraki başlatmalarda remap ATLANIR.
-
-PAPER_CACHE_DIR = MC_DIR / "cache"
-
-def _remap_cache_files():
-    """Mevcut remap cache dosyalarını listele."""
-    if not PAPER_CACHE_DIR.exists():
-        return []
-    return list(PAPER_CACHE_DIR.glob("patched_*.jar")) +            list(PAPER_CACHE_DIR.glob("bundler_*.jar")) +            list(PAPER_CACHE_DIR.glob("*.jar"))
-
-def _save_remap_cache():
-    """
-    Remap tamamlandıktan sonra cache/patched_*.jar dosyalarını
-    tüm agent'ların diskine yedekle.
-    """
-    files = _remap_cache_files()
-    if not files:
-        return 0
-    agents = _pool.get_agents()
-    if not agents:
-        return 0
-
-    saved = 0
-    import concurrent.futures as _cf
-    for f in files:
-        try:
-            data  = f.read_bytes()
-            fname = f.name
-            def _up_one(a, _d=data, _n=fname):
-                try: return a.file_upload("paper_cache", _n, _d)
-                except: return False
-            with _cf.ThreadPoolExecutor(max_workers=len(agents)) as ex:
-                results = list(ex.map(_up_one, agents))
-            if any(results):
-                n = sum(1 for r in results if r)
-                log(f"[Panel] 💾 Remap cache yedeklendi: {fname} → {n}/{len(agents)} agent "
-                    f"({len(data)//1024//1024}MB)")
-                saved += 1
-        except Exception as e:
-            log(f"[Panel] ⚠️  Remap cache yedek hatası: {f.name}: {e}")
-    return saved
-
-def _restore_remap_cache():
-    """
-    MC başlatılmadan önce agent'lardan remap cache'ini geri yükle.
-    Başarılı olursa remap aşaması tamamen ATLANIR → RAM spike yok.
-    """
-    agents = _pool.get_agents()
-    if not agents:
-        return False
-
-    PAPER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Agent'lardan paper_cache dosyalarını listele
-    restored = 0
-    for agent in agents:
-        try:
-            files = agent.file_list("paper_cache")
-            for fi in files:
-                fname = fi if isinstance(fi, str) else fi.get("name", "")
-                if not fname.endswith(".jar"):
-                    continue
-                dest = PAPER_CACHE_DIR / fname
-                if dest.exists() and dest.stat().st_size > 1024 * 1024:
-                    continue  # Zaten var — atla
-                data = agent.file_download("paper_cache", fname)
-                if data and len(data) > 1024 * 1024:
-                    dest.write_bytes(data)
-                    log(f"[Panel] ✅ Remap cache geri yüklendi: {fname} "
-                        f"({len(data)//1024//1024}MB) ← {agent.node_id}")
-                    restored += 1
-                    break  # 1 agenten alındı yeter
-        except Exception as e:
-            continue
-
-    if restored:
-        log(f"[Panel] 🚀 Remap cache hazır ({restored} dosya) — remapping ATLANACAK")
-    return restored > 0
 
 
 def _auto_archive_old_regions(older_than_days: int = 0):
@@ -843,7 +757,7 @@ def get_jvm_args():
         try:
             val = open(path).read().strip()
             if val not in ("max", "-1"):
-                mb = int(val) // 1024 // 1024
+                mb = min(512, int(val) // 1024 // 1024)
                 if 64 < mb < 65536:
                     container_ram_mb = mb; break
         except: pass
@@ -862,8 +776,12 @@ def get_jvm_args():
     #   Xmx=320 → RSS_JVM ≈ 250MB (aktif heap) + 220MB (swap'a taşan) → fiziksel ~480MB peak
     #   Peak 512MB'yi aşınca UserSwap devreye girer → dosyaya yazar, crash YOK
     #   Steady-state (GC sonrası): RSS ~380MB → güvenli
-    xmx_mb = 320   # UserSwap aktif → Paper 1.21 bootstrap için yeterli heap
-    xms_mb = 48    # Düşük başlangıç → JVM lazy expand eder
+    # 512MB bütçe: Python ~120MB + JVM Xmx + JVM meta/code/stack ~100MB ≤ 512
+    # UserSwap varsa JVM taşması dosyaya → Xmx=300 güvenli
+    # UserSwap yoksa: 512 - 120(py) - 100(jvm_overhead) - 20(buf) = 272MB
+    userswap_ok = os.path.exists(USERSWAP_SO)
+    xmx_mb = 300 if userswap_ok else 272
+    xms_mb = 48
 
     userswap_ok = os.path.exists(USERSWAP_SO)
     swap_label  = f"UserSwap(4GB)" if userswap_ok else "NoSwap"
@@ -930,17 +848,6 @@ def start_server():
             socketio.emit("server_status", server_state)
             return False, "Jar indirilemedi"
     write_server_config()
-
-    # ── Remap cache: agent diskinden geri yükle (remap'i atla) ──
-    if _pool.agent_count() > 0:
-        log("[Panel] 🔍 Agent'lardan remap cache kontrol ediliyor...")
-        if _restore_remap_cache():
-            log("[Panel] ✅ Remap cache hazır — Paper remapping ATLANABİLİR")
-        else:
-            log("[Panel] ℹ️  Remap cache yok — ilk başlatmada remap yapılacak (UserSwap halleder)")
-    else:
-        log("[Panel] ℹ️  Agent yok — remap cache atlandı")
-
     server_state.update({"status": "starting", "online_players": 0})
     players.clear()
     socketio.emit("server_status", server_state)
@@ -1013,57 +920,36 @@ def send_command(cmd: str) -> bool:
 def _ram_watchdog():
     import psutil
     _pressure_count = 0
-    _CONT_MB = int(os.environ.get("CONTAINER_RAM_MB", "512"))
-    _US_PATH = USERSWAP_SO
-
     while True:
         eventlet.sleep(8)
         try:
-            # psutil.virtual_memory() → Render'da HOST RAM okur (YANLIŞ)
-            # Panel RSS + JVM RSS → gerçek container kullanımı
-            try:
-                _panel_rss = int(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
-            except: _panel_rss = 200
+            mem = psutil.virtual_memory()
+            swp = psutil.swap_memory()
+            used_mb  = int(mem.used  / 1024 / 1024)
+            total_mb = int(mem.total / 1024 / 1024)
+            swap_pct = swp.percent if swp.total > 0 else 0
 
-            _jvm_rss = 0
-            if mc_process and mc_process.poll() is None:
-                try: _jvm_rss = int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
-                except: pass
-
-            used_mb = _panel_rss + _jvm_rss
-            swap_pct = 0
-            try:
-                swp = psutil.swap_memory()
-                swap_pct = swp.percent if swp.total > 0 else 0
-            except: pass
-
-            # Remap aşamasında (status=starting) alarm sustur
-            # UserSwap 4GB dosya swap → JVM taşarsa dosyaya yazar, crash yok
-            _starting  = server_state.get("status") == "starting"
-            _us_ok     = os.path.exists(_US_PATH)
-
-            if _starting:
-                pressure = False  # Remap sırasında RAM spike normal — sessiz kal
-            elif _us_ok:
-                # JVM UserSwap ile RAM'i taşırabilir — sadece panel şişerse uyar
-                pressure = _panel_rss > 300 or swap_pct > 95
-            else:
-                pressure = used_mb > (_CONT_MB * 0.88) or swap_pct > 80
+            # Render free = 512MB. Python ~150MB kullanıyor.
+            # MC 280MB kullanıyorsa toplam ~430MB → %84 → uyar
+            pressure = used_mb > (total_mb * 0.85) or swap_pct > 80
 
             if pressure:
                 _pressure_count += 1
-                try: open("/proc/sys/vm/drop_caches","w").write("1")
+                try: open("/proc/sys/vm/drop_caches","w").write("3")
                 except: pass
 
                 if _pressure_count >= 2:
+                    # Hafif MC temizliği
                     send_command("kill @e[type=item]")
                     send_command("kill @e[type=experience_orb]")
 
                 if _pressure_count >= 3:
+                    # Ağır baskı: kaydet + agent'a region offload tetikle
                     send_command("save-all")
-                    log(f"[Panel] ⚠️  RAM Baskısı! Panel={_panel_rss}MB JVM={_jvm_rss}MB Swap=%{swap_pct:.0f}")
+                    log(f"[Panel] ⚠️  RAM Baskısı! Kullanılan={used_mb}MB/{total_mb}MB Swap=%{swap_pct:.0f}")
+                    # Agent'a eski region'ları taşı
                     threading.Thread(
-                        target=lambda: _auto_archive_old_regions(older_than_days=0),
+                        target=lambda: _auto_archive_old_regions(older_than_days=2),
                         daemon=True
                     ).start()
                     _pressure_count = 0

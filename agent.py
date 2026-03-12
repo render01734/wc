@@ -19,6 +19,17 @@ from collections import OrderedDict
 import urllib.request as _ur
 import urllib.parse as _up
 
+# ── 512MB process limiti ────────────────────────────────────────────────────
+# Render free: 512MB. Cache peak (set sırasında) = compressed + ham aynı anda.
+# RLIMIT_AS ile adres alanını sınırla → limit aşımında MemoryError → graceful fail
+try:
+    _AGENT_AS_LIMIT = 500 * 1024 * 1024   # 500MB — 12MB buffer
+    _s, _h = resource.getrlimit(resource.RLIMIT_AS)
+    if _h == resource.RLIM_INFINITY or _h > _AGENT_AS_LIMIT:
+        resource.setrlimit(resource.RLIMIT_AS, (_AGENT_AS_LIMIT, _AGENT_AS_LIMIT))
+except Exception:
+    pass
+
 from flask import Flask, request, jsonify, send_file, Response, abort
 
 # ─────────────────────────────────────────────
@@ -40,7 +51,8 @@ NODE_ID      = (
 DATA_DIR     = Path("/agent_data")          # Dosya deposu
 # Agent 382MB free RAM'e sahip. Cache için 350MB ayır (32MB Flask/OS büyümesi için bırak).
 # Ana sunucu bu limiti agent'ın /api/cache/stats endpoint'inden okur.
-RAM_CACHE_MB  = int(os.environ.get("RAM_CACHE_MB",   "400"))  # RAM önbelleği boyutu
+RAM_CACHE_MB  = int(os.environ.get("RAM_CACHE_MB",   "380"))  # RAM önbelleği boyutu
+# 512MB bütçe: Flask/OS=80MB + cache=380MB + peak_geçici=16MB + buffer=36MB = 512MB
 RAM_LIMIT_MB  = int(os.environ.get("RAM_LIMIT_MB",   "512"))  # Render plan RAM kotası
 DISK_LIMIT_GB = float(os.environ.get("DISK_LIMIT_GB", "17.5")) # Render plan Disk kotası
 AGENT_OVERHEAD_MB = 130  # Flask + psutil + OS taban kullanımı (~130MB)
@@ -80,15 +92,23 @@ class RamCache:
         self.misses  = 0
 
     def set(self, key: str, data: bytes) -> bool:
-        compressed = gzip.compress(data, compresslevel=1)
+        # Ham veri referansını hemen serbest bırak: sıkıştır → orijinali del
+        try:
+            compressed = gzip.compress(data, compresslevel=1)
+        except MemoryError:
+            return False  # Peak bellek yetersiz — reddet, crash etme
+        finally:
+            del data  # Ham veriyi hemen serbest bırak
         sz = len(compressed)
         with self.lock:
             if key in self.store:
                 self.size -= len(self.store[key])
                 del self.store[key]
+            # Yer açmak için en eski girdileri sil
             while self.size + sz > self.limit and self.store:
                 _, old = self.store.popitem(last=False)
                 self.size -= len(old)
+                del old
             if sz > self.limit:
                 return False
             self.store[key] = compressed
@@ -147,7 +167,13 @@ def cache_set():
     data = request.get_data()
     if not key or not data:
         return jsonify({"ok": False, "error": "key veya data eksik"}), 400
-    ok = ram_cache.set(key, data)
+    if len(data) > 8 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "8MB üstü desteklenmiyor"}), 413
+    try:
+        ok = ram_cache.set(key, data)
+    except MemoryError:
+        import gc; gc.collect()
+        return jsonify({"ok": False, "error": "RAM dolu"}), 507
     return jsonify({"ok": ok, "size": len(data), "compressed": ok})
 
 
@@ -237,9 +263,20 @@ def file_upload(category, filename):
     if _disk_used_gb() > DISK_LIMIT_GB - 0.5:
         return jsonify({"ok": False, "error": "Disk dolu"}), 507
     p.parent.mkdir(parents=True, exist_ok=True)
-    data = request.get_data()
-    p.write_bytes(data)
-    return jsonify({"ok": True, "size": len(data), "path": str(p.relative_to(DATA_DIR))})
+    # Stream olarak yaz — büyük dosyayı RAM'e yükleme
+    written = 0
+    try:
+        with open(p, "wb") as f:
+            while True:
+                chunk = request.stream.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                written += len(chunk)
+    except MemoryError:
+        import gc; gc.collect()
+        return jsonify({"ok": False, "error": "RAM dolu"}), 507
+    return jsonify({"ok": True, "size": written, "path": str(p.relative_to(DATA_DIR))})
 
 
 @app.route("/api/files/<category>/<path:filename>", methods=["GET"])
@@ -513,7 +550,8 @@ def cpu_queue():
 # ══════════════════════════════════════════════════════════════
 
 def _get_resource_info() -> dict:
-    import psutil
+    import psutil, gc as _gcr
+    _gcr.collect(0)  # RAM sürünmesini önle
     cpu  = psutil.cpu_count(logical=True)
     try:
         load1, load5, _ = os.getloadavg()
@@ -528,8 +566,9 @@ def _get_resource_info() -> dict:
     except:
         my_rss_mb = AGENT_OVERHEAD_MB
     cache_mb     = ram_cache.stats["used_mb"]
-    agent_used_mb = max(my_rss_mb, AGENT_OVERHEAD_MB)  # en az overhead kadar say
-    ram_free_mb  = max(0, RAM_LIMIT_MB - agent_used_mb)
+    cache_mb      = ram_cache.size // 1024 // 1024
+    agent_used_mb = max(my_rss_mb, AGENT_OVERHEAD_MB + cache_mb)
+    ram_free_mb   = max(0, RAM_LIMIT_MB - agent_used_mb)
 
     # ── Render sınırlı Disk ─────────────────────────────────
     # Sadece /agent_data kullanımını ölç — host FS değil.
