@@ -423,7 +423,7 @@ def _world_backup_loop():
 # Her agent 382MB free RAM var, RamCache limiti agent'ta RAM_CACHE_MB env ile ayarlanır.
 # Ana sunucu bu değeri bilmez — agent'ın cache/stats endpoint'inden okur.
 # Güvenli hedef: cache limitinin %90'ı
-AGENT_CACHE_FILL_TARGET = 0.90   # Her agentin cache'ini %90 doldur
+AGENT_CACHE_FILL_TARGET = 0.97   # Her agenti limitle doldurmaya çalış
 
 
 def _get_agent_cache_limit_mb(agent_client) -> int:
@@ -467,19 +467,10 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
         except:
             return False
 
-    # 1. Server JAR → 4MB chunk'larla gönder (47MB × N agent = OOM olmasın)
-    _CHUNK_B = 4 * 1024 * 1024
+    # 1. Server JAR (tüm agentlara — sık erişilen)
     if MC_JAR.exists():
         try:
-            import gc as _gc
-            n_ch = (MC_JAR.stat().st_size + _CHUNK_B - 1) // _CHUNK_B
-            with open(MC_JAR, "rb") as _jf:
-                for _ci in range(n_ch):
-                    _ch = _jf.read(_CHUNK_B)
-                    if not _ch: break
-                    _send(f"mc/jar/c{_ci:04d}", _ch)
-                    del _ch; _gc.collect()
-            _send("mc/jar/meta", f'{{"n":{n_ch}}}'.encode())
+            _send("mc/server.jar", MC_JAR.read_bytes())
         except: pass
 
     # 2. Config dosyaları
@@ -494,24 +485,16 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
     plugins_dir = MC_DIR / "plugins"
     if plugins_dir.exists():
         for pjar in sorted(plugins_dir.glob("*.jar"))[:20]:
-            try:
-                if pjar.stat().st_size <= 5 * 1024 * 1024:
-                    _send(f"mc/plugins/{pjar.name}", pjar.read_bytes())
+            try: _send(f"mc/plugins/{pjar.name}", pjar.read_bytes())
             except: pass
 
-    # 4. World region dosyaları — ASIL DOLDURMA ─────────────────────────────
-    # Her .mca dosyası ~2-8MB. 5 agent dağılımı: dosya hash'i % agent_index
-    # Böylece her agent farklı region'ları önbelleğe alır → toplam harita kapsamı artar.
+    # 4. World region dosyaları — TÜM AGENT'LARA KOPYALA (round-robin DEĞİL)
+    # ─────────────────────────────────────────────────────────────────────
+    # Round-robin: 8 agent → her agent 1/8 bölge → küçük dünyada ~5MB/agent
+    # YENİ: Her agent tüm bölgeleri alır (400MB limitine kadar)
+    # 8 agent × 400MB = 3.2GB toplam → herhangi bir agent herhangi isteği karşılar
+    # Yedeklilik: 1 agent düşse diğer 7'si full cache'le devam eder
     if fill_regions and pushed_bytes < target_bytes:
-        agents     = _pool.get_agents()
-        n_agents   = max(1, len(agents))
-        # Bu agent'ın index'i (kararlı sıralama)
-        try:
-            sorted_ids = sorted(a.node_id for a in agents)
-            my_idx     = sorted_ids.index(agent_client.node_id)
-        except:
-            my_idx = 0
-
         dim_dirs = [
             (MC_DIR / "world"          / "region",          "world"),
             (MC_DIR / "world_nether"   / "DIM-1" / "region","world_nether"),
@@ -520,22 +503,30 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
         for region_dir, dim_name in dim_dirs:
             if not region_dir.exists():
                 continue
-            # En son erişilen region'lar önce (aktif bölgeler daha değerli)
+            # En son erişilen (aktif) region'lar önce
             mca_files = sorted(region_dir.glob("*.mca"),
                                key=lambda f: f.stat().st_mtime, reverse=True)
             for rf in mca_files:
                 if pushed_bytes >= target_bytes:
                     break
-                # Dosya hash'i % n_agents == my_idx → bu agent bu dosyayı alır
-                import hashlib as _hl
-                file_idx = int(_hl.md5(rf.name.encode()).hexdigest(), 16) % n_agents
-                if file_idx != my_idx:
-                    continue  # Başka agent'ın payı
                 key = f"mc/region/{dim_name}/{rf.name}"
                 try:
-                    if rf.stat().st_size > 8 * 1024 * 1024:
-                        continue
-                    _send(key, rf.read_bytes())
+                    _send(key, rf.read_bytes())  # Her agent bu dosyayı alır
+                except: pass
+
+    # 5. Entities / poi / data alt dizinleri (kalan alan varsa)
+    if pushed_bytes < target_bytes:
+        for sub in ["entities", "poi"]:
+            sub_dir = MC_DIR / "world" / sub
+            if not sub_dir.exists():
+                continue
+            for sf in sorted(sub_dir.rglob("*.mca"),
+                             key=lambda f: f.stat().st_mtime, reverse=True):
+                if pushed_bytes >= target_bytes:
+                    break
+                try:
+                    if sf.stat().st_size <= 8 * 1024 * 1024:
+                        _send(f"mc/{sub}/{sf.name}", sf.read_bytes())
                 except: pass
 
     used_mb = pushed_bytes // 1024 // 1024
@@ -559,34 +550,27 @@ def _ram_cache_warm_loop():
         log("[Pool] ⚠️  Cache warm: JAR veya agent 15dk içinde hazır olmadı")
         return
 
-    # MC "Done" olana kadar bekle — boot peak'inde cache warm yapma
-    log("[Pool] 🕐 Cache warm: MC tam başlayana kadar bekliyor...")
-    for _ in range(600):
-        if server_state.get("status") == "running":
-            break
-        time.sleep(1)
-    else:
-        log("[Pool] ⚠️  MC 10dk içinde hazır olmadı, warm atlandı"); return
-    # 90sn: world .mca dosyaları diske yazılsın, GC sakinleşsin
-    log("[Pool] 🕐 Cache warm: 90sn bekleniyor (world I/O + GC)...")
-    time.sleep(90)
+    time.sleep(10)  # MC başlasın + world dosyaları oluşsun
 
     def _fill_all_agents():
         agents = _pool.get_agents()
         if not agents:
             return 0
-        total = 0
-        # SERİ: 1 agent biter → GC → sonraki başlar (N×buffer = OOM önlenir)
+        threads, results = [], []
+
+        def _t(a):
+            n = _warm_single_agent(a, log_fn=log, fill_regions=True)
+            results.append(n)
+
         for a in agents:
-            try:
-                n = _warm_single_agent(a, log_fn=log, fill_regions=True)
-                total += n
-                import gc as _gcf; _gcf.collect()
-                time.sleep(3)
-            except Exception as _e:
-                log(f"[Pool] ⚠️  Cache warm {a.node_id}: {_e}")
+            t = threading.Thread(target=_t, args=(a,), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=180)
+        total = sum(results)
         if total:
-            log(f"[Pool] 🧠 Cache: {len(agents)} agent, {total} dosya")
+            log(f"[Pool] 🧠 Cache tamamlandı: {len(agents)} agent, toplam {total} dosya gönderildi")
             socketio.emit("pool_update", _pool_summary())
         return total
 
@@ -594,9 +578,10 @@ def _ram_cache_warm_loop():
 
     # Periyodik: yeni agentları ısıt + tüm havuzu tazele
     _warmed_agents: set = set(a.node_id for a in _pool.get_agents())
+    _last_fill_time: float = time.time()
 
     while True:
-        time.sleep(300)  # 5 dakika
+        time.sleep(120)  # 2dk kontrol (yeni region'lar hızlı cache'e girer)
         try:
             if _pool.agent_count() == 0:
                 continue
@@ -614,10 +599,12 @@ def _ram_cache_warm_loop():
                             time.sleep(2)
                         except Exception as _ew:
                             log(f"[Pool] ⚠️  Yeni agent warm {nid}: {_ew}")
-                _warmed_agents.update(current)
+            _warmed_agents.update(current)
 
-            # World yeni region'ları çıktıysa tazele (oyun genişledi)
-            _fill_all_agents()
+            # 5dk'da bir tüm havuzu tazele (oyun büyüdükçe yeni region'lar eklenir)
+            if time.time() - _last_fill_time >= 300:
+                _fill_all_agents()
+                _last_fill_time = time.time()
         except Exception as e:
             log(f"[Pool] ⚠️  Cache warm döngü hatası: {e}")
 
@@ -778,10 +765,10 @@ def get_jvm_args():
     #   Xmx=320 → RSS_JVM ≈ 250MB (aktif heap) + 220MB (swap'a taşan) → fiziksel ~480MB peak
     #   Peak 512MB'yi aşınca UserSwap devreye girer → dosyaya yazar, crash YOK
     #   Steady-state (GC sonrası): RSS ~380MB → güvenli
-    userswap_ok = os.path.exists(USERSWAP_SO)
-    xmx_mb = 380 if userswap_ok else 240  # UserSwap→taşma dosyaya, NoSwap→konservatif
-    xms_mb = 48
+    xmx_mb = 320   # UserSwap aktif → Paper 1.21 bootstrap için yeterli heap
+    xms_mb = 48    # Düşük başlangıç → JVM lazy expand eder
 
+    userswap_ok = os.path.exists(USERSWAP_SO)
     swap_label  = f"UserSwap(4GB)" if userswap_ok else "NoSwap"
     log(f"[Panel] 🧠 Container={container_ram_mb}MB {swap_label} Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
 
@@ -918,31 +905,18 @@ def send_command(cmd: str) -> bool:
 def _ram_watchdog():
     import psutil
     _pressure_count = 0
-    _CONT_MB = int(os.environ.get("CONTAINER_RAM_MB", "512"))
     while True:
         eventlet.sleep(8)
         try:
-            # psutil.virtual_memory() Render'da HOST'u okur → YANLIŞ
-            # Panel RSS + JVM RSS ölç
-            try:
-                _panel_rss = int(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
-            except: _panel_rss = 200
-            _mc_rss = 0
-            if mc_process and mc_process.poll() is None:
-                try: _mc_rss = int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
-                except: pass
-            used_mb  = _panel_rss + _mc_rss
-            total_mb = _CONT_MB
+            mem = psutil.virtual_memory()
             swp = psutil.swap_memory()
+            used_mb  = int(mem.used  / 1024 / 1024)
+            total_mb = int(mem.total / 1024 / 1024)
             swap_pct = swp.percent if swp.total > 0 else 0
 
-            # UserSwap varsa JVM 512MB+ olabilir — dosyaya yazar, crash YOK
-            # Sadece panel (Python) RSS yüksekse veya swap tamamen doluysa uyar
-            _us_ok = os.path.exists(USERSWAP_SO)
-            if _us_ok:
-                pressure = _panel_rss > 300 or swap_pct > 95
-            else:
-                pressure = used_mb > (_CONT_MB * 0.88) or swap_pct > 80
+            # Render free = 512MB. Python ~150MB kullanıyor.
+            # MC 280MB kullanıyorsa toplam ~430MB → %84 → uyar
+            pressure = used_mb > (total_mb * 0.85) or swap_pct > 80
 
             if pressure:
                 _pressure_count += 1
@@ -1094,7 +1068,7 @@ def api_agent_register():
         mc_host = tunnel_info.get("host", "")
         if mc_host and mc_process and mc_process.poll() is None:
             def _new_agent_proxy():
-                time.sleep(60)
+                time.sleep(3)
                 ok = agent_client.proxy_start(mc_host, 25565, 25565)
                 if ok:
                     log(f"[Pool] 🔀 Yeni agent proxy: {node_id} → {mc_host}:25565")
