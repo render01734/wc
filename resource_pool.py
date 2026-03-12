@@ -312,25 +312,32 @@ class ResourcePool:
 
     def store_region_backup(self, dimension: str, region_file: Path) -> bool:
         """
-        Region dosyasını agent diskine YEDEK olarak gönder (orijinali SİLMEZ).
-        Round-robin: tüm agentlara dağıt, disk dolmayan birini seç.
+        Region dosyasını TÜM agentlerin diskine yaz (tam replikasyon).
+        1 agent düşse diğerleri aynı veriyi sunabilir.
         """
-        agents = self.get_agents()
+        import concurrent.futures as _cf
+        agents = [a for a in self.get_agents()
+                  if a.info.get("disk", {}).get("free_gb", 0) >= 0.2]
         if not agents:
             return False
-        # En çok boş disk olan agenta yükle
-        agent = max(agents, key=lambda a: a.info.get("disk", {}).get("free_gb", 0))
-        if agent.info.get("disk", {}).get("free_gb", 0) < 0.5:
-            return False   # Disk dolmak üzere — atla
         try:
             data = region_file.read_bytes()
-            ok = agent.file_upload("regions", f"{dimension}/{region_file.name}", data)
-            if ok:
-                self._log(f"[Pool] 💾 Yedek: {dimension}/{region_file.name} → {agent.node_id}")
-            return ok
+            fname = f"{dimension}/{region_file.name}"
         except Exception as e:
-            self._log(f"[Pool] ⚠️  Yedek hata: {region_file.name}: {e}")
+            self._log(f"[Pool] ⚠️  Yedek okuma hata: {region_file.name}: {e}")
             return False
+
+        def _one(a):
+            try: return a.file_upload("regions", fname, data)
+            except: return False
+
+        with _cf.ThreadPoolExecutor(max_workers=len(agents)) as ex:
+            results = list(ex.map(_one, agents))
+        ok = any(results)
+        if ok:
+            n_ok = sum(1 for r in results if r)
+            self._log(f"[Pool] 💾 Yedek: {region_file.name} → {n_ok}/{len(agents)} agent")
+        return ok
 
     def fetch_region(self, dimension: str, filename: str,
                      dest: Path) -> bool:

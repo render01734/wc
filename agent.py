@@ -40,7 +40,7 @@ NODE_ID      = (
 DATA_DIR     = Path("/agent_data")          # Dosya deposu
 # Agent 382MB free RAM'e sahip. Cache için 350MB ayır (32MB Flask/OS büyümesi için bırak).
 # Ana sunucu bu limiti agent'ın /api/cache/stats endpoint'inden okur.
-RAM_CACHE_MB  = int(os.environ.get("RAM_CACHE_MB",   "350"))  # RAM önbelleği boyutu
+RAM_CACHE_MB  = int(os.environ.get("RAM_CACHE_MB",   "400"))  # RAM önbelleği boyutu
 RAM_LIMIT_MB  = int(os.environ.get("RAM_LIMIT_MB",   "512"))  # Render plan RAM kotası
 DISK_LIMIT_GB = float(os.environ.get("DISK_LIMIT_GB", "17.5")) # Render plan Disk kotası
 AGENT_OVERHEAD_MB = 130  # Flask + psutil + OS taban kullanımı (~130MB)
@@ -565,16 +565,6 @@ def _get_resource_info() -> dict:
 _start_time = time.time()
 
 
-def _keepalive_loop():
-    """Her 10 dakikada self+ana sunucu ping — Render free tier uyutma."""
-    while True:
-        time.sleep(600)
-        try: _ur.urlopen(f"http://localhost:{PORT}/ping", timeout=5)
-        except: pass
-        try: _ur.urlopen(f"{MAIN_URL.rstrip('/')}/api/ping", timeout=10)
-        except: pass
-
-
 def _register_loop():
     """Ana sunucuya kayıt ol, heartbeat gönder."""
     # Tünel hazır olana kadar bekle
@@ -603,12 +593,12 @@ def _register_loop():
             print(f"  [agent] ⚠️  Kayıt #{attempt}: {e} — 30sn sonra...")
             time.sleep(30)
 
-    # Heartbeat döngüsü — fail sayacı + otomatik re-register
-    _hb_fail = 0
+    # Heartbeat döngüsü
     while True:
         time.sleep(20)
         try:
             info = _get_resource_info()
+            # DÜZELTİLDİ: Tünel boşsa heartbeat gönderme (ana sunucu URL'yi güncelleyemez)
             if not info.get("tunnel"):
                 continue
             _ur.urlopen(
@@ -620,31 +610,8 @@ def _register_loop():
                 ),
                 timeout=10,
             )
-            _hb_fail = 0  # başarı → sıfırla
         except Exception:
-            _hb_fail += 1
-            # 3 ardışık hata = ana sunucu uyumuş/restart olmuş → yeniden kayıt yap
-            if _hb_fail >= 3:
-                print(f"  [agent] ⚠️  {_hb_fail} heartbeat hatası → yeniden kayıt deneniyor...")
-                for _attempt in range(8):
-                    try:
-                        _info2 = _get_resource_info()
-                        if not _info2.get("tunnel"):
-                            time.sleep(10); continue
-                        _ur.urlopen(
-                            _ur.Request(
-                                f"{MAIN_URL.rstrip('/')}/api/agent/register",
-                                data=json.dumps(_info2).encode(),
-                                headers={"Content-Type": "application/json"},
-                                method="POST",
-                            ),
-                            timeout=15,
-                        )
-                        print(f"  [agent] ✅ Yeniden kayıt başarılı (deneme {_attempt+1})")
-                        _hb_fail = 0
-                        break
-                    except Exception as _e2:
-                        time.sleep(15)
+            pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -680,12 +647,6 @@ def _start_tunnel():
 # ══════════════════════════════════════════════════════════════
 #  SAĞLIK + PANEL SAYFASI
 # ══════════════════════════════════════════════════════════════
-
-@app.route("/ping")
-def quick_ping():
-    """Render keep-alive — hafif, hızlı."""
-    return {"ok": True, "node": NODE_ID, "t": int(time.time())}, 200
-
 
 @app.route("/")
 @app.route("/health")
@@ -780,7 +741,6 @@ print("━"*54 + "\n")
 
 threading.Thread(target=_start_tunnel,   daemon=True).start()
 threading.Thread(target=_register_loop,  daemon=True).start()
-threading.Thread(target=_keepalive_loop, daemon=True).start()
 
 print(f"[Agent] Flask :{PORT} başlatılıyor...")
 app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
