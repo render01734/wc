@@ -260,18 +260,51 @@ def write_server_config():
         )
 
 
+def _setup_swap():
+    """Disk'ten swap alanı oluştur — RAM'i genişlet"""
+    import psutil, subprocess, os
+    try:
+        disk = psutil.disk_usage("/")
+        free_gb = disk.free / 1024 / 1024 / 1024
+        # Boş diskin %40'ını swap yap, max 16GB
+        swap_gb = min(16, int(free_gb * 0.40))
+        if swap_gb < 1:
+            log("[Panel] ⚠️  Swap: yeterli disk yok")
+            return
+        swap_file = "/swapfile"
+        swap_mb = swap_gb * 1024
+        if not os.path.exists(swap_file):
+            log(f"[Panel] 💾 Swap dosyası oluşturuluyor: {swap_gb}GB...")
+            subprocess.run(["fallocate", "-l", f"{swap_mb}M", swap_file], check=True)
+            subprocess.run(["chmod", "600", swap_file], check=True)
+            subprocess.run(["mkswap", swap_file], check=True)
+        subprocess.run(["swapon", swap_file], check=False)
+        # swappiness'i düşür: RAM bitmeden swap kullanma
+        try:
+            with open("/proc/sys/vm/swappiness", "w") as f:
+                f.write("10")
+        except Exception:
+            pass
+        mem = psutil.virtual_memory()
+        swp = psutil.swap_memory()
+        log(f"[Panel] ✅ Swap aktif: RAM={int(mem.total/1024/1024)}MB + Swap={int(swp.total/1024/1024)}MB = toplam {int((mem.total+swp.total)/1024/1024)}MB")
+    except Exception as e:
+        log(f"[Panel] ⚠️  Swap kurulamadı: {e}")
+
+
 def get_jvm_args():
     import psutil
-    # Gerçekten kullanılabilir RAM'i al (container limiti dahil)
-    mem = psutil.virtual_memory()
-    avail_mb = int(mem.available / 1024 / 1024)
-    total_mb = int(mem.total   / 1024 / 1024)
-    # Container'da kullanılabilir RAM'in %80'ini kullan, max 400MB güvenli üst sınır bırak
-    xmx_mb = max(256, min(avail_mb - 128, int(avail_mb * 0.80)))
-    xms_mb = max(128, int(xmx_mb * 0.50))
+    mem     = psutil.virtual_memory()
+    swp     = psutil.swap_memory()
+    ram_mb  = int(mem.total  / 1024 / 1024)
+    swap_mb = int(swp.total  / 1024 / 1024)
+    # RAM + Swap toplamının %75'ini JVM'e ver
+    pool_mb = ram_mb + swap_mb
+    xmx_mb  = max(256, int(pool_mb * 0.75))
+    xms_mb  = max(128, int(xmx_mb  * 0.40))
     xmx = f"{xmx_mb}M"
     xms = f"{xms_mb}M"
-    log(f"[Panel] 🧠 RAM: toplam={total_mb}MB  kullanılabilir={avail_mb}MB  Xms={xms}  Xmx={xmx}")
+    log(f"[Panel] 🧠 RAM={ram_mb}MB + Swap={swap_mb}MB = {pool_mb}MB havuz  →  Xms={xms}  Xmx={xmx}")
     return [
         "java",
         f"-Xms{xms}", f"-Xmx{xmx}",
