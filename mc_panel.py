@@ -176,23 +176,15 @@ def _parse_mc_output(line: str):
         try: _bootstrap_done.set()
         except Exception: pass
 
-    # iostream error / player dosyasi sorunu → dosyaları sil (kick sonrası yeniden bağlanır)
-    if ("iostream error" in line or "statistics file loading failed" in line
-            or "save or statistics file loading failed" in line):
+    # iostream error / player dosyasi sorunu
+    if "iostream error" in line or "statistics file loading failed" in line:
         threading.Thread(target=_ensure_runtime_dirs, daemon=True).start()
+        # Player "Ray" save or statistics file loading failed
         m_pname = re.search(r'Player "([A-Za-z0-9_]+)"', line)
         if m_pname:
             threading.Thread(
                 target=_reset_player_files, args=(m_pname.group(1),), daemon=True
             ).start()
-
-    # "prevented from joining" → UUID uyumsuzluğu — dosyaları temizle
-    if "prevented from joining" in line or "could not be parsed" in line:
-        m_pname2 = re.search(r'Player "([A-Za-z0-9_]+)"', line)
-        pname2 = m_pname2.group(1) if m_pname2 else None
-        threading.Thread(
-            target=_reset_player_files, args=(pname2,), daemon=True
-        ).start() if pname2 else threading.Thread(target=_clean_player_files, daemon=True).start()
 
     if "Stopping server" in line or "Shutting down" in line:
         server_state["status"] = "stopping"
@@ -206,12 +198,10 @@ def _players_list():
 def _reset_player_files(player_name: str):
     """
     Cuberite player dosyasi sorunu:
-    - Asıl neden: Online→Offline geçişinde UUID değişiyor, eski dosya uyumsuz
+    - Asıl neden: dosya yok veya bizim yazdığımız JSON formatı yanlış
     - Çözüm: SİL → Cuberite kendi doğru formatında yeniden oluştursun
     - Dizin izinlerini 777 yap ki Cuberite yazabilsin
     """
-    if not player_name:
-        _clean_player_files(); return
     import subprocess as _sp
     players_dir = MC_DIR / "players"
     stats_dir   = MC_DIR / "world" / "data" / "stats"
@@ -229,18 +219,26 @@ def _reset_player_files(player_name: str):
     except Exception: pass
 
     deleted = []
-    # Tüm olası player dosyalarını SİL — Cuberite kendi yazar
-    for fp in [
+    # Tüm olası konumlarda player dosyasını sil — Cuberite kendi yazar
+    _fixed = [
         players_dir / f"{player_name}.json",
         players_dir / f"{player_name.lower()}.json",
         stats_dir   / f"{player_name}.json",
         stats_dir   / f"{player_name.lower()}.json",
         MC_DIR / "world" / "playerdata" / f"{player_name}.json",
-    ]:
+        MC_DIR / "world" / "players"    / f"{player_name}.json",
+        MC_DIR / "world" / "data" / "stats" / f"{player_name}.json",
+    ]
+    import glob as _gl
+    _found = (
+        _gl.glob(str(MC_DIR / "**" / f"{player_name}.json"),       recursive=True) +
+        _gl.glob(str(MC_DIR / "**" / f"{player_name.lower()}.json"), recursive=True)
+    )
+    for fp in _fixed + [Path(p) for p in _found]:
         try:
             if fp.exists():
                 fp.unlink()
-                deleted.append(fp.name)
+                deleted.append(str(fp.relative_to(MC_DIR)))
         except Exception as _e:
             log(f"[Players] ⚠️  silinemedi {fp.name}: {_e}")
 
@@ -869,15 +867,11 @@ def _clean_player_files():
         is_corrupt = False
         try:
             txt = pf.read_text(encoding="utf-8", errors="replace").strip()
-            if not txt or len(txt) < 2:
+            if not txt:
                 is_corrupt = True
             else:
                 obj = _j.loads(txt)
                 if not isinstance(obj, dict):
-                    is_corrupt = True
-                # Cuberite formatında "Position" veya "Inventory" olmalı
-                # Eğer hiçbiri yoksa büyük ihtimalle eski/bozuk format
-                elif not any(k in obj for k in ["Position","Inventory","Health","World","GameMode"]):
                     is_corrupt = True
         except Exception:
             is_corrupt = True
@@ -924,41 +918,21 @@ def write_server_config():
     # ── settings.ini — Ana sunucu ayarları ─────────────────────
     settings = MC_DIR / "settings.ini"
     settings.write_text(
-        # ═══════════════════════════════════════
-        # CRACK MOD (Offline) — Tam Konfigürasyon
-        # ═══════════════════════════════════════
         f"[Server]\n"
         f"Ports={MC_PORT}\n"
         f"MaxPlayers=20\n"
-        f"OnlineMode=false\n"            # CRACK MOD — auth yok
+        f"OnlineMode=false\n"        # Render'da auth sunucusuna erişim yok
         f"Motd=\u00A7aRender MC • Cuberite 1.8.8\n"
         f"AllowFlight=true\n"
         f"Description=Cuberite 1.8.8 on Render\n"
         f"ShutdownMessage=Server kapaniyor...\n"
-        f"HardcoreEnabled=false\n"
-        f"AllowMultiLogin=false\n"       # Aynı ad iki kez giremez (güvenlik)
-        f"DefaultViewDistance=10\n"
-        f"MaxUpgradedViewDistance=10\n"
         f"\n"
         f"[Authentication]\n"
-        f"Authenticate=false\n"          # CRACK MOD — Mojang auth kapalı
-        f"AllowBungeeCord=false\n"
-        f"OnlyAllowBungeeCord=false\n"
-        f"\n"
-        f"[MojangAPI]\n"
-        f"NameToUUIDServer=\n"           # Boş → offline UUID kullan
-        f"UUIDToProfileServer=\n"        # Boş → offline UUID kullan
+        f"Authenticate=false\n"      # Offline mode
         f"\n"
         f"[AntiCheat]\n"
         f"LimitPlayerBlockChanges=false\n"
         f"AllowFlight=true\n"
-        f"\n"
-        f"[Worlds]\n"
-        f"DefaultWorld=world\n"
-        f"\n"
-        f"[Logging]\n"
-        f"LogUserActivity=true\n"
-        f"LogConsoleActivity=true\n"
     )
 
     # ── world.ini — Dünya ayarları ──────────────────────────────
@@ -1013,26 +987,6 @@ def write_server_config():
 
     # ── Tüm gerekli dizinler + chmod 777 ─────────────────────────
     # iostream error kaynagi: stats/ ve playerdata/ dizinleri yok
-    # ── Scoreboard.dat oluştur (yoksa "Failed to load scoreboard" hatası) ────
-    sb_dat = MC_DIR / "world" / "data" / "scoreboard.dat"
-    if not sb_dat.exists():
-        (MC_DIR / "world" / "data").mkdir(parents=True, exist_ok=True)
-        # Minimal valid NBT binary: boş scoreboard
-        sb_dat.write_bytes(bytes([
-            0x0a, 0x00, 0x00,                    # TAG_Compound (root, no name)
-            0x0a, 0x00, 0x04, 0x64, 0x61, 0x74,  # TAG_Compound "dat"
-            0x61,
-            0x09, 0x00, 0x0a, 0x4f, 0x62, 0x6a,  # TAG_List "Objectives"
-            0x65, 0x63, 0x74, 0x69, 0x76, 0x65,
-            0x73, 0x0a, 0x00, 0x00, 0x00, 0x00,  # type=Compound, count=0
-            0x09, 0x00, 0x0d, 0x50, 0x6c, 0x61,  # TAG_List "PlayerScores"
-            0x79, 0x65, 0x72, 0x53, 0x63, 0x6f,
-            0x72, 0x65, 0x73, 0x0a, 0x00, 0x00,
-            0x00, 0x00,
-            0x00, 0x00,                           # End "dat", End root
-        ]))
-        log("[Panel] ✅ scoreboard.dat oluşturuldu")
-
     import subprocess as _sp
     _mkdirs = [
         MC_DIR / "players",
@@ -1081,7 +1035,7 @@ def get_cuberite_cmd() -> list:
     wrapper.write_text(
         "#!/bin/sh\n"
         f"umask 000\n"
-        f"chmod -R 777 {MC_DIR} 2>/dev/null || true\n"
+        # dizinler
         f"mkdir -p {MC_DIR}/world/data/stats "
         f"{MC_DIR}/world/data "
         f"{MC_DIR}/world/playerdata "
@@ -1089,12 +1043,16 @@ def get_cuberite_cmd() -> list:
         f"{MC_DIR}/world_nether/data/stats "
         f"{MC_DIR}/world_the_end/data/stats "
         f"{MC_DIR}/logs 2>/dev/null || true\n"
-        f"chmod 777 {MC_DIR}/world/data {MC_DIR}/world/data/stats "
-        f"{MC_DIR}/world/playerdata {MC_DIR}/players 2>/dev/null || true\n"
+        # tam izin — Cuberite root olmadan yazabilmeli
+        f"chmod -R 777 {MC_DIR} 2>/dev/null || true\n"
+        # scoreboard.dat SİL — sahte NBT crash eder, yoksa sadece warning verir
         f"rm -f {MC_DIR}/world/data/scoreboard.dat 2>/dev/null || true\n"
-        # Önceki bozuk player dosyalarını temizle — Cuberite ilk girişte kendi yazar
-        f"find {MC_DIR}/players -name '*.json' -size -10c -delete 2>/dev/null || true\n"
-        f"find {MC_DIR}/world/data/stats -name '*.json' -size -10c -delete 2>/dev/null || true\n"
+        # TÜM player dosyalarını sil — Online→Offline geçişinde UUID uyumsuzluğu
+        # Cuberite ilk girişte kendi doğru formatında yeniden yazar
+        f"rm -f {MC_DIR}/players/*.json 2>/dev/null || true\n"
+        f"rm -f {MC_DIR}/world/data/stats/*.json 2>/dev/null || true\n"
+        f"rm -f {MC_DIR}/world/playerdata/*.json 2>/dev/null || true\n"
+        f"rm -f {MC_DIR}/world/players/*.json 2>/dev/null || true\n"
         f"exec {MC_BIN}\n"
     )
     wrapper.chmod(0o755)
