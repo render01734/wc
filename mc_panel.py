@@ -24,68 +24,7 @@ import eventlet
 eventlet.monkey_patch()
 
 from flask import Flask, request, jsonify, send_file, abort, Response
-# cluster.py LAZY LOAD — MC bootstrap sırasında bellek kullanma
-# vcluster ve cluster_api, MC başladıktan sonra yüklenir
-_cluster_loaded = False
-_vcluster_inst  = None
-_cluster_api    = None
-
-class _LazyVCluster:
-    """
-    MC bootstrap sırasında cluster.py'yi yüklemez.
-    İlk gerçek çağrıda yükler.
-    """
-    def _load(self):
-        global _cluster_loaded, _vcluster_inst, _cluster_api
-        if not _cluster_loaded:
-            try:
-                import cluster as _cm
-                _vcluster_inst  = _cm.vcluster
-                _cluster_api    = _cm.cluster_api
-                _cluster_loaded = True
-            except Exception as e:
-                print(f"[LazyCluster] ⚠️  cluster.py yüklenemedi: {e}")
-        return _vcluster_inst
-
-    def __getattr__(self, name):
-        inst = self._load()
-        if inst is None:
-            if name == "_agents":
-                return {}
-            if name == "_lock":
-                import threading
-                return threading.Lock()
-            return lambda *a, **kw: None
-        return getattr(inst, name)
-
-    def summary(self):
-        inst = self._load()
-        if inst is None:
-            return {"total": 0, "healthy": 0, "resources": {}, "agents": []}
-        return inst.summary()
-
-    def set_socketio(self, sio):
-        inst = self._load()
-        if inst: inst.set_socketio(sio)
-
-    def register_agent(self, *a, **kw):
-        inst = self._load()
-        if inst: return inst.register_agent(*a, **kw)
-
-    @property
-    def _agents(self):
-        inst = self._load()
-        return inst._agents if inst else {}
-
-    @property
-    def _lock(self):
-        inst = self._load()
-        if inst: return inst._lock
-        import threading
-        return threading.Lock()
-
-vcluster    = _LazyVCluster()
-cluster_api = None   # Blueprint MC başladıktan sonra register edilir
+from cluster import vcluster, cluster_api
 from flask_socketio import SocketIO, emit
 
 # ── Ayarlar ───────────────────────────────────────────────────
@@ -111,6 +50,7 @@ mc_process   = None
 console_buf  = deque(maxlen=3000)
 players      = {}
 tunnel_info  = {"url": "", "host": ""}
+_bootstrap_done = threading.Event()  # MC "Done!" gelince set edilir
 server_state = {
     "status": "stopped", "tps": 20.0, "tps15": 20.0, "tps5": 20.0,
     "ram_mb": 0, "uptime": 0, "started": None,
@@ -126,22 +66,8 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
                     ping_timeout=60, ping_interval=25)
-# cluster Blueprint MC başladıktan sonra lazy register edilir
-# vcluster.set_socketio → MC bootstrap bitmeden set edilmez (hafifçe geciktir)
-def _register_cluster_blueprint():
-    """MC başladıktan sonra çağrılır — cluster blueprint'ini kaydet."""
-    global cluster_api
-    try:
-        import cluster as _cm
-        cluster_api = _cm.cluster_api
-        if cluster_api:
-            try:
-                app.register_blueprint(cluster_api)
-            except Exception:
-                pass   # Zaten kayıtlıysa AssertionError — görmezden gel
-        _cm.vcluster.set_socketio(socketio)
-    except Exception as e:
-        print(f"[Panel] ⚠️  cluster blueprint: {e}")
+if cluster_api: app.register_blueprint(cluster_api)
+vcluster.set_socketio(socketio)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -185,9 +111,14 @@ def _parse_mc_output(line: str):
         server_state["status"]  = "running"
         server_state["started"] = time.time()
         server_state["online_players"] = 0
-        socketio.emit("server_status", server_state)
+        # socketio henüz hazır olmayabilir — try/except
+        try: socketio.emit("server_status", server_state)
+        except Exception: pass
         log("[Panel] ✅ Minecraft Server hazır!")
         threading.Thread(target=_tps_monitor, daemon=True).start()
+        # Faz 2'ye geç — Flask+SocketIO başlat
+        try: _bootstrap_done.set()
+        except Exception: pass
     if "Stopping server" in line:
         server_state["status"] = "stopping"
         socketio.emit("server_status", server_state)
@@ -502,35 +433,11 @@ def get_jvm_args():
     # MC_ONLY=0  (Panel + MC aynı yerde):
     #   512 - 90(flask) - 110(jvm meta) - 32(os) = 280MB Xmx
     #
-    # ══════════════════════════════════════════════════════════════
-    # 512MB bütçe — lazy cluster ile MC bootstrap güvenli
-    # ══════════════════════════════════════════════════════════════
-    #
-    # FULL mod (Flask + lazy cluster):
-    #   Python/Flask (cluster yüklü DEĞİL) : ~55MB
-    #   JVM non-heap (meta+code+stack)      : ~120MB
-    #   JVM heap (Xmx)                      : 280MB (bootstrap için yeterli!)
-    #   Kernel/OS                           : ~30MB
-    #   ────────────────────────────────────────────
-    #   MC BOOTSTRAP TOPLAM                 : ~485MB ✓
-    #
-    #   MC başladıktan sonra cluster yüklenir:
-    #   + cluster/Python ek                 : ~40MB
-    #   = ~525MB → swap ile karşılanır      ✓
-    #
-    # MC_ONLY mod (minimal HTTP, cluster eager):
-    #   Python minimal                      : ~20MB
-    #   JVM non-heap                        : ~120MB
-    #   JVM heap (Xmx)                      : 340MB
-    #   ────────────────────────────────────────────
-    #   TOPLAM                              : ~480MB ✓
-    #
-    xmx_mb = 340 if MC_ONLY else 280
-    xms_mb = 16   # çok lazy — JVM sadece ihtiyacı kadar büyüsün
+    xmx_mb = 370 if MC_ONLY else 340   # Phase1: Flask yok → +80MB Xmx
+    xms_mb = 32   # lazy start — GC baskısını azalt
 
     log(f"[Panel] 🧠 {'MC_ONLY' if MC_ONLY else 'FULL'} "
-        f"RAM={phys_mb}MB Xmx={xmx_mb}M "
-        f"GC=G1GC(küçük) "
+        f"RAM={phys_mb}MB Xmx={xmx_mb}M (Phase1=no-Flask) "
         f"UserSwap={'✅ ' + us_path if us_ok else '❌'}")
 
     cmd_prefix = ["env", f"LD_PRELOAD={us_path}", "java"] if us_ok else ["java"]
@@ -538,40 +445,41 @@ def get_jvm_args():
     return cmd_prefix + [
         f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
 
-        # Non-heap — agresif kısıtlama (toplam ~120MB)
-        "-XX:MaxMetaspaceSize=72m",          # Paper 1.21.1 için yeterli
-        "-XX:CompressedClassSpaceSize=16m",
-        "-XX:ReservedCodeCacheSize=20m",     # JIT cache küçült
-        "-Xss192k",                          # thread stack (default 512k → 192k)
+        # Non-heap — minimumda tut (meta+class+code+stack = ~124MB)
+        "-XX:MaxMetaspaceSize=80m",
+        "-XX:CompressedClassSpaceSize=20m",
+        "-XX:ReservedCodeCacheSize=24m",
+        "-Xss256k",
 
-        # G1GC — küçük bölgeler, bootstrap sırasında da GC çalışır
-        # SerialGC KULLANMA: bootstrap sırasında GC yapmaz → OOM
+        # G1GC — düşük RAM için optimize
         "-XX:+UseG1GC",
         "-XX:+ParallelRefProcEnabled",
-        "-XX:MaxGCPauseMillis=150",
+        "-XX:MaxGCPauseMillis=100",          # daha sık ama kısa GC
         "-XX:+UnlockExperimentalVMOptions",
         "-XX:+DisableExplicitGC",
-        "-XX:G1HeapRegionSize=2m",           # küçük region → daha sık GC
-        "-XX:G1NewSizePercent=10",           # young gen küçük (daha sık GC)
-        "-XX:G1MaxNewSizePercent=20",
-        "-XX:G1ReservePercent=10",
-        "-XX:InitiatingHeapOccupancyPercent=15",  # erken GC başlat
-        "-XX:SoftRefLRUPolicyMSPerMB=0",     # soft ref hemen bırak
+        "-XX:G1NewSizePercent=15",
+        "-XX:G1MaxNewSizePercent=25",
+        "-XX:G1HeapRegionSize=2m",           # küçük heap → küçük region
+        "-XX:G1ReservePercent=15",
+        "-XX:InitiatingHeapOccupancyPercent=20",
+        "-XX:SoftRefLRUPolicyMSPerMB=0",
         "-XX:+UseStringDeduplication",
 
-        # Sıkıştırma
+        # Bellek baskısı azaltma
         "-XX:+UseCompressedOops",
         "-XX:+UseCompressedClassPointers",
+        "-XX:NativeMemoryTracking=off",      # tracking overhead yok
+        "-XX:+ExplicitGCInvokesConcurrent",  # GC bloklamayı azalt
+        "-XX:-OmitStackTraceInFastThrow",
+
+        # OOM dump yok — disk alanı kritik
+        "-XX:-HeapDumpOnOutOfMemoryError",
 
         # Genel
-        "-XX:NativeMemoryTracking=off",
-        "-XX:-OmitStackTraceInFastThrow",
-        "-XX:-HeapDumpOnOutOfMemoryError",
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8",
         "-Dcom.mojang.eula.agree=true",
         "-Djava.awt.headless=true",
-        "-Dlog4j2.formatMsgNoLookups=true",
 
         "-jar", str(MC_JAR), "--nogui",
     ]
@@ -643,10 +551,6 @@ def start_server():
         return False, str(e)
     threading.Thread(target=_stdout_reader, daemon=True).start()
     log(f"[Panel] 🛡️  Java PID={mc_process.pid} (OOM adj child-preexec ✅)")
-
-    # MC başladı — şimdi cluster blueprint'ini yükle (lazy)
-    threading.Thread(target=_register_cluster_blueprint, daemon=True).start()
-
     return True, "Başlatılıyor..."
 
 
@@ -2069,7 +1973,7 @@ def _run_mc_only():
             preexec_fn=_cs,
         )
         threading.Thread(target=_reader, daemon=True).start()
-        _mc_log(f"[MC_ONLY] 🚀 Java PID={mc_process.pid} Xmx=340MB")
+        _mc_log(f"[MC_ONLY] 🚀 Java PID={mc_process.pid} Xmx=370MB")
         return True, f"Başlatıldı PID={mc_process.pid}"
 
     class _Handler(BaseHTTPRequestHandler):
@@ -2181,17 +2085,124 @@ def _run_mc_only():
 #  BAŞLATMA
 # ══════════════════════════════════════════════════════════════
 
-if not MC_ONLY:
+# ══════════════════════════════════════════════════════════════
+#  İKİ FAZLI BAŞLATMA
+#  Faz 1: Minimal HTTP (5MB) + MC Xmx=340MB  bootstrap ~475MB ✓
+#  Faz 2: MC "Done!" sonrası Flask+SocketIO devralır (swap karşılar)
+# ══════════════════════════════════════════════════════════════
+
+
+def _minimal_http_phase():
+    """
+    Faz 1: stdlib HTTPServer — Flask/SocketIO/eventlet yok.
+    ~80MB tasarruf → Xmx=340MB.
+    MC başlatır, Done! gelince Flask moduna geçer.
+    """
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import urllib.parse as _up2
+
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+
+        def _j(self, code, obj):
+            b = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):
+            p = _up2.urlparse(self.path).path
+            if p in ("/", "/health", "/api/ping"):
+                self._j(200, {"ok": True, "phase": 1,
+                              "status": server_state.get("status", "stopped")})
+            else:
+                self._j(200, {"ok": True, "phase": 1,
+                              "status": server_state.get("status", "stopped")})
+
+        def do_POST(self):
+            global mc_process
+            p  = _up2.urlparse(self.path).path
+            cl = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(cl)) if cl else {}
+            except Exception:
+                body = {}
+
+            if p in ("/api/start", "/api/mc/start"):
+                if mc_process and mc_process.poll() is None:
+                    self._j(200, {"ok": False, "msg": "Zaten çalışıyor"})
+                else:
+                    ok, msg = start_server()
+                    self._j(200, {"ok": ok, "msg": msg})
+
+            elif p in ("/api/agent/register", "/api/agent/heartbeat"):
+                nid    = body.get("node_id", "")
+                tunnel = body.get("tunnel", "")
+                if nid and tunnel:
+                    try: vcluster.register_agent(tunnel, nid, body)
+                    except Exception: pass
+                self._j(200, {"ok": True})
+
+            elif p == "/api/internal/status_msg":
+                msg = body.get("msg", "")
+                if msg:
+                    print(f"[STATUS] {msg}", flush=True)
+                    console_buf.append({"ts": datetime.now().strftime("%H:%M:%S"),
+                                        "line": msg})
+                self._j(200, {"ok": True})
+
+            elif p == "/api/internal/tunnel":
+                tunnel_info.update(body)
+                self._j(200, {"ok": True})
+
+            else:
+                self._j(200, {"ok": True})
+
+    srv = HTTPServer(("0.0.0.0", PANEL_PORT), _H)
+    srv.timeout = 0.5
+
+    print(f"[Phase1] ⚡ Minimal HTTP :{PANEL_PORT} aktif (Flask yok Xmx=340MB)", flush=True)
+
+    # Otomatik MC başlat
+    def _auto_mc():
+        time.sleep(2)
+        print("[Phase1] 🚀 MC otomatik başlatılıyor...", flush=True)
+        start_server()
+    threading.Thread(target=_auto_mc, daemon=True).start()
+
+    # MC Done! gelene kadar minimal HTTP sun
+    while not _bootstrap_done.is_set():
+        try:
+            srv.handle_request()
+        except Exception:
+            pass
+
+    # Done! → Flask'a geçiş
+    print("[Phase1→2] ✅ MC hazır — Flask+SocketIO başlatılıyor...", flush=True)
+    try:
+        srv.server_close()
+    except Exception:
+        pass
+
+    # Bellek temizle
+    try: open("/proc/sys/vm/drop_caches", "w").write("1")
+    except Exception: pass
+
+    # Daemon thread'leri başlat
     threading.Thread(target=_ram_monitor,  daemon=True).start()
     threading.Thread(target=_ram_watchdog, daemon=True).start()
-    # cluster.py thread'leri MC başladıktan sonra lazy yüklenir
-    # _pool_health_watchdog ve _pool_auto_optimize cluster içinde
+    _register_cluster_blueprint()
+
+    print(f"[Phase2] 🚀 Flask+SocketIO :{PANEL_PORT} başlatılıyor...", flush=True)
+    socketio.run(app, host="0.0.0.0", port=PANEL_PORT,
+                 debug=False, use_reloader=False, log_output=False)
+
 
 if __name__ == "__main__":
     MC_DIR.mkdir(parents=True, exist_ok=True)
     if MC_ONLY:
         _run_mc_only()
     else:
-        print(f"[MC Panel v10.0] :{PANEL_PORT} başlatılıyor...")
-        socketio.run(app, host="0.0.0.0", port=PANEL_PORT,
-                     debug=False, use_reloader=False, log_output=False)
+        _minimal_http_phase()
