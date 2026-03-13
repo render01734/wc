@@ -176,13 +176,14 @@ def _parse_mc_output(line: str):
         try: _bootstrap_done.set()
         except Exception: pass
 
-    # iostream error → oyuncu dosyasi yok/bozuk → gercerli JSON olustur
+    # iostream error / player dosyasi sorunu
     if "iostream error" in line or "statistics file loading failed" in line:
         threading.Thread(target=_ensure_runtime_dirs, daemon=True).start()
+        # Player "Ray" save or statistics file loading failed
         m_pname = re.search(r'Player "([A-Za-z0-9_]+)"', line)
         if m_pname:
             threading.Thread(
-                target=_create_player_files, args=(m_pname.group(1),), daemon=True
+                target=_reset_player_files, args=(m_pname.group(1),), daemon=True
             ).start()
 
     if "Stopping server" in line or "Shutting down" in line:
@@ -194,52 +195,48 @@ def _players_list():
     return [{"name": n, **info} for n, info in players.items()]
 
 
-def _create_player_files(player_name: str):
+def _reset_player_files(player_name: str):
     """
-    Cuberite yeni oyuncu girisi: player JSON yok → iostream → kick.
-    Cozum: Cuberite'in bekledigi GERCERLI minimal player JSON olustur.
-    Bos {} kabul etmiyor — zorunlu alanlar lazim.
+    Cuberite player dosyasi sorunu:
+    - Asıl neden: dosya yok veya bizim yazdığımız JSON formatı yanlış
+    - Çözüm: SİL → Cuberite kendi doğru formatında yeniden oluştursun
+    - Dizin izinlerini 777 yap ki Cuberite yazabilsin
     """
-    import json as _j
-    _CUBERITE_PLAYER = {
-        "position": [0.0, 65.0, 0.0],
-        "rotation": [0.0, 0.0, 0.0],
-        "velocity": [0.0, 0.0, 0.0],
-        "health": 20,
-        "foodLevel": 20,
-        "foodSaturationLevel": 5.0,
-        "foodTickTimer": 0,
-        "xpTotal": 0, "xpLevel": 0, "xpP": 0.0, "score": 0,
-        "isHardcore": False,
-        "inventory": {}, "enderchestinventory": {},
-        "world": "world", "gamemode": 2,
-        "SpawnX": 0, "SpawnY": 65, "SpawnZ": 0,
-        "AirLevel": 300, "maxAirLevel": 300,
-        "torchPlacedSinceLastPickup": False
-    }
-    _pjson = _j.dumps(_CUBERITE_PLAYER, indent=2)
-    created = []
-    # Ana player dosyasi
-    pf = MC_DIR / "players" / f"{player_name}.json"
-    pf.parent.mkdir(parents=True, exist_ok=True)
-    if not pf.exists() or pf.stat().st_size < 10:
-        pf.write_text(_pjson)
-        created.append("players/" + pf.name)
-    # stats — Cuberite bos JSON kabul eder
-    sf = MC_DIR / "world" / "data" / "stats" / f"{player_name}.json"
-    sf.parent.mkdir(parents=True, exist_ok=True)
-    if not sf.exists() or sf.stat().st_size < 2:
-        sf.write_text("{}")
-        created.append("stats/" + sf.name)
-    if created:
-        log(f"[Players] ✅ {player_name}: {created} olusturuldu — yeniden baglanabilir")
-    else:
-        # Dosya var ama Cuberite hala okuyamiyor → sil, yeniden yaz
+    import subprocess as _sp
+    players_dir = MC_DIR / "players"
+    stats_dir   = MC_DIR / "world" / "data" / "stats"
+
+    # Dizinler kesinlikle var ve yazılabilir olsun
+    players_dir.mkdir(parents=True, exist_ok=True)
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _sp.run(["chmod", "777",
+                 str(players_dir), str(stats_dir),
+                 str(MC_DIR / "world" / "data"),
+                 str(MC_DIR / "world"),
+                 str(MC_DIR),
+                 ], capture_output=True, timeout=5)
+    except Exception: pass
+
+    deleted = []
+    # Tüm olası player dosyalarını SİL — Cuberite kendi yazar
+    for fp in [
+        players_dir / f"{player_name}.json",
+        players_dir / f"{player_name.lower()}.json",
+        stats_dir   / f"{player_name}.json",
+        stats_dir   / f"{player_name.lower()}.json",
+        MC_DIR / "world" / "playerdata" / f"{player_name}.json",
+    ]:
         try:
-            pf.write_text(_pjson)
-            log(f"[Players] 🔄 {player_name}: dosya yeniden yazildi")
+            if fp.exists():
+                fp.unlink()
+                deleted.append(fp.name)
         except Exception as _e:
-            log(f"[Players] ❌ {player_name}: {_e}")
+            log(f"[Players] ⚠️  silinemedi {fp.name}: {_e}")
+
+    action = f"silindi: {deleted}" if deleted else "zaten yoktu"
+    log(f"[Players] 🔄 {player_name} dosyalari {action} — Cuberite yeniden olusturacak")
+    log(f"[Players] ➡️  {player_name} sunucuya yeniden baglanabilir")
 
 
 def _ensure_runtime_dirs():
@@ -1029,6 +1026,7 @@ def get_cuberite_cmd() -> list:
     wrapper = MC_DIR / "_start_cuberite.sh"
     wrapper.write_text(
         "#!/bin/sh\n"
+        f"umask 000\n"
         f"chmod -R 777 {MC_DIR} 2>/dev/null || true\n"
         f"mkdir -p {MC_DIR}/world/data/stats "
         f"{MC_DIR}/world/data "
@@ -1040,6 +1038,9 @@ def get_cuberite_cmd() -> list:
         f"chmod 777 {MC_DIR}/world/data {MC_DIR}/world/data/stats "
         f"{MC_DIR}/world/playerdata {MC_DIR}/players 2>/dev/null || true\n"
         f"rm -f {MC_DIR}/world/data/scoreboard.dat 2>/dev/null || true\n"
+        # Önceki bozuk player dosyalarını temizle — Cuberite ilk girişte kendi yazar
+        f"find {MC_DIR}/players -name '*.json' -size -10c -delete 2>/dev/null || true\n"
+        f"find {MC_DIR}/world/data/stats -name '*.json' -size -10c -delete 2>/dev/null || true\n"
         f"exec {MC_BIN}\n"
     )
     wrapper.chmod(0o755)
