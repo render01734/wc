@@ -906,6 +906,7 @@ def _patch_cuberite_data():
     1. Protocol/1.13/base.recipes.txt  — Cuberite bu dosyayı içermiyor, boş oluştur
     2. Protocol/1.14.4/base.recipes.txt — aynı
     3. JungleTemple.cubeset — BambooJungle ve BambooJungleHills Cuberite'de yok, kaldır
+    4. PlayerSave Lua plugin — HOOK_LOGIN ile stats dosyasını giriş öncesi hazırlar
     """
     import re as _re
 
@@ -926,9 +927,7 @@ def _patch_cuberite_data():
         try:
             _txt = _cubeset.read_text()
             _original = _txt
-            # "BambooJungle", "BambooJungleHills" değerlerini AllowedBiomes listesinden sil
             for _bm in ("BambooJungleHills", "BambooJungle"):
-                # virgülle başlayan veya biten satırı temizle
                 _txt = _re.sub(r',\s*"' + _bm + r'"', '', _txt)
                 _txt = _re.sub(r'"' + _bm + r'"\s*,\s*', '', _txt)
                 _txt = _re.sub(r'"' + _bm + r'"', '', _txt)
@@ -937,6 +936,77 @@ def _patch_cuberite_data():
                 log("[Panel] JungleTemple.cubeset: BambooJungle biyomları kaldırıldı")
         except Exception as _e:
             log(f"[Panel] cubeset patch hatası: {_e}")
+
+    # ── 4: PlayerSave Lua plugin — her zaman taze yaz ──────────────
+    # HOOK_LOGIN (player entity oluşmadan önce) ile stats dosyasını hazırlar.
+    # Cuberite {"stats":{}} formatını bekler — {} veya eksik dosya iostream hatası verir.
+    _plugin_dir = MC_DIR / "Plugins" / "PlayerSave"
+    _plugin_dir.mkdir(parents=True, exist_ok=True)
+    _plugin_main = _plugin_dir / "main.lua"
+    _plugin_main.write_text(r'''-- PlayerSave v1.0 — stats/player dosyası iostream hatasını önler
+-- HOOK_LOGIN: player entity oluşmadan ÖNCE stats dosyasını hazırla
+-- Cuberite {"stats":{}} formatını bekler; {} veya eksik dosya kick verir
+
+local EMPTY_STATS = '{"stats":{}}'
+
+local function EnsureDir(path)
+    os.execute('mkdir -p "' .. path .. '" 2>/dev/null')
+    os.execute('chmod 777 "' .. path .. '" 2>/dev/null')
+end
+
+local function IsValidStats(path)
+    local f = io.open(path, "r")
+    if not f then return false end
+    local c = f:read("*all"); f:close()
+    return c and c:find('"stats"') ~= nil
+end
+
+local function WriteStats(path, name)
+    local f = io.open(path, "w")
+    if f then
+        f:write(EMPTY_STATS); f:close()
+        os.execute('chmod 666 "' .. path .. '" 2>/dev/null')
+        LOG("[PlayerSave] " .. name .. " stats hazir")
+    end
+end
+
+function OnLogin(Client, ProtocolVersion, Username)
+    if not Username or Username == "" then return false end
+    local dir  = "world/data/stats"
+    local path = dir .. "/" .. Username .. ".json"
+    EnsureDir(dir)
+    EnsureDir("players")
+    if not IsValidStats(path) then
+        local bak = dir .. "/_bak_" .. Username .. ".json"
+        os.rename(path, bak)
+        WriteStats(path, Username)
+    end
+    return false
+end
+
+function OnPlayerDestroyed(Player)
+    local name = Player:GetName()
+    local path = "world/data/stats/" .. name .. ".json"
+    if not IsValidStats(path) then
+        WriteStats(path, name)
+    end
+    return false
+end
+
+function Initialize(Plugin)
+    Plugin:SetName("PlayerSave")
+    Plugin:SetVersion(1)
+    cPluginManager.AddHook(cPluginManager.HOOK_LOGIN,            OnLogin)
+    cPluginManager.AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
+    LOG("[PlayerSave] v1.0 aktif — HOOK_LOGIN + HOOK_PLAYER_DESTROYED")
+    return true
+end
+
+function OnDisable()
+    LOG("[PlayerSave] devre disi")
+end
+''')
+    log("[Panel] PlayerSave Lua plugin yazıldı: Plugins/PlayerSave/main.lua")
 
 
 def download_paper():
@@ -1064,6 +1134,11 @@ def write_server_config():
         f"[AntiCheat]\n"
         f"LimitPlayerBlockChanges=false\n"
         f"AllowFlight=true\n"
+        f"\n"
+        f"[Plugins]\n"
+        f"Core=1\n"
+        f"ChatLog=1\n"
+        f"PlayerSave=1\n"            # stats/player dosyası iostream hatasını önler
     )
 
     # ── world.ini — Dünya ayarları ──────────────────────────────
