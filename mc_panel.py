@@ -23,6 +23,15 @@ from pathlib import Path
 import eventlet
 eventlet.monkey_patch()
 
+import resource as _resource
+try:
+    _PANEL_LIMIT = 480 * 1024 * 1024
+    _s, _h = _resource.getrlimit(_resource.RLIMIT_AS)
+    if _h == _resource.RLIM_INFINITY or _h > _PANEL_LIMIT:
+        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _PANEL_LIMIT))
+except Exception:
+    pass
+
 from flask import Flask, request, jsonify, send_file, abort, Response
 from cluster import vcluster, cluster_api
 from flask_socketio import SocketIO, emit
@@ -62,8 +71,15 @@ server_state = {
 _agents: dict = {}
 _agents_lock  = threading.Lock()
 
+import gc as _gc_mod
+
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
+
+@app.after_request
+def _gc_after(resp):
+    _gc_mod.collect(0)
+    return resp
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
                     ping_timeout=60, ping_interval=25)
 if cluster_api: app.register_blueprint(cluster_api)
@@ -2324,4 +2340,17 @@ if __name__ == "__main__":
     if MC_ONLY:
         _run_mc_only()
     else:
-        _minimal_http_phase()
+        # Cuberite C++ ~50MB — iki fazlı başlatmaya gerek yok, direkt Flask
+        threading.Thread(target=_ram_monitor,          daemon=True).start()
+        threading.Thread(target=_ram_watchdog,         daemon=True).start()
+        threading.Thread(target=_pool_health_watchdog, daemon=True).start()
+        threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
+        def _auto_start_mc():
+            import time as _t; _t.sleep(3)
+            try: start_server()
+            except Exception as e:
+                print(f"[Panel] ⚠️  MC başlatma hatası: {e}", flush=True)
+        threading.Thread(target=_auto_start_mc, daemon=True).start()
+        print(f"[Panel] 🚀 Flask+SocketIO :{PANEL_PORT}", flush=True)
+        socketio.run(app, host="0.0.0.0", port=PANEL_PORT,
+                     debug=False, use_reloader=False, log_output=False)

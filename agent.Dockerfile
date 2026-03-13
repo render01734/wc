@@ -14,14 +14,14 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 
 WORKDIR /app
 
-# Normal agent modu için
+# Normal agent modu
 COPY agent.py     ./agent.py
 
-# IS_PANEL=1 modu için (panel agent mc_panel.py + cluster.py gerektirir)
+# IS_PANEL=1 modu için (panel bu dosyaları başlatır)
 COPY mc_panel.py  ./mc_panel.py
 COPY cluster.py   ./cluster.py
 
-# Dizinler: normal agent + cuberite_cache (Cuberite C++ uyumlu)
+# Dizinler — cuberite_cache Cuberite C++ uyumlu
 RUN mkdir -p \
     /agent_data/regions/world \
     /agent_data/regions/world_nether \
@@ -34,7 +34,6 @@ RUN mkdir -p \
 
 EXPOSE 8080 5000
 
-# Başlatma:
-#   IS_PANEL=0 → normal agent (PORT=8080)
-#   IS_PANEL=1 → panel host: mc_panel.py'yi WORKER_URL ile başlatır (PORT=5000)
+# IS_PANEL=0 → agent (PORT=8080)
+# IS_PANEL=1 → panel host: mc_panel.py WORKER_URL ile (PORT=5000)
 CMD ["python3", "/app/agent.py"]
