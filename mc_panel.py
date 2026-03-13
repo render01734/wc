@@ -2062,6 +2062,85 @@ def api_admin_cleanup_status():
     })
 
 
+@app.route("/api/admin/full-wipe", methods=["POST"])
+def api_admin_full_wipe():
+    """
+    Tam sıfırlama:
+      1. MC_DIR içindeki TÜM dosyaları sil (Cuberite binary HARİÇ)
+      2. Tüm agentlara POST /api/admin/wipe-all gönder
+    Sunucuyu yeniden başlatmaz — frontend yapar.
+    """
+    d = request.json or {}
+    if not d.get("confirmed"):
+        return jsonify({"ok": False, "error": "confirmed=true gerekli"}), 400
+
+    import shutil as _shutil
+
+    # ── 1. Yerel temizlik (binary hariç her şey) ─────────────────
+    local_deleted = 0
+    local_errors  = []
+    KEEP_NAMES    = {"Cuberite", "Cuberite.exe", "userswap.so"}
+
+    for item in list(MC_DIR.iterdir()):
+        if item.name in KEEP_NAMES:
+            continue
+        try:
+            if item.is_dir():
+                _shutil.rmtree(str(item), ignore_errors=True)
+                local_deleted += 1
+                log(f"[Wipe] 🗑️  Klasör silindi: {item.name}")
+            else:
+                item.unlink(missing_ok=True)
+                local_deleted += 1
+        except Exception as _e:
+            local_errors.append(f"{item.name}: {_e}")
+
+    log(f"[Wipe] ✅ Yerel: {local_deleted} öğe silindi")
+
+    # ── 2. Agentlara wipe komutu gönder ──────────────────────────
+    agent_results = []
+    with _agents_lock:
+        healthy_agents = [a for a in _agents.values() if a.get("healthy")]
+
+    for ag in healthy_agents:
+        try:
+            import json as _jw
+            payload = _jw.dumps({"confirmed": True}).encode()
+            req = _urllib_req.Request(
+                ag["url"] + "/api/admin/wipe-all",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _urllib_req.urlopen(req, timeout=30) as resp:
+                ar = _jw.loads(resp.read())
+                ar["node_id"] = ag["node_id"]
+                agent_results.append(ar)
+                log(f"[Wipe] ✅ Agent {ag['node_id']}: {ar.get('deleted', 0)} dosya silindi")
+        except Exception as _e:
+            agent_results.append({"node_id": ag["node_id"], "error": str(_e), "deleted": 0})
+            log(f"[Wipe] ⚠️  Agent {ag['node_id']} hata: {_e}")
+
+    # ── 3. Global state sıfırla ───────────────────────────────────
+    players.clear()
+    server_state.update({
+        "status": "stopped", "tps": 20.0, "ram_mb": 0,
+        "uptime": 0, "started": None, "online_players": 0,
+    })
+    try: socketio.emit("players_update", [])
+    except Exception: pass
+    try: socketio.emit("server_status", server_state)
+    except Exception: pass
+
+    log(f"[Wipe] 🔥 Tam sıfırlama tamamlandı")
+    return jsonify({
+        "ok":           True,
+        "local_deleted": local_deleted,
+        "local_errors":  local_errors,
+        "agents":        agent_results,
+    })
+
+
 # ── Oyuncu yönetimi ───────────────────────────────────────────
 
 @app.route("/api/players")
@@ -2584,6 +2663,7 @@ select.set-inp option{background:#1e1e1e}
     <div class="nav-sec">İzleme</div>
     <div class="nav-item" data-page="perf"><span class="ico">📈</span>Performans</div>
     <div class="nav-item" data-page="pool"><span class="ico">🔗</span>Kaynak Havuzu <span id="pool-badge" style="background:rgba(124,106,255,.2);color:var(--a2);border-radius:20px;padding:1px 6px;font-size:10px;margin-left:auto">0</span></div>
+    <div class="nav-item" data-page="cleanup"><span class="ico">🧹</span>Temizleme</div>
   </nav>
   <div class="sb-ctrl">
     <button class="ctrl-btn cb-start"   onclick="srvAction('start')">▶ Başlat</button>
@@ -2904,6 +2984,105 @@ select.set-inp option{background:#1e1e1e}
   </div>
 
   </div><!-- /pages -->
+
+  <!-- ════════════════════════════════════════════════════════ -->
+  <!--  TEMIZLEME SAYFASI                                       -->
+  <!-- ════════════════════════════════════════════════════════ -->
+  <div class="page" id="page-cleanup" style="max-width:900px;margin:0 auto">
+
+    <!-- Disk Durumu -->
+    <div class="card" style="margin-bottom:14px" id="cleanup-status-card">
+      <div class="card-hd">💾 Disk Durumu</div>
+      <div id="cleanup-disk-info" style="color:var(--t2);font-size:13px;padding:8px 0">
+        Yükleniyor...
+      </div>
+    </div>
+
+    <!-- Seçici temizlik -->
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-hd">🔧 Seçici Temizlik</div>
+      <div style="color:var(--t2);font-size:12px;margin-bottom:14px">
+        Sadece seçili kategorileri temizler. Sunucu yeniden başlatılmaz.
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="cat-corrupt" checked style="accent-color:var(--a1);width:15px;height:15px">
+          <span>🐛 Bozuk JSON dosyaları</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="cat-empty" checked style="accent-color:var(--a1);width:15px;height:15px">
+          <span>📭 0 byte boş dosyalar</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="cat-tmp" checked style="accent-color:var(--a1);width:15px;height:15px">
+          <span>🗑 .tmp / .bak geçici dosyalar</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="cat-old_bak" checked style="accent-color:var(--a1);width:15px;height:15px">
+          <span>📁 7+ gün eski yedekler</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="cat-old_logs" checked style="accent-color:var(--a1);width:15px;height:15px">
+          <span>📜 30+ gün eski loglar</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="cat-crash" checked style="accent-color:var(--a1);width:15px;height:15px">
+          <span>💥 3+ gün eski crash raporları</span>
+        </label>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn b-ghost" onclick="cleanupDryRun()">🔍 Önizle (Silme)</button>
+        <button class="btn b-purp" onclick="cleanupRun()">🧹 Temizle (Ana + Agentlar)</button>
+      </div>
+    </div>
+
+    <!-- Önizleme / Sonuç -->
+    <div class="card" id="cleanup-result-card" style="margin-bottom:14px;display:none">
+      <div class="card-hd" id="cleanup-result-title">Sonuç</div>
+      <div id="cleanup-result-body" style="font-size:12px;font-family:var(--mono);line-height:1.8;max-height:280px;overflow-y:auto"></div>
+    </div>
+
+    <!-- TAM SİLME — Tehlikeli Bölge -->
+    <div class="card" style="border:1px solid rgba(255,71,87,.3);margin-bottom:14px">
+      <div class="card-hd" style="color:var(--red)">⚠️ Tehlikeli Bölge — Tam Sıfırlama</div>
+      <div style="color:var(--t2);font-size:12px;line-height:1.7;margin-bottom:16px">
+        Bu işlem <strong style="color:var(--t1)">tüm sunucu verilerini</strong> (dünya, oyuncular, eklentiler, config) ve
+        <strong style="color:var(--t1)">tüm agent disklerindeki her şeyi</strong> kalıcı olarak siler.
+        Sunucu otomatik yeniden başlatılır ve sıfırdan başlar.<br>
+        <span style="color:var(--red);font-size:11px">⚠️ Bu işlem GERİ ALINAMAZ!</span>
+      </div>
+
+      <!-- Onay kutuları -->
+      <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:16px">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px;padding:10px;background:rgba(255,71,87,.07);border-radius:8px;border:1px solid rgba(255,71,87,.15)">
+          <input type="checkbox" id="wipe-confirm-1" style="accent-color:var(--red);width:16px;height:16px">
+          <span>Tüm dünya verilerinin, oyuncu kayıtlarının ve config dosyalarının <strong>kalıcı olarak silineceğini</strong> anlıyorum</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px;padding:10px;background:rgba(255,71,87,.07);border-radius:8px;border:1px solid rgba(255,71,87,.15)">
+          <input type="checkbox" id="wipe-confirm-2" style="accent-color:var(--red);width:16px;height:16px">
+          <span>Tüm agent disklerindeki <strong>önbellek ve yedek dosyaların silineceğini</strong> anlıyorum</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px;padding:10px;background:rgba(255,71,87,.07);border-radius:8px;border:1px solid rgba(255,71,87,.15)">
+          <input type="checkbox" id="wipe-confirm-3" style="accent-color:var(--red);width:16px;height:16px">
+          <span>Bu işlemin <strong>geri alınamayacağını</strong> anlıyorum</span>
+        </label>
+      </div>
+
+      <button class="btn b-dang" id="wipe-btn" onclick="doFullWipe()" disabled
+        style="font-size:14px;padding:12px 24px;opacity:0.4;transition:opacity .2s">
+        🗑️ Her Şeyi Sil ve Sunucuyu Sıfırla
+      </button>
+    </div>
+
+    <!-- Wipe ilerleme -->
+    <div id="wipe-progress" style="display:none">
+      <div class="card" style="border:1px solid rgba(255,71,87,.3)">
+        <div class="card-hd" style="color:var(--red)">⏳ Silme İşlemi Devam Ediyor...</div>
+        <div id="wipe-log" style="font-family:var(--mono);font-size:12px;line-height:1.9;max-height:300px;overflow-y:auto;color:#9cdcfe"></div>
+      </div>
+    </div>
+
+  </div>
 </div>
 </div>
 
@@ -2925,8 +3104,8 @@ socket.on('pool_update',    d    => updatePool(d));
 socket.on('download_progress', d => notify(`⬇ %${d.pct}`,'info'));
 
 document.querySelectorAll('.nav-item').forEach(el=>el.addEventListener('click',()=>{const p=el.dataset.page;if(p)navTo(p,el)}));
-const TITLES={dashboard:'📊 Dashboard',console:'💻 Konsol',players:'👥 Oyuncular',whitelist:'📋 Beyaz Liste',banlist:'🔨 Ban Listesi',plugins:'🔌 Pluginler',files:'📁 Dosyalar',worlds:'🌍 Dünyalar',backups:'💾 Yedekler',settings:'⚙️ Ayarlar',perf:'📈 Performans',pool:'🔗 Kaynak Havuzu'};
-const LOADERS={players:refreshPlayers,whitelist:loadWhitelist,banlist:loadBanlist,plugins:loadPlugins,files:()=>fmLoad(curDir),worlds:loadWorlds,backups:loadBackups,settings:loadSettings,perf:loadPerf,pool:loadPoolStatus};
+const TITLES={dashboard:'📊 Dashboard',console:'💻 Konsol',players:'👥 Oyuncular',whitelist:'📋 Beyaz Liste',banlist:'🔨 Ban Listesi',plugins:'🔌 Pluginler',files:'📁 Dosyalar',worlds:'🌍 Dünyalar',backups:'💾 Yedekler',settings:'⚙️ Ayarlar',perf:'📈 Performans',pool:'🔗 Kaynak Havuzu',cleanup:'🧹 Temizleme'};
+const LOADERS={players:refreshPlayers,whitelist:loadWhitelist,banlist:loadBanlist,plugins:loadPlugins,files:()=>fmLoad(curDir),worlds:loadWorlds,backups:loadBackups,settings:loadSettings,perf:loadPerf,pool:loadPoolStatus,cleanup:loadCleanupStatus};
 
 function navTo(page,el){
   document.querySelectorAll('.page').forEach(p=>{p.classList.remove('active');p.style.display='';});
@@ -3076,6 +3255,179 @@ async function poolAction(action,msg){
 }
 
 async function srvAction(a){const r=await api('/api/'+a,{});notify(r.msg||a,'ok');}
+
+// ══════════════════════════════════════════════════════
+//  TEMIZLEME
+// ══════════════════════════════════════════════════════
+
+async function loadCleanupStatus(){
+  const el=document.getElementById('cleanup-disk-info');
+  el.innerHTML='<span style="color:var(--t2)">Yükleniyor...</span>';
+  try{
+    const d=await fetch('/api/admin/cleanup/status').then(r=>r.json());
+    const loc=d.local||{};
+    let html=`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px">
+      <div class="sc"><div class="sc-val">${loc.used_gb||0}GB</div><div class="sc-lbl">Kullanılan (Yerel)</div></div>
+      <div class="sc"><div class="sc-val">${loc.free_gb||0}GB</div><div class="sc-lbl">Boş (Yerel)</div></div>
+      <div class="sc"><div class="sc-val">${loc.pct||0}%</div><div class="sc-lbl">Doluluk</div></div>
+      <div class="sc"><div class="sc-val">${(d.agents||[]).length}</div><div class="sc-lbl">Agent</div></div>
+    </div>`;
+    if((d.agents||[]).length){
+      html+='<div style="font-size:11px;color:var(--t3);margin-bottom:6px">AGENTLAR</div>';
+      html+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">';
+      for(const ag of d.agents){
+        html+=`<div style="background:var(--s3);border-radius:8px;padding:8px;font-size:11px">
+          <div style="color:var(--a1);font-weight:600;margin-bottom:4px">${ag.node_id||'agent'}</div>
+          <div style="color:var(--t2)">💾 ${ag.store_used_gb||0}GB / ${ag.cache_mb||0}MB cache</div>
+        </div>`;
+      }
+      html+='</div>';
+    }
+    el.innerHTML=html;
+  }catch(e){el.innerHTML='<span style="color:var(--red)">Durum alınamadı</span>';}
+  // Checkbox değişince wipe butonunu kontrol et
+  ['wipe-confirm-1','wipe-confirm-2','wipe-confirm-3'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.addEventListener('change',checkWipeReady);
+  });
+}
+
+function checkWipeReady(){
+  const all=[
+    document.getElementById('wipe-confirm-1'),
+    document.getElementById('wipe-confirm-2'),
+    document.getElementById('wipe-confirm-3'),
+  ].every(el=>el&&el.checked);
+  const btn=document.getElementById('wipe-btn');
+  if(btn){btn.disabled=!all;btn.style.opacity=all?'1':'0.4';}
+}
+
+function getSelectedCats(){
+  const cats=[];
+  ['corrupt','empty','tmp','old_bak','old_logs','crash'].forEach(c=>{
+    const el=document.getElementById('cat-'+c);
+    if(el&&el.checked) cats.push(c);
+  });
+  return cats;
+}
+
+function showCleanupResult(title, data, isDryRun){
+  const card=document.getElementById('cleanup-result-card');
+  const titleEl=document.getElementById('cleanup-result-title');
+  const body=document.getElementById('cleanup-result-body');
+  card.style.display='';
+  titleEl.textContent=title;
+
+  const loc=data.local||{};
+  const removed=loc.removed||[];
+  const agents=data.agents||[];
+
+  let html=`<div style="margin-bottom:10px;padding:8px;background:var(--s3);border-radius:6px;display:flex;gap:16px;flex-wrap:wrap">
+    <span>📍 <strong>Yerel:</strong> ${loc.removed_count||0} dosya, ${loc.freed_mb||0}MB</span>`;
+  for(const ag of agents){
+    if(ag.error) html+=`<span style="color:var(--red)">❌ ${ag.node_id}: ${ag.error}</span>`;
+    else html+=`<span>🔗 <strong>${ag.node_id||'agent'}:</strong> ${ag.removed_count||0} dosya, ${ag.freed_mb||0}MB</span>`;
+  }
+  html+=`<span style="margin-left:auto;color:var(--a3)"><strong>Toplam: ${data.total_freed_mb||0}MB</strong></span></div>`;
+
+  if(removed.length){
+    html+='<div style="color:var(--t3);margin-bottom:4px;font-size:10px">YEREL DOSYALAR:</div>';
+    removed.slice(0,50).forEach(f=>{
+      const col=isDryRun?'var(--yellow)':'var(--red)';
+      html+=`<div style="color:${col};padding:1px 0">${isDryRun?'[DRY]':'[SİLİNDİ]'} ${f.path} <span style="color:var(--t3)">(${f.reason}, ${(f.size/1024).toFixed(1)}KB)</span></div>`;
+    });
+    if(removed.length>50) html+=`<div style="color:var(--t3)">... +${removed.length-50} dosya daha</div>`;
+  }else{
+    html+='<div style="color:var(--a3);padding:6px 0">✅ Silinecek/silinen dosya yok</div>';
+  }
+  body.innerHTML=html;
+  card.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+
+async function cleanupDryRun(){
+  const cats=getSelectedCats();
+  if(!cats.length){notify('En az 1 kategori seç','err');return;}
+  notify('🔍 Önizleniyor...','info');
+  const r=await fetch('/api/admin/cleanup/dry-run',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({categories:cats})
+  }).then(r=>r.json()).catch(()=>({ok:false}));
+  if(!r.ok){notify('❌ Önizleme başarısız','err');return;}
+  showCleanupResult(`🔍 Önizleme — ${r.total_freed_mb||0}MB silinecek`,r,true);
+  notify(`🔍 Önizleme: ${r.total_freed_mb||0}MB temizlenebilir`,'info');
+}
+
+async function cleanupRun(){
+  const cats=getSelectedCats();
+  if(!cats.length){notify('En az 1 kategori seç','err');return;}
+  if(!confirm('Seçili kategoriler ana sunucu ve tüm agentlardan temizlenecek. Devam?'))return;
+  notify('🧹 Temizleniyor...','info');
+  const r=await fetch('/api/admin/cleanup',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({dry_run:false,categories:cats})
+  }).then(r=>r.json()).catch(()=>({ok:false}));
+  if(!r.ok){notify('❌ Temizlik başarısız','err');return;}
+  showCleanupResult(`✅ Temizlendi — ${r.total_freed_mb||0}MB boşaltıldı`,r,false);
+  notify(`✅ ${r.total_freed_mb||0}MB temizlendi`,'ok');
+  loadCleanupStatus();
+}
+
+async function doFullWipe(){
+  const confirms=[
+    document.getElementById('wipe-confirm-1'),
+    document.getElementById('wipe-confirm-2'),
+    document.getElementById('wipe-confirm-3'),
+  ];
+  if(!confirms.every(el=>el&&el.checked)){notify('Tüm onay kutularını işaretle','err');return;}
+  if(!confirm('⚠️ SON UYARI: Tüm veriler kalıcı olarak silinecek. Emin misin?'))return;
+
+  const prog=document.getElementById('wipe-progress');
+  const wipeLog=document.getElementById('wipe-log');
+  const card=document.getElementById('wipe-btn').closest('.card');
+  prog.style.display='';
+  document.getElementById('wipe-btn').disabled=true;
+  prog.scrollIntoView({behavior:'smooth'});
+
+  function wlog(msg,color='#9cdcfe'){
+    const ts=new Date().toLocaleTimeString('tr-TR');
+    wipeLog.innerHTML+=`<div style="color:${color}">[${ts}] ${msg}</div>`;
+    wipeLog.scrollTop=wipeLog.scrollHeight;
+  }
+
+  wlog('🔴 Sunucu durduruluyor...','var(--yellow)');
+  await fetch('/api/stop',{method:'POST'}).catch(()=>{});
+  await new Promise(r=>setTimeout(r,3000));
+  wlog('✅ Sunucu durduruldu');
+
+  wlog('🗑️ Tam sıfırlama başlatılıyor...','var(--red)');
+  const r=await fetch('/api/admin/full-wipe',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({confirmed:true})
+  }).then(r=>r.json()).catch(e=>({ok:false,error:String(e)}));
+
+  if(!r.ok){
+    wlog('❌ Hata: '+(r.error||'Bilinmeyen hata'),'var(--red)');
+    notify('❌ Silme başarısız: '+(r.error||''),'err');
+    return;
+  }
+
+  wlog(`✅ Yerel: ${r.local_deleted||0} dosya silindi`,'var(--a3)');
+  for(const ag of (r.agents||[])){
+    if(ag.error) wlog(`❌ ${ag.node_id}: ${ag.error}`,'var(--red)');
+    else wlog(`✅ Agent ${ag.node_id}: ${ag.deleted||0} dosya silindi`,'var(--a3)');
+  }
+
+  wlog('🚀 Sunucu yeniden başlatılıyor...','var(--yellow)');
+  await new Promise(r=>setTimeout(r,2000));
+  await fetch('/api/start',{method:'POST'}).catch(()=>{});
+  wlog('✅ Sunucu başlatıldı — sıfırdan kurulum yapılıyor','var(--a1)');
+  notify('✅ Tam sıfırlama tamamlandı, sunucu başlatıldı','ok');
+
+  // Onayları sıfırla
+  confirms.forEach(el=>{if(el)el.checked=false;});
+  checkWipeReady();
+  setTimeout(()=>loadCleanupStatus(),5000);
+}
 function updatePlayers(list){
   document.getElementById('d-pl').textContent=list.length;
   document.getElementById('tb-pl').textContent=list.length;

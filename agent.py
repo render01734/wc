@@ -930,7 +930,47 @@ def admin_cleanup_status():
     })
 
 
-# ── Toplu işlem ─────────────────────────────────────────────────────────────
+@app.route("/api/admin/wipe-all", methods=["POST"])
+def admin_wipe_all():
+    """
+    Agent diskindeki TÜM dosyaları sil + RAM cache tamamen boşalt.
+    Ana sunucudan POST /api/admin/full-wipe tarafından tetiklenir.
+    """
+    d = request.json or {}
+    if not d.get("confirmed"):
+        return jsonify({"ok": False, "error": "confirmed=true gerekli"}), 400
+
+    import shutil as _shutil
+
+    deleted = 0
+    errors  = []
+
+    # RAM cache tamamen boşalt
+    try:
+        cache.flush("")
+        print(f"[Wipe] RAM cache temizlendi", flush=True)
+    except Exception as _e:
+        errors.append(f"cache_flush: {_e}")
+
+    # AGENT_DATA içindeki her şeyi sil
+    for item in list(AGENT_DATA.iterdir()):
+        try:
+            if item.is_dir():
+                _shutil.rmtree(str(item), ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
+            deleted += 1
+        except Exception as _e:
+            errors.append(f"{item.name}: {_e}")
+
+    # Temel dizin yapısını yeniden oluştur
+    for sub in ["regions/world", "regions/world_nether", "regions/world_the_end",
+                "backups", "plugins", "configs", "chunks", "cuberite_cache"]:
+        try: (AGENT_DATA / sub).mkdir(parents=True, exist_ok=True)
+        except Exception: pass
+
+    print(f"[Wipe] ✅ {deleted} öğe silindi, {len(errors)} hata", flush=True)
+    return jsonify({"ok": True, "deleted": deleted, "errors": errors, "node_id": NODE_ID})
 
 @app.route("/api/bulk/cache_and_store", methods=["POST"])
 def bulk_cache_and_store():
