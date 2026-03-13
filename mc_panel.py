@@ -265,18 +265,47 @@ def _reset_player_files(player_name: str):
 
 def _ensure_runtime_dirs():
     """Cuberite için gerekli dizinleri garantile ve izin ver."""
-    import subprocess as _sp3
-    for _d in [
+    import subprocess as _sp3, struct as _st, gzip as _gz, io as _io
+
+    _all_dirs = [
         MC_DIR / "players",
-        MC_DIR / "world" / "data" / "stats",
+        MC_DIR / "players_backup",
+        MC_DIR / "players_corrupted",
         MC_DIR / "world" / "data",
+        MC_DIR / "world" / "data" / "stats",
         MC_DIR / "world" / "playerdata",
         MC_DIR / "world" / "players",
+        MC_DIR / "world" / "region",
+        MC_DIR / "world_nether" / "data",
         MC_DIR / "world_nether" / "data" / "stats",
+        MC_DIR / "world_nether" / "DIM-1" / "region",
+        MC_DIR / "world_the_end" / "data",
+        MC_DIR / "world_the_end" / "data" / "stats",
+        MC_DIR / "world_the_end" / "DIM1" / "region",
         MC_DIR / "logs",
-    ]:
+        MC_DIR / "crash-reports",
+    ]
+    for _d in _all_dirs:
         _d.mkdir(parents=True, exist_ok=True)
-        try: _sp3.run(["chmod","777",str(_d)], capture_output=True, timeout=2)
+        try: _sp3.run(["chmod", "777", str(_d)], capture_output=True, timeout=2)
+        except Exception: pass
+
+    # scoreboard.dat — gzip+NBT binary (her world için, yoksa oluştur)
+    def _write_sbd(p):
+        def _s(t): b=t.encode(); return _st.pack('>H',len(b))+b
+        def _l(n,e,c): return bytes([9])+_s(n)+bytes([e])+_st.pack('>i',c)
+        def _c(n,pl): return bytes([10])+_s(n)+pl+bytes([0])
+        root = bytes([10])+_s('')+_c('data',_l('Objectives',10,0)+_l('PlayerScores',10,0)+_l('Teams',10,0)+_c('DisplaySlots',b''))+bytes([0])
+        buf=_io.BytesIO()
+        with _gz.GzipFile(fileobj=buf,mode='wb',mtime=0) as gz: gz.write(root)
+        p.write_bytes(buf.getvalue())
+
+    for _w in ("world", "world_nether", "world_the_end"):
+        _sbd = MC_DIR / _w / "data" / "scoreboard.dat"
+        if not _sbd.exists():
+            try: _write_sbd(_sbd); log(f"[Panel] {_w}/data/scoreboard.dat yazildi (NBT)")
+            except Exception as _e: log(f"[Panel] scoreboard hata ({_w}): {_e}")
+        try: _sp3.run(["chmod","666",str(_sbd)], capture_output=True, timeout=2)
         except Exception: pass
 def _backup_players_to_agents():
     """players/*.json dosyalarini agent disk'e yedekle."""
@@ -1206,9 +1235,11 @@ def start_server():
             return False, "Cuberite indirilemedi"
     write_server_config()
 
-    # Bozuk oyuncu kayıt dosyalarını temizle — her başlatmada kontrol
-    # "Your player's save files could not be parsed" hatasının önüne geçer
-    _clean_player_files()
+    # ── Her başlatmada PROAKTİF hazırlık — Cuberite başlamadan önce ──────────
+    # REACTIVE değil — hata GELDIKTEN SONRA değil, BAŞLAMADAN ÖNCE çalıştır
+    _ensure_runtime_dirs()   # world/data/stats/ + diğer kritik dizinler
+    _patch_cuberite_data()   # Protocol placeholders + JungleTemple BambooJungle fix
+    _clean_player_files()    # Bozuk .json → corrupted/ (stats dahil)
 
     server_state.update({"status": "starting", "online_players": 0})
     players.clear()
