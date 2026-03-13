@@ -176,15 +176,23 @@ def _parse_mc_output(line: str):
         try: _bootstrap_done.set()
         except Exception: pass
 
-    # iostream error / player dosyasi sorunu
-    if "iostream error" in line or "statistics file loading failed" in line:
+    # iostream error / player dosyasi sorunu → dosyaları sil (kick sonrası yeniden bağlanır)
+    if ("iostream error" in line or "statistics file loading failed" in line
+            or "save or statistics file loading failed" in line):
         threading.Thread(target=_ensure_runtime_dirs, daemon=True).start()
-        # Player "Ray" save or statistics file loading failed
         m_pname = re.search(r'Player "([A-Za-z0-9_]+)"', line)
         if m_pname:
             threading.Thread(
                 target=_reset_player_files, args=(m_pname.group(1),), daemon=True
             ).start()
+
+    # "prevented from joining" → UUID uyumsuzluğu — dosyaları temizle
+    if "prevented from joining" in line or "could not be parsed" in line:
+        m_pname2 = re.search(r'Player "([A-Za-z0-9_]+)"', line)
+        pname2 = m_pname2.group(1) if m_pname2 else None
+        threading.Thread(
+            target=_reset_player_files, args=(pname2,), daemon=True
+        ).start() if pname2 else threading.Thread(target=_clean_player_files, daemon=True).start()
 
     if "Stopping server" in line or "Shutting down" in line:
         server_state["status"] = "stopping"
@@ -198,10 +206,12 @@ def _players_list():
 def _reset_player_files(player_name: str):
     """
     Cuberite player dosyasi sorunu:
-    - Asıl neden: dosya yok veya bizim yazdığımız JSON formatı yanlış
+    - Asıl neden: Online→Offline geçişinde UUID değişiyor, eski dosya uyumsuz
     - Çözüm: SİL → Cuberite kendi doğru formatında yeniden oluştursun
     - Dizin izinlerini 777 yap ki Cuberite yazabilsin
     """
+    if not player_name:
+        _clean_player_files(); return
     import subprocess as _sp
     players_dir = MC_DIR / "players"
     stats_dir   = MC_DIR / "world" / "data" / "stats"
@@ -859,11 +869,15 @@ def _clean_player_files():
         is_corrupt = False
         try:
             txt = pf.read_text(encoding="utf-8", errors="replace").strip()
-            if not txt:
+            if not txt or len(txt) < 2:
                 is_corrupt = True
             else:
                 obj = _j.loads(txt)
                 if not isinstance(obj, dict):
+                    is_corrupt = True
+                # Cuberite formatında "Position" veya "Inventory" olmalı
+                # Eğer hiçbiri yoksa büyük ihtimalle eski/bozuk format
+                elif not any(k in obj for k in ["Position","Inventory","Health","World","GameMode"]):
                     is_corrupt = True
         except Exception:
             is_corrupt = True
@@ -910,21 +924,41 @@ def write_server_config():
     # ── settings.ini — Ana sunucu ayarları ─────────────────────
     settings = MC_DIR / "settings.ini"
     settings.write_text(
+        # ═══════════════════════════════════════
+        # CRACK MOD (Offline) — Tam Konfigürasyon
+        # ═══════════════════════════════════════
         f"[Server]\n"
         f"Ports={MC_PORT}\n"
         f"MaxPlayers=20\n"
-        f"OnlineMode=false\n"        # Render'da auth sunucusuna erişim yok
+        f"OnlineMode=false\n"            # CRACK MOD — auth yok
         f"Motd=\u00A7aRender MC • Cuberite 1.8.8\n"
         f"AllowFlight=true\n"
         f"Description=Cuberite 1.8.8 on Render\n"
         f"ShutdownMessage=Server kapaniyor...\n"
+        f"HardcoreEnabled=false\n"
+        f"AllowMultiLogin=false\n"       # Aynı ad iki kez giremez (güvenlik)
+        f"DefaultViewDistance=10\n"
+        f"MaxUpgradedViewDistance=10\n"
         f"\n"
         f"[Authentication]\n"
-        f"Authenticate=false\n"      # Offline mode
+        f"Authenticate=false\n"          # CRACK MOD — Mojang auth kapalı
+        f"AllowBungeeCord=false\n"
+        f"OnlyAllowBungeeCord=false\n"
+        f"\n"
+        f"[MojangAPI]\n"
+        f"NameToUUIDServer=\n"           # Boş → offline UUID kullan
+        f"UUIDToProfileServer=\n"        # Boş → offline UUID kullan
         f"\n"
         f"[AntiCheat]\n"
         f"LimitPlayerBlockChanges=false\n"
         f"AllowFlight=true\n"
+        f"\n"
+        f"[Worlds]\n"
+        f"DefaultWorld=world\n"
+        f"\n"
+        f"[Logging]\n"
+        f"LogUserActivity=true\n"
+        f"LogConsoleActivity=true\n"
     )
 
     # ── world.ini — Dünya ayarları ──────────────────────────────
@@ -979,6 +1013,26 @@ def write_server_config():
 
     # ── Tüm gerekli dizinler + chmod 777 ─────────────────────────
     # iostream error kaynagi: stats/ ve playerdata/ dizinleri yok
+    # ── Scoreboard.dat oluştur (yoksa "Failed to load scoreboard" hatası) ────
+    sb_dat = MC_DIR / "world" / "data" / "scoreboard.dat"
+    if not sb_dat.exists():
+        (MC_DIR / "world" / "data").mkdir(parents=True, exist_ok=True)
+        # Minimal valid NBT binary: boş scoreboard
+        sb_dat.write_bytes(bytes([
+            0x0a, 0x00, 0x00,                    # TAG_Compound (root, no name)
+            0x0a, 0x00, 0x04, 0x64, 0x61, 0x74,  # TAG_Compound "dat"
+            0x61,
+            0x09, 0x00, 0x0a, 0x4f, 0x62, 0x6a,  # TAG_List "Objectives"
+            0x65, 0x63, 0x74, 0x69, 0x76, 0x65,
+            0x73, 0x0a, 0x00, 0x00, 0x00, 0x00,  # type=Compound, count=0
+            0x09, 0x00, 0x0d, 0x50, 0x6c, 0x61,  # TAG_List "PlayerScores"
+            0x79, 0x65, 0x72, 0x53, 0x63, 0x6f,
+            0x72, 0x65, 0x73, 0x0a, 0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,                           # End "dat", End root
+        ]))
+        log("[Panel] ✅ scoreboard.dat oluşturuldu")
+
     import subprocess as _sp
     _mkdirs = [
         MC_DIR / "players",
