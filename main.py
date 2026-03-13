@@ -249,25 +249,104 @@ def auto_start():
         print("  ⚠️  Cuberite port timeout (120s)")
 
 
+def _download_bore() -> str:
+    """
+    bore binary indir — GitHub ekzhang/bore.
+    bore.pub TCP tüneli cloudflared'dan farklı: doğrudan IP:PORT verir,
+    Minecraft istemcisi ekstra yazılım olmadan bağlanabilir.
+    """
+    bore_bin = "/usr/local/bin/bore"
+    if os.path.exists(bore_bin) and os.access(bore_bin, os.X_OK):
+        return bore_bin
+    import tarfile as _tf
+    url = ("https://github.com/ekzhang/bore/releases/download/"
+           "v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz")
+    try:
+        print("  📥 bore indiriliyor...")
+        tmp = "/tmp/bore.tar.gz"
+        with _ur.urlopen(_ur.Request(url, headers={"User-Agent": "MCPanel/14.0"}),
+                         timeout=60) as r:
+            open(tmp, "wb").write(r.read())
+        with _tf.open(tmp, "r:gz") as tf:
+            for m in tf.getmembers():
+                if m.name.endswith("bore") and not m.isdir():
+                    m.name = "bore"
+                    tf.extract(m, "/usr/local/bin/")
+                    break
+        os.chmod(bore_bin, 0o755)
+        os.unlink(tmp)
+        print("  ✅ bore hazır")
+        return bore_bin
+    except Exception as e:
+        print(f"  ⚠️  bore indirilemedi: {e}")
+        return ""
+
+
 def _start_mc_tunnel():
-    log = "/tmp/cf_mc.log"
+    """
+    MC TCP tüneli:
+      1. bore.pub (birincil) — doğrudan IP:PORT, istemci yazılımı gerektirmez
+      2. cloudflared (yedek) — HTTPS URL, istemci tarafında cloudflared gerektirir
+    """
+    # ── bore.pub (birincil) ───────────────────────────────────────────────────
+    bore_bin = _download_bore()
+    if bore_bin:
+        log_bore = "/tmp/bore_mc.log"
+        subprocess.Popen(
+            [bore_bin, "local", str(MC_PORT), "--to", "bore.pub"],
+            stdout=open(log_bore, "w"), stderr=subprocess.STDOUT,
+        )
+        for _ in range(120):
+            try:
+                content = open(log_bore).read()
+                m = re.search(r"bore\.pub:(\d+)", content)
+                if m:
+                    host = f"bore.pub:{m.group(1)}"
+                    url  = f"tcp://{host}"
+                    print(f"\n  ✅ MC Tüneli (bore): {host}\n")
+                    _panel_log(f"[Sistem] ✅ MC Adresi: {host}")
+                    try:
+                        _ur.urlopen(_ur.Request(
+                            f"http://localhost:{PORT}/api/internal/tunnel",
+                            data=json.dumps({"url": url, "host": host}).encode(),
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        ), timeout=3)
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+            time.sleep(0.5)
+        print("  ⚠️  bore tüneli yanıt vermedi — cloudflared deneniyor")
+
+    # ── cloudflared (yedek) ───────────────────────────────────────────────────
+    # ÖNEMLİ: cloudflared TCP tüneli istemci tarafında da cloudflared gerektirir!
+    # Oyuncular doğrudan bağlanamaz. Sadece yedek olarak kullanılır.
+    log_cf = "/tmp/cf_mc.log"
     subprocess.Popen(
         ["cloudflared", "tunnel", "--url", f"tcp://localhost:{MC_PORT}",
          "--no-autoupdate", "--loglevel", "info"],
-        stdout=open(log, "w"), stderr=subprocess.STDOUT,
+        stdout=open(log_cf, "w"), stderr=subprocess.STDOUT,
     )
     for _ in range(120):
         try:
-            urls = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com",
-                              open(log).read())
-            if urls:
-                url  = urls[0]
-                host = url.replace("https://", "")
-                print(f"\n  ✅ MC Tüneli: {host}\n")
+            cf_urls = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com",
+                                 open(log_cf).read())
+            if cf_urls:
+                cf_url  = cf_urls[0]
+                cf_host = cf_url.replace("https://", "")
+                note    = "(cloudflared gerekli — bore başarısız)"
+                print(f"\n  ⚠️  MC Tüneli (cloudflared): {cf_host}")
+                print(f"  NOT: Oyuncular doğrudan bağlanamaz!")
+                print(f"  Bağlanmak için: cloudflared access tcp "
+                      f"--hostname {cf_host} --url localhost:25566")
+                print(f"  Sonra Minecraft'ta: localhost:25566\n")
                 try:
                     _ur.urlopen(_ur.Request(
                         f"http://localhost:{PORT}/api/internal/tunnel",
-                        data=json.dumps({"url": url, "host": host}).encode(),
+                        data=json.dumps({"url": cf_url,
+                                         "host": f"{cf_host} {note}"}).encode(),
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     ), timeout=3)

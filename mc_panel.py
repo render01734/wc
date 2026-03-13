@@ -24,12 +24,13 @@ import eventlet
 eventlet.monkey_patch()
 
 import resource as _resource
-# NOT: RLIMIT_AS hard limiti ARTIK set edilmiyor.
-# Daha önce (480MB, 480MB) ile kilitleniyordu → Cuberite alt process'i
-# _child_setup içinde RLIM_INFINITY'e çekmeye çalışıyordu ama hard limit
-# kilitli olduğundan başarısız olup sessizce atlıyordu.
-# Sonuç: Cuberite 480MB sanal adres alanına sıkışıp Lua OOM veriyordu.
-# Çözüm: Sınırı hiç koymuyoruz; kernel zaten cgroup ile yönetiyor.
+try:
+    _PANEL_LIMIT = 480 * 1024 * 1024
+    _s, _h = _resource.getrlimit(_resource.RLIMIT_AS)
+    if _h == _resource.RLIM_INFINITY or _h > _PANEL_LIMIT:
+        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _PANEL_LIMIT))
+except Exception:
+    pass
 
 from flask import Flask, request, jsonify, send_file, abort, Response
 from cluster import vcluster, cluster_api
@@ -55,7 +56,7 @@ MC_VERSION = "1.8.8"  # Cuberite 1.8.8 uyumlu
 
 # ── Global durum ─────────────────────────────────────────────
 mc_process   = None
-console_buf  = deque(maxlen=500)   # 3000→500: ~12MB RAM kazanımı
+console_buf  = deque(maxlen=3000)
 players      = {}
 tunnel_info  = {"url": "", "host": ""}
 _bootstrap_done = threading.Event()  # MC "Done!" gelince set edilir
@@ -89,10 +90,28 @@ vcluster.set_socketio(socketio)
 #  YARDIMCI FONKSİYONLAR
 # ══════════════════════════════════════════════════════════════
 
+_spawn_emit_counter = 0   # spawn chunk log throttle sayacı
+
 def log(line: str):
+    global _spawn_emit_counter
     ts    = datetime.now().strftime("%H:%M:%S")
     entry = {"ts": ts, "line": line.rstrip()}
     console_buf.append(entry)
+
+    # "Preparing spawn" satırlarını throttle et — her 20'de 1 emit et.
+    # Aksi hâlde 400 chunk × hızlı akış → SocketIO kuyruğu dolup UI donuyor.
+    if "Preparing spawn" in line or "chunks / sec" in line:
+        _spawn_emit_counter += 1
+        m = re.search(r'(\d+(?:\.\d+)?)%', line)
+        pct = float(m.group(1)) if m else -1
+        # Yalnızca %1, %25, %50, %75, %99+ ve her 20. satırı emit et
+        if pct not in (-1,) and pct < 99 and _spawn_emit_counter % 20 != 0:
+            _parse_mc_output(line)  # parse et ama emit etme
+            return
+        _spawn_emit_counter = 0
+    else:
+        _spawn_emit_counter = 0
+
     socketio.emit("console_line", entry)
     _parse_mc_output(line)
 
@@ -729,10 +748,6 @@ def write_server_config():
         f"AllowFlight=true\n"
         f"Description=Cuberite 1.8.8 on Render\n"
         f"ShutdownMessage=Server kapaniyor...\n"
-        # MaxViewDistance=4 → spawn chunk sayısı 400→81 (%75 azalma)
-        # Varsayılan 10 ile başlangıçta 400 chunk Lua'da OOM'a neden oluyordu.
-        # RAM izinli olduğunda watchdog view-distance 8'e yükseltir.
-        f"MaxViewDistance=4\n"
         f"\n"
         f"[Authentication]\n"
         f"Authenticate=false\n"      # Offline mode
@@ -762,17 +777,13 @@ def write_server_config():
             f"\n"
             f"[Mobs]\n"
             f"MaxMobDistanceFromPlayer=80\n"
-            f"MaxAnimals=4\n"          # 8→4: mob hesaplama RAM kullanımı azaltıldı
-            f"MaxMonsters=20\n"        # 40→20: azaltıldı
-            f"MaxWaterMobs=2\n"        # 3→2
+            f"MaxAnimals=8\n"          # Azaltıldı (RAM tasarrufu)
+            f"MaxMonsters=40\n"        # Azaltıldı
+            f"MaxWaterMobs=3\n"
             f"\n"
             f"[Chunking]\n"
-            f"ChunkDestroyTimer=30\n"  # 60→30sn: kullanılmayan chunk'ları daha çabuk temizle
+            f"ChunkDestroyTimer=60\n"  # 60sn kullanılmayan chunk kaldır
             f"LimitedHeightWorld=false\n"
-            f"\n"
-            f"[WorldLimit]\n"
-            f"LimitX=1500\n"           # Dünya sınırı: spawn OOM önlemek için
-            f"LimitZ=1500\n"
         )
 
     # ── webadmin.ini — Cuberite web admin (kapalı, Panel var) ──
@@ -851,13 +862,8 @@ def start_server():
         def _child_setup():
             try:
                 import resource as _r
-                # Hard + soft limiti tamamen kaldır — Lua OOM'un önüne geç
-                _r.setrlimit(_r.RLIMIT_AS,   (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
-                _r.setrlimit(_r.RLIMIT_DATA, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
-            except Exception as _rl_err:
-                # Başarısız olursa stderr'e yaz (panel loguna da düşer)
-                import sys as _sys
-                print(f"[Panel] ⚠️  RLIMIT kaldırma hatası: {_rl_err}", file=_sys.stderr)
+                _r.setrlimit(_r.RLIMIT_AS, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
+            except Exception: pass
             try:
                 open("/proc/self/oom_score_adj", "w").write("-900")
             except Exception: pass
@@ -888,7 +894,7 @@ def stop_server(force=False):
     if force:
         mc_process.kill()
     else:
-        send_command("/save"); time.sleep(1); send_command("/stop")
+        send_command("save"); time.sleep(2); send_command("stop")
     return True, "Durduruluyor..."
 
 
@@ -931,13 +937,11 @@ def _ram_watchdog():
                 except: pass
 
                 if _consecutive_low >= 3:
-                    # MC'ye temizlik komutları
-                    send_command("kill @e[type=item]")
-                    send_command("kill @e[type=experience_orb]")
+                    # Cuberite'de item/xp entity temizleme Lua API ile yapılır.
+                    # Konsol komutu yok — sadece save ile chunk flush et
+                    send_command("save")
                 if _consecutive_low >= 6:
-                    send_command("save-all")
-                    # View distance'ı geçici düşür
-                    send_command("minecraft:view-distance 4")
+                    send_command("save")
                 log(f"[Panel] ⚠️  RAM kritik: phys={phys_avail_mb}MB swap_free={swap_free_mb}MB")
 
             elif phys_avail_mb < 150:
@@ -947,9 +951,7 @@ def _ram_watchdog():
 
             else:
                 _consecutive_low = 0
-                # Başlangıç view-distance zaten 4 — yalnızca swap bolsa yükselt
-                if swap_free_mb > 2000:
-                    send_command("minecraft:view-distance 6")
+                # Cuberite'de runtime view-distance değişikliği yok — no-op
 
         except: pass
 
@@ -1473,11 +1475,11 @@ def api_world_backup():
     if not src.exists(): return jsonify({"ok":False,"error":"Dünya bulunamadı"})
     ts=datetime.now().strftime("%Y%m%d_%H%M%S"); dest=MC_DIR/"backups"/f"{world}_{ts}.zip"
     dest.parent.mkdir(exist_ok=True)
-    send_command("save-off"); time.sleep(1); send_command("save-all"); time.sleep(2)
+    send_command("save"); time.sleep(2)   # Cuberite: save-off/save-all/save-on yok → sadece save
     with zipfile.ZipFile(str(dest),"w",zipfile.ZIP_DEFLATED) as z:
         for fp in src.rglob("*"):
             if fp.is_file(): z.write(fp,fp.relative_to(MC_DIR))
-    send_command("save-on")
+    # save-on yok — save sonrası otomatik devam eder
     return jsonify({"ok":True,"file":str(dest.relative_to(MC_DIR)),"size":dest.stat().st_size})
 
 @app.route("/api/worlds/delete", methods=["POST"])
@@ -1960,7 +1962,7 @@ select.set-inp option{background:#1e1e1e}
         <button class="btn b-ghost" onclick="cmd('weather rain')">🌧️ Yağmur</button>
         <button class="btn b-ghost" onclick="cmd('difficulty peaceful')">😊 Peaceful</button>
         <button class="btn b-ghost" onclick="cmd('difficulty hard')">🔴 Hard</button>
-        <button class="btn b-ghost" onclick="cmd('save-all')">💾 Kaydet</button>
+        <button class="btn b-ghost" onclick="cmd('save')">💾 Kaydet</button>
         <button class="btn b-ghost" onclick="cmd('kill @e[type=!player]')">⚡ Mob Temizle</button>
       </div>
     </div>
@@ -2364,11 +2366,8 @@ def _run_mc_only():
         def _cs():
             try:
                 import resource as _r
-                _r.setrlimit(_r.RLIMIT_AS,   (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
-                _r.setrlimit(_r.RLIMIT_DATA, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
-            except Exception as _e:
-                import sys as _sys
-                print(f"[Panel] ⚠️  RLIMIT kaldırma hatası: {_e}", file=_sys.stderr)
+                _r.setrlimit(_r.RLIMIT_AS, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
+            except Exception: pass
             try: open("/proc/self/oom_score_adj", "w").write("-900")
             except Exception: pass
         mc_process = subprocess.Popen(
@@ -2435,7 +2434,7 @@ def _run_mc_only():
                         mc_process.kill()
                     else:
                         try:
-                            mc_process.stdin.write(b"save-all\nstop\n")
+                            mc_process.stdin.write(b"save\nstop\n")
                             mc_process.stdin.flush()
                         except Exception: pass
                     self._send(200, {"ok": True, "msg": "Durduruluyor"})
