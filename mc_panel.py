@@ -207,31 +207,51 @@ def _players_list():
 
 
 def _pre_create_player_files(player_name: str):
-    """Oyuncu dizin+dosyalarını diske oluştur — iostream'i önler."""
+    """
+    Oyuncu için SADECE DİZİN oluştur + izin ver.
+    ⚠️  Dosya YARATMA — Cuberite player/stats dosyalarını kendi oluşturur.
+    Boş '{}' yazmak 'basic_ios::clear: iostream error' hatasına yol açar
+    çünkü Cuberite beklediği alanları bulamayınca stream exception fırlatır.
+    """
     if not player_name:
         return
     import subprocess as _spp
-    for fp in [
-        MC_DIR / "players"                  / f"{player_name}.json",
-        MC_DIR / "world" / "data" / "stats" / f"{player_name}.json",
-        MC_DIR / "world" / "playerdata"     / f"{player_name}.json",
-        MC_DIR / "world" / "players"        / f"{player_name}.json",
+    # SADECE dizinler — dosya oluşturma!
+    for _d in [
+        MC_DIR / "players",
+        MC_DIR / "world" / "data" / "stats",
+        MC_DIR / "world" / "playerdata",
+        MC_DIR / "world" / "players",
     ]:
         try:
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            _spp.run(["chmod","777",str(fp.parent)], capture_output=True, timeout=2)
-            if not fp.exists():
-                fp.write_text("{}")
-                _spp.run(["chmod","666",str(fp)], capture_output=True, timeout=2)
+            _d.mkdir(parents=True, exist_ok=True)
+            _spp.run(["chmod", "777", str(_d)], capture_output=True, timeout=2)
         except Exception:
             pass
-    log(f"[Players] ✅ {player_name} dosyalari hazirlandi — yeniden baglanabilir")
+
+    # Eğer stats dosyası bozuksa (var ama okunemiyor) SİL — {} yazma!
+    # Dosya yoksa: Cuberite "not found, resetting to defaults" deyip geçer → sorun yok
+    # Dosya varsa ama bozuksa: Cuberite basic_ios::clear fırlatır → SİL ki "not found" alsın
+    _stats_file = MC_DIR / "world" / "data" / "stats" / f"{player_name}.json"
+    if _stats_file.exists():
+        try:
+            import json as _jj
+            _jj.loads(_stats_file.read_text())
+        except Exception:
+            try:
+                _stats_file.unlink()
+                log(f"[Players] {player_name} bozuk stats dosyası silindi")
+            except Exception: pass
+
+    log(f"[Players] ✅ {player_name} dizin+izin hazir — yeniden baglanabilir")
 
 
 def _reset_player_files(player_name: str):
     """
     ⚠️  OYUNCU DOSYASI HİÇBİR ZAMAN SİLİNMEZ — envanter/konum/can korunur.
-    Sadece: dizinleri oluştur + izin ver + dosya yoksa boş oluştur.
+    Sadece: dizinleri oluştur + izin ver.
+    ⚠️  Boş '{}' YAZILMAZ — Cuberite player/stats dosyalarını kendi oluşturur.
+    Boş dosya yazmak basic_ios::clear hatasına yol açar.
     """
     import subprocess as _sp
     for _d in [
@@ -247,19 +267,20 @@ def _reset_player_files(player_name: str):
     if not player_name:
         return
 
+    # Stats dosyası bozuksa SİL (Cuberite "not found" durumunu graceful handle eder)
+    # ASLA {} yazma — Cuberite stream okurken beklediği yapıyı bulamazsa exception fırlatır
+    import json as _jreset
     for fp in [
-        MC_DIR / "players"                  / f"{player_name}.json",
         MC_DIR / "world" / "data" / "stats" / f"{player_name}.json",
-        MC_DIR / "world" / "playerdata"     / f"{player_name}.json",
-        MC_DIR / "world" / "players"        / f"{player_name}.json",
     ]:
-        try:
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            _sp.run(["chmod","777",str(fp.parent)], capture_output=True, timeout=2)
-            if not fp.exists():
-                fp.write_text("{}")
-                _sp.run(["chmod","666",str(fp)], capture_output=True, timeout=2)
-        except Exception: pass
+        if fp.exists():
+            try:
+                _jreset.loads(fp.read_text())
+            except Exception:
+                try:
+                    fp.unlink()
+                    log(f"[Players] {player_name} bozuk stats silindi — Cuberite yeniden olusturacak")
+                except Exception: pass
 
     log(f"[Players] ✅ {player_name} dizin+izin hazir — yeniden baglanabilir")
 
@@ -990,24 +1011,25 @@ def _clean_player_files():
                 log(f"[Players] {pf.name} tasinamadi: {_e}")
         moved += 1
 
-    # ── 2. world/data/stats/*.json — bozuk istatistik → SIFIRLA (veri kaybı yok, kayıt değil) ──
-    # Bu dosyalar bozulunca Cuberite oyuncuyu "save or statistics file loading failed" ile atar!
+    # ── 2. world/data/stats/*.json — bozuk istatistik → SİL (Cuberite "not found" ile graceful devam eder) ──
+    # ⚠️  {} YAZMA! Cuberite stats JSON'unu stream ile okur; beklediği alanlar yoksa basic_ios::clear fırlatır.
+    # Doğru davranış: bozuk dosyayı sil → Cuberite "not found, resetting to defaults" diyerek geçer.
     stats_fixed = 0
     for sf in list(stats_dir.glob("*.json")):
         if not sf.is_file():
             continue
         if _is_valid_json(sf):
             continue
-        # Bozuk stats dosyası — sıfırla (boş obje Cuberite tarafından kabul edilir)
+        # Bozuk stats dosyası — yedekle ve SİL
         try:
             _sh.copy2(str(sf), str(corrupt_dir / ("stats_" + sf.name)))
         except Exception: pass
         try:
-            sf.write_text("{}")
-            log(f"[Players] stats/{sf.name} bozuktu -> sifirlandi (bos obje)")
+            sf.unlink()
+            log(f"[Players] stats/{sf.name} bozuktu -> silindi (Cuberite yeniden olusturacak)")
             stats_fixed += 1
         except Exception as _e:
-            log(f"[Players] stats/{sf.name} sıfırlanamadı: {_e}")
+            log(f"[Players] stats/{sf.name} silinemedi: {_e}")
 
     n = len(list(players_dir.rglob("*.json")))
     if moved or stats_fixed:
