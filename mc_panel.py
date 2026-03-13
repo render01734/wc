@@ -179,6 +179,13 @@ def _parse_mc_output(line: str):
     # iostream error → stats/ veya playerdata/ eksik — aninda olustur
     if "iostream error" in line or "statistics file loading failed" in line:
         threading.Thread(target=_ensure_runtime_dirs, daemon=True).start()
+        # Oyuncu adi bul → o oyuncu icin bos stats/players dosyasi olustur
+        m_kick = re.search(r'Player "?([A-Za-z0-9_]+)"? (?:save|statistics).+failed', line)
+        if m_kick:
+            pname = m_kick.group(1)
+            threading.Thread(
+                target=_create_player_files, args=(pname,), daemon=True
+            ).start()
 
     if "Stopping server" in line or "Shutting down" in line:
         server_state["status"] = "stopping"
@@ -188,6 +195,29 @@ def _parse_mc_output(line: str):
 def _players_list():
     return [{"name": n, **info} for n, info in players.items()]
 
+
+def _create_player_files(player_name: str):
+    """
+    Yeni oyuncu girisi: stats/players dosyasi yok → iostream hatasi → kick.
+    Cozum: bos gecerli JSON dosyalarini onceden olustur, Cuberite hata vermez.
+    """
+    created = []
+    for fpath, default in [
+        (MC_DIR / "players"                    / f"{player_name}.json", "{}"),
+        (MC_DIR / "world" / "data" / "stats"   / f"{player_name}.json", "{}"),
+        (MC_DIR / "world" / "playerdata"       / f"{player_name}.json", "{}"),
+    ]:
+        try:
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            if not fpath.exists():
+                fpath.write_text(default)
+                created.append(fpath.name)
+        except Exception as e:
+            log(f"[Players] ⚠️  {fpath.name} olusturulamadi: {e}")
+    if created:
+        log(f"[Players] ✅ {player_name}: {len(created)} profil dosyasi olusturuldu — yeniden baglanabilir")
+    else:
+        log(f"[Players] ℹ️  {player_name} dosyalari zaten mevcut")
 
 def _ensure_runtime_dirs():
     """iostream error geldiginde cagrilir — dizinleri aninda garantile."""
