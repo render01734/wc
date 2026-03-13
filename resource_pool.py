@@ -146,7 +146,7 @@ class ResourcePool:
             import psutil
             mem = psutil.virtual_memory()
             if mem.available / 1024 / 1024 < RAM_WARN_MB:
-                # JVM'i biraz rahatlatmak için GC tetikle
+                # Belleği rahatlatmak için GC tetikle
                 subprocess.run("kill -s SIGUSR1 $(pgrep java) 2>/dev/null", shell=True)
         except: pass
 

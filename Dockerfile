@@ -1,6 +1,6 @@
 FROM ubuntu:24.04
 # ── Cuberite C++ Minecraft Server (1.8.8 uyumlu) ──────────────
-# JVM yok → ~50MB RAM (Paper 400MB yerine)
+# Cuberite C++ binary — JVM yok → ~50MB RAM (Java 400MB yerine)
 # Cuberite binary build sırasında indirilir → soğuk başlatma anında
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -34,7 +34,7 @@ COPY cluster.py   ./cluster.py
 COPY main.py      ./main.py
 COPY agent.py     ./agent.py
 # resource_pool.py kaldırıldı — v14'te cluster.py kullanılıyor
-# userswap.c kaldırıldı — Cuberite C++ JVM gerektirmiyor (userswap JVM içindir)
+# userswap.c dahil edilmiyor — Cuberite C++ mmap hook gerektirmiyor
 
 # ── Dizin yapısı ─────────────────────────────────────────────────────────────
 RUN mkdir -p \

@@ -2,11 +2,11 @@
 ⛏️  Minecraft Server Boot — v14.0 (Cuberite)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 v14.0 (Cuberite):
-  • ANA sunucu: Panel + MC + UserSwap
+  • ANA sunucu: Flask + Cuberite C++ binary
   • AGENT modu: agent.py'yi başlat, ana sunucuya kayıt ol
   • Swap: zram → disk dosyası (hem ANA hem AGENT için)
-  • OOM: overcommit=1, oom_score_adj=-900 (Java korunsun)
-  • userswap.so: derleme + JVM LD_PRELOAD
+  • OOM: overcommit=1, oom_score_adj=-900 (Cuberite korunsun)
+  • Cuberite ~50MB RAM — JVM/userswap gerektirmez
 """
 
 import os, sys, subprocess, time, socket, resource, threading, re, json
@@ -49,7 +49,7 @@ base_env = {
     **os.environ,
     "HOME": "/root", "USER": "root", "LOGNAME": "root",
     "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8",
-    # JAVA_HOME kaldırıldı — Cuberite C++ JVM gerektirmiyor
+    # Java gerektirmiyor — Cuberite C++ binary
     "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "PORT":             str(PORT),
     "CONTAINER_RAM_MB": str(CONTAINER_RAM_MB),
@@ -191,7 +191,7 @@ def setup_swap() -> int:
     return swp.total // 1024 // 1024
 
 
-# UserSwap kaldırıldı — Cuberite C++ JVM gerektirmiyor
+# UserSwap YOK — Cuberite C++ mmap hook gerektirmiyor
 
 
 # ── Kernel ayarları ───────────────────────────────────────────────────────────
@@ -221,21 +221,14 @@ def optimize_all(mode: str = "main"):
 
 def start_panel():
     """
-    Ana sunucuda mc_panel.py'yi MC_ONLY=1 ile başlatır.
-    Flask/SocketIO yok → Xmx=370MB.
-    Panel UI ayrı bir agent'ta (IS_PANEL=1) çalışır.
+    mc_panel.py başlatır. Cuberite C++ ~50MB → Flask+MC birlikte rahat çalışır.
+    MC_ONLY=1 env ile sadece Cuberite + minimal HTTP (Flask yok) da çalışır.
     """
-    print(f"\n🚀 Panel (iki fazlı) başlatılıyor :{PORT}...")
-    print(f"  Faz1: Minimal HTTP + MC Xmx=340MB")
-    print(f"  Faz2: MC Done! → Flask+SocketIO devralır")
-    env = {
-        **base_env,
-        "MC_ONLY": "0",
-    }
+    print(f"\n🚀 MC Panel v14.0 (Cuberite) başlatılıyor :{PORT}...")
+    env = {**base_env}
     proc = subprocess.Popen([sys.executable, "/app/mc_panel.py"], env=env)
-    # Faz1 minimal HTTP port açılışını bekle
     if _wait_port(PORT, 30):
-        print(f"  ✅ Faz1 minimal HTTP hazır :{PORT}")
+        print(f"  ✅ Panel hazır :{PORT}")
     else:
         print(f"  ⚠️  Port {PORT} timeout — devam ediliyor")
     return proc
@@ -245,20 +238,15 @@ def start_panel():
 
 def auto_start():
     """
-    mc_panel.py iki fazlı başlatır:
-      Faz1: Minimal HTTP → MC Xmx=340MB bootstrap
-      Faz2: MC Done! → Flask+SocketIO
-    Buradan sadece tünel açıyoruz.
+    Cuberite hazır olduktan sonra Cloudflare tüneli açar.
     """
-    _panel_log("[Sistem] 🟢 v14.0 (Cuberite) iki fazlı başladı")
-    _panel_log("[Sistem] ⏳ Faz1: Minimal HTTP + MC Xmx=340MB bootstrap...")
-
-    if _wait_port(MC_PORT, 360):
-        print("  ✅ MC Server hazır!")
-        _panel_log("[Sistem] ✅ Faz2 aktif — Flask+SocketIO devralıyor")
+    _panel_log("[Sistem] 🟢 v14.0 Cuberite başladı")
+    if _wait_port(MC_PORT, 120):
+        print("  ✅ Cuberite hazır!")
+        _panel_log("[Sistem] ✅ Cuberite çalışıyor — tünel açılıyor")
         _start_mc_tunnel()
     else:
-        print("  ⚠️  MC port timeout (360s)")
+        print("  ⚠️  Cuberite port timeout (120s)")
 
 
 def _start_mc_tunnel():
@@ -334,9 +322,9 @@ optimize_all("main" if IS_MAIN else "agent")
 
 if IS_MAIN:
     print(f"\n{'━'*56}")
-    print(f"  🟢 ANA SUNUCU v14.0 (Cuberite) — İki Fazlı :{PORT}")
-    print(f"  Faz1: Minimal HTTP + Xmx=340MB bootstrap")
-    print(f"  Faz2: MC Done! → Flask+SocketIO (wc-tsgd.onrender.com)")
+    print(f"  🟢 ANA SUNUCU v14.0 (Cuberite) — Flask + Cuberite :{PORT}")
+    print(f"  Cuberite: ~50MB RAM  Flask: ~90MB  Toplam: ~140MB")
+    print(f"  Agent'lar: RAM cache + disk store aktif")
     print(f"{'━'*56}\n")
     panel = start_panel()
     threading.Thread(target=auto_start, daemon=True).start()

@@ -18,7 +18,7 @@ v13.0 Değişiklikleri (v12'ye göre):
   • ClusterMemory.build_swapfile_on_agent() kaldırıldı
     (swapon Render'da EPERM — UserSwap yerel dosyaya yazıyor)
   • Tek agent kaydı: mc_panel._agents + vcluster._agents birleşti
-  • Paper remap cache: başlatma öncesi agent'tan geri yükle
+  • Region cache: başlatma öncesi agent'tan region dosyaları geri yükle
   • Sağlık döngüsü: hata sayacı düzeltildi (healthy=False gecikmesi)
   • ClusterNet: proxy watchdog geliştirildi
   • Blueprint route'ları /api/agent/* (mc_panel ile çakışmasın)
@@ -121,7 +121,7 @@ class ClusterMemory:
     Render'da swapon EPERM döner. Bunun yerine:
       • Ana sunucu UserSwap (userswap.so) kullanır → yerel dosyaya yazar
       • Agent'lar MC chunk/entity verilerini RAM cache'inde tutar
-      • JVM heap baskısı bu sayede azalır
+      • Cuberite bellek baskısı bu sayede azalır
 
     Strateji: Distributed application cache
       put(key, data) → en az yüklü agent cache'ine gönder
@@ -190,7 +190,7 @@ class ClusterMemory:
             _jget(f"{ag['url']}/api/cache/flush", {}, timeout=10)
         return n
 
-    # ── Paper remap cache ────────────────────────────────────────────────────
+    # ── Region cache (Cuberite .mca dosyaları) ──────────────────────────────
 
     def save_remap_cache(self) -> int:
         """
@@ -238,7 +238,7 @@ class ClusterMemory:
     def restore_remap_cache(self) -> bool:
         """
         MC başlamadan önce agent'lardan remap cache'i geri yükle.
-        Başarılı olursa Paper remapping atlanır → RAM spike yok.
+        Başarılı olursa Cuberite disk I/O azalır → başlatma hızlanır.
         """
         agents = self._healthy()
         if not agents:

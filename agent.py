@@ -821,7 +821,7 @@ def bulk_cache_and_store():
 def _run_as_panel():
     """
     IS_PANEL=1: Bu agent panel host.
-    - mc_panel.py'yi WORKER_URL=MAIN_URL (JVM ana sunucu) ile başlatır.
+    - mc_panel.py'yi WORKER_URL=MAIN_URL (Cuberite ana sunucu) ile başlatır.
     - Agent kendi Flask'ını da çalıştırır (cache/disk/proxy için).
     - Panel PORT'ta, agent AGENT_PORT'ta çalışır (ikisi aynı port olabilir).
     """
@@ -833,7 +833,7 @@ def _run_as_panel():
     env = {
         **os.environ,
         "MC_ONLY":    "0",       # Flask aç
-        "WORKER_URL": MAIN_URL,  # JVM bu URL'de (MC_ONLY=1 mod)
+        "WORKER_URL": MAIN_URL,  # Cuberite bu URL'de (MC_ONLY=1 mod)
         "PORT":       str(PORT), # Aynı port — panel burada
         "MAIN_URL":   MAIN_URL,
     }

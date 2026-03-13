@@ -1,20 +1,21 @@
 """
-⚙️  WORKER — 2. Render Hesabı
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Bu servis 2. hesapta çalışır.
-Diskini NBD (Network Block Device) olarak tünele açar.
-Ana sunucu bu diski swap olarak kullanır.
-
-Akış:
-  1. 14GB blok dosya oluştur
-  2. nbd-server ile port 10809'da sun
-  3. cloudflared TCP tüneli → URL al
-  4. URL'i MAIN_URL'e bildir (/api/worker/register)
-  5. Sağlık endpoint'i tut (Render uyku yapmaya devam etsin)
-
-⚠️  DEPRECATED (v10.0): Bu dosya artık kullanılmamaktadır.
+⚙️  WORKER — v1.0 (DEPRECATED)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  Bu dosya v10.0'dan beri KULLANILMAMAKTADIR.
    Kullanılacak dosya: agent.py
-   NBD kaldırıldı → HTTP tabanlı Resource Pool kullanılıyor.
+
+NEDEN DEPRECATEd:
+  • NBD (Network Block Device) kaldırıldı — Render TCP tüneli
+    üzerinden güvenilir çalışmıyor.
+  • JVM swap yerine Cuberite C++ kullanılıyor (~50MB RAM).
+  • Disk paylaşımı agent.py HTTP tabanlı Resource Pool ile yapılıyor.
+    PUT /api/files/regions/ → agent disk
+    GET /api/cache/set      → agent RAM
+
+YERINE KULLAN:
+  agent.py           — RAM cache + disk store + TCP proxy + CPU worker
+  agent_render.yaml  — Deploy konfigürasyonu (7× farklı hesap)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os, sys, subprocess, time, re, threading, json

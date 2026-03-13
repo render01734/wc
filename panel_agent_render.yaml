@@ -1,13 +1,13 @@
 # ─────────────────────────────────────────────────────────────────
 # Panel Agent — Sadece 1 tane, herhangi bir Render hesabında
 # Kullanıcı bu servisin URL'ine browser ile bağlanır.
-# JVM Ana sunucuda (wc-tsgd.onrender.com) çalışır.
+# Cuberite ana sunucuda (wc-tsgd.onrender.com) çalışır.
 #
 # Nasıl çalışır:
 #   1. mc_panel.py WORKER_URL=ana_sunucu ile başlar
-#   2. Flask/SocketIO web UI bu agent'ta (Xmx yok, sadece ~90MB)
+#   2. Flask/SocketIO web UI bu agent'ta (~90MB Python + Flask)
 #   3. Başlat/Durdur/Komut → WORKER_URL/api/mc/* proxy edilir
-#   4. Ana sunucu MC_ONLY=1 → Xmx=370MB (Flask yok)
+#   4. Ana sunucu MC_ONLY=1 → Cuberite ~50MB + minimal HTTP (Flask yok)
 # ─────────────────────────────────────────────────────────────────
 services:
   - type: web
