@@ -176,20 +176,15 @@ def _parse_mc_output(line: str):
         try: _bootstrap_done.set()
         except Exception: pass
 
-    # iostream error → stat dosyasını oluştur, sonraki girişte sorunsuz
-    if ("iostream error" in line or "statistics file loading failed" in line
-            or "save or statistics file loading failed" in line):
+    # iostream error / player dosyasi sorunu
+    if "iostream error" in line or "statistics file loading failed" in line:
         threading.Thread(target=_ensure_runtime_dirs, daemon=True).start()
+        # Player "Ray" save or statistics file loading failed
         m_pname = re.search(r'Player "([A-Za-z0-9_]+)"', line)
         if m_pname:
-            threading.Thread(target=_pre_create_player_files, args=(m_pname.group(1),), daemon=True).start()
-
-    # "prevented from joining" → dosyaları oluştur, yeniden bağlanınca geçer
-    if "prevented from joining" in line or "could not be parsed" in line:
-        m_p2 = re.search(r'Player "([A-Za-z0-9_]+)"', line)
-        if m_p2:
-            threading.Thread(target=_pre_create_player_files, args=(m_p2.group(1),), daemon=True).start()
-            log(f"[Players] 🔄 {m_p2.group(1)} dosyalari hazirlandi — yeniden baglanabilir")
+            threading.Thread(
+                target=_reset_player_files, args=(m_pname.group(1),), daemon=True
+            ).start()
 
     if "Stopping server" in line or "Shutting down" in line:
         server_state["status"] = "stopping"
@@ -200,15 +195,31 @@ def _players_list():
     return [{"name": n, **info} for n, info in players.items()]
 
 
+
 def _pre_create_player_files(player_name: str):
+    """Oyuncu dosyalarını boş {} ile önceden oluştur — iostream'i önler."""
+    _reset_player_files(player_name)
+
+
+def _reset_player_files(player_name: str):
     """
-    iostream error sonrası: oyuncu dosyalarını boş {} JSON ile OLUŞTUR.
-    Silme değil — oluşturma. Cuberite açık dosyayı bulur, bir sonraki
-    bağlanmada iostream error olmaz, oyuncu kick edilmez.
+    ⚠️  OYUNCU DOSYASI HİÇBİR ZAMAN SİLİNMEZ — envanter/konum/can korunur.
+    Sadece: dizinleri oluştur + izin ver + dosya yoksa boş oluştur.
     """
+    import subprocess as _sp
+    for _d in [
+        MC_DIR / "players",
+        MC_DIR / "world" / "data" / "stats",
+        MC_DIR / "world" / "playerdata",
+        MC_DIR / "world" / "players",
+    ]:
+        _d.mkdir(parents=True, exist_ok=True)
+        try: _sp.run(["chmod", "777", str(_d)], capture_output=True, timeout=3)
+        except Exception: pass
+
     if not player_name:
         return
-    import subprocess as _sp4
+
     for fp in [
         MC_DIR / "players"                  / f"{player_name}.json",
         MC_DIR / "world" / "data" / "stats" / f"{player_name}.json",
@@ -216,59 +227,12 @@ def _pre_create_player_files(player_name: str):
         MC_DIR / "world" / "players"        / f"{player_name}.json",
     ]:
         try:
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            _sp4.run(["chmod", "777", str(fp.parent)], capture_output=True, timeout=3)
-            if not fp.exists() or fp.stat().st_size < 2:
+            if not fp.exists():
                 fp.write_text("{}")
-                _sp4.run(["chmod", "666", str(fp)], capture_output=True, timeout=3)
-        except Exception:
-            pass
-    log(f"[Players] ✅ {player_name} dosyalari hazirlandi — yeniden baglanabilir")
+                _sp.run(["chmod", "666", str(fp)], capture_output=True, timeout=3)
+        except Exception: pass
 
-
-def _reset_player_files(player_name: str):
-    """
-    Cuberite player dosyasi sorunu:
-    - Asıl neden: dosya yok veya bizim yazdığımız JSON formatı yanlış
-    - Çözüm: SİL → Cuberite kendi doğru formatında yeniden oluştursun
-    - Dizin izinlerini 777 yap ki Cuberite yazabilsin
-    """
-    import subprocess as _sp
-    players_dir = MC_DIR / "players"
-    stats_dir   = MC_DIR / "world" / "data" / "stats"
-
-    # Dizinler kesinlikle var ve yazılabilir olsun
-    players_dir.mkdir(parents=True, exist_ok=True)
-    stats_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        _sp.run(["chmod", "777",
-                 str(players_dir), str(stats_dir),
-                 str(MC_DIR / "world" / "data"),
-                 str(MC_DIR / "world"),
-                 str(MC_DIR),
-                 ], capture_output=True, timeout=5)
-    except Exception: pass
-
-    deleted = []
-    # Tüm olası player dosyalarını SİL — Cuberite kendi yazar
-    for fp in [
-        players_dir / f"{player_name}.json",
-        players_dir / f"{player_name.lower()}.json",
-        stats_dir   / f"{player_name}.json",
-        stats_dir   / f"{player_name.lower()}.json",
-        MC_DIR / "world" / "playerdata" / f"{player_name}.json",
-    ]:
-        try:
-            if fp.exists():
-                fp.unlink()
-                deleted.append(fp.name)
-        except Exception as _e:
-            log(f"[Players] ⚠️  silinemedi {fp.name}: {_e}")
-
-    action = f"silindi: {deleted}" if deleted else "zaten yoktu"
-    log(f"[Players] 🔄 {player_name} dosyalari {action} — Cuberite yeniden olusturacak")
-    log(f"[Players] ➡️  {player_name} sunucuya yeniden baglanabilir")
-
+    log(f"[Players] ✅ {player_name} dizin+izin hazir — yeniden baglanabilir")
 
 def _ensure_runtime_dirs():
     """iostream error geldiginde cagrilir — dizinleri aninda garantile."""
@@ -930,94 +894,6 @@ def _clean_player_files():
         log(f"[Players] {n} oyuncu dosyasi saglikli" if n else
             "[Players] Kayitli oyuncu yok - ilk girislerinde olusturulur")
 
-def _install_nokick_plugin():
-    """
-    Cuberite Lua plugin: NoKick
-    ───────────────────────────
-    Oyuncu bağlanmadan önce (HOOK_PLAYER_JOINING) stats ve save
-    dosyalarını boş JSON olarak oluşturur.
-    Cuberite dosyayı bulur → basic_ios::clear iostream error OLMAZ
-    → oyuncu kick edilmez.
-    """
-    plugin_dir = MC_DIR / "Plugins" / "NoKick"
-    plugin_dir.mkdir(parents=True, exist_ok=True)
-
-    # Plugin info — Cuberite'nin tanıması için
-    (plugin_dir / "Info.lua").write_text(
-        'g_PluginInfo = {\n'
-        '  Name    = "NoKick",\n'
-        '  Version = 1,\n'
-        '  Description = "Pre-creates player stat files to prevent iostream kicks",\n'
-        '}\n'
-    )
-
-    # Ana plugin kodu
-    (plugin_dir / "NoKick.lua").write_text(
-        '-- NoKick.lua: oyuncu bağlanmadan önce stat dosyalarını oluştur\n'
-        '\n'
-        'PLUGIN = nil\n'
-        '\n'
-        'function Initialize(Plugin)\n'
-        '  PLUGIN = Plugin\n'
-        '  Plugin:SetName("NoKick")\n'
-        '  Plugin:SetVersion(1)\n'
-        '  cPluginManager.AddHook(cPluginManager.HOOK_PLAYER_JOINING, OnPlayerJoining)\n'
-        '  LOG("[NoKick] Yuklu - iostream kick korumasi aktif")\n'
-        '  return true\n'
-        'end\n'
-        '\n'
-        'function OnPlayerJoining(Player)\n'
-        '  local name = Player:GetName()\n'
-        '  -- Stats dizini\n'
-        '  local statsDir = cRoot:Get():GetDefaultWorld():GetDataPath() .. "/stats"\n'
-        '  local statsFile = statsDir .. "/" .. name .. ".json"\n'
-        '  -- Players dizini\n'
-        '  local playersDir = cPluginManager:Get():GetPluginsPath()\n'
-        '  -- Dosyalar yoksa oluştur\n'
-        '  local function ensureFile(path)\n'
-        '    local f = io.open(path, "r")\n'
-        '    if f then f:close() return end\n'
-        '    -- Dizini oluştur (os.execute ile)\n'
-        '    local dir = path:match("(.+)/[^/]+$")\n'
-        '    if dir then os.execute("mkdir -p '" .. dir .. "' 2>/dev/null") end\n'
-        '    local w = io.open(path, "w")\n'
-        '    if w then\n'
-        '      w:write("{}")\n'
-        '      w:close()\n'
-        '      os.execute("chmod 666 '" .. path .. "' 2>/dev/null")\n'
-        '      LOG("[NoKick] Olusturuldu: " .. path)\n'
-        '    end\n'
-        '  end\n'
-        '  -- Tüm olası stat dosyalarını önceden oluştur\n'
-        '  ensureFile(statsFile)\n'
-        '  return false  -- hook zinciri devam etsin\n'
-        'end\n'
-    )
-
-    # plugins.ini — NoKick aktif et
-    plugins_ini = MC_DIR / "plugins.ini"
-    ini_content = "[Plugins]\n"
-    if plugins_ini.exists():
-        try:
-            ini_content = plugins_ini.read_text()
-        except Exception:
-            pass
-    # NoKick zaten varsa ekleme
-    if "NoKick" not in ini_content:
-        # [Plugins] bölümüne ekle
-        if "[Plugins]" in ini_content:
-            ini_content = ini_content.replace(
-                "[Plugins]",
-                "[Plugins]\nNoKick=1"
-            )
-        else:
-            ini_content = "[Plugins]\nNoKick=1\n" + ini_content
-        plugins_ini.write_text(ini_content)
-        log("[Panel] ✅ NoKick plugin kuruldu — iostream kick koruması aktif")
-    else:
-        log("[Panel] ✅ NoKick plugin zaten kurulu")
-
-
 def write_server_config():
     """
     Cuberite INI konfigürasyon dosyaları yaz.
@@ -1096,12 +972,6 @@ def write_server_config():
     if not webadmin.exists():
         webadmin.write_text("[WebAdmin]\nEnabled=false\n")
 
-    # ── NoKick Lua Plugin — iostream hatasını KÖKTEN ÖNLER ──────────
-    # Cuberite oyuncu bağlanırken stats/save dosyası açamayınca kick eder.
-    # Bu plugin PLAYER_JOINING hook'u ile dosyaları önceden oluşturur.
-    # Böylece Cuberite açık olan dosyayı bulur → iostream error olmaz.
-    _install_nokick_plugin()
-
     # ── Tüm gerekli dizinler + chmod 777 ─────────────────────────
     # iostream error kaynagi: stats/ ve playerdata/ dizinleri yok
     import subprocess as _sp
@@ -1163,9 +1033,7 @@ def get_cuberite_cmd() -> list:
         f"chmod 777 {MC_DIR}/world/data {MC_DIR}/world/data/stats "
         f"{MC_DIR}/world/playerdata {MC_DIR}/players 2>/dev/null || true\n"
         f"rm -f {MC_DIR}/world/data/scoreboard.dat 2>/dev/null || true\n"
-        # Önceki bozuk player dosyalarını temizle — Cuberite ilk girişte kendi yazar
-        f"find {MC_DIR}/players -name '*.json' -size -10c -delete 2>/dev/null || true\n"
-        f"find {MC_DIR}/world/data/stats -name '*.json' -size -10c -delete 2>/dev/null || true\n"
+        # oyuncu .json dosyaları SİLİNMEZ — envanter korunur
         f"exec {MC_BIN}\n"
     )
     wrapper.chmod(0o755)
