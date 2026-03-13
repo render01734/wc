@@ -244,16 +244,16 @@ def optimize_all(mode: str = "main"):
 
 def start_panel():
     """
-    Ana sunucuda mc_panel.py'yi FULL Flask moduyla başlatır.
-    Panel UI: https://wc-tsgd.onrender.com
-    JVM: SerialGC ile ~150MB non-heap → Xmx=240MB (toplam ~480MB ✓)
+    mc_panel.py'yi FULL Flask moduyla başlatır.
+    URL: https://wc-tsgd.onrender.com
+    cluster.py LAZY — MC bootstrap tamamlanana kadar yüklenmez.
+    JVM: G1GC Xmx=280MB, Python(lazy)=~55MB, non-heap=~120MB = ~455MB bootstrap ✓
     """
-    print(f"\n🚀 Panel (FULL Flask) başlatılıyor :{PORT}...")
+    print(f"\n🚀 Panel (Flask + lazy cluster) başlatılıyor :{PORT}...")
     userswap_so = build_userswap()
     env = {
         **base_env,
-        "MC_ONLY":         "0",   # Flask + SocketIO aktif → panel wc-tsgd.onrender.com'da
-        "MAIN_SERVER_URL": "https://wc-tsgd.onrender.com",
+        "MC_ONLY": "0",
     }
     if userswap_so:
         env["USERSWAP_SO"] = userswap_so
@@ -261,7 +261,7 @@ def start_panel():
     if _wait_port(PORT, 45):
         print("  ✅ Panel hazır → https://wc-tsgd.onrender.com")
     else:
-        print("  ⚠️  Panel timeout (45s)")
+        print("  ⚠️  Panel timeout (45s) — devam ediliyor")
     return proc
 
 
@@ -269,21 +269,21 @@ def start_panel():
 
 def auto_start():
     """
-    Panel hazır olunca MC start API'sini çağır.
-    MC hazır olunca cloudflared tüneli aç.
+    Panel hazır → swap bekle → MC start API çağır → tünel aç.
+    cluster.py MC başladıktan sonra panel tarafından lazy yüklenir.
     """
-    _panel_log("[Sistem] 🟢 v12.0 başladı — swap kuruluyor...")
-    # Swap yeterli mi bekle
-    import psutil as _ps
-    for _ in range(18):   # max 90sn
-        swp = _ps.swap_memory()
-        if swp.total // 1024 // 1024 >= 512:
+    _panel_log("[Sistem] 🟢 v12.0 başladı — swap bekleniyor...")
+
+    # Swap hazır mı? (agent'lar swap dosyası ekler)
+    for _ in range(18):  # max 90sn
+        swp = psutil.swap_memory()
+        if swp.total // 1024 // 1024 >= 400:
             break
         time.sleep(5)
-    sw_mb = _ps.swap_memory().total // 1024 // 1024
-    _panel_log(f"[Sistem] 💾 Swap hazır: {sw_mb}MB — MC başlatılıyor")
+    sw_mb = psutil.swap_memory().total // 1024 // 1024
+    _panel_log(f"[Sistem] 💾 Swap: {sw_mb}MB — MC başlatılıyor")
 
-    # Panel API'sine MC start komutu gönder
+    # Panel API'sine MC start gönder (3 deneme)
     for attempt in range(3):
         try:
             _ur.urlopen(_ur.Request(
@@ -292,18 +292,18 @@ def auto_start():
                 headers={"Content-Type": "application/json"},
                 method="POST",
             ), timeout=10)
-            print("  ✅ MC başlatma komutu gönderildi")
+            print("  ✅ MC start komutu gönderildi")
             break
         except Exception as e:
             print(f"  ⚠️  MC start ({attempt+1}/3): {e}")
-            time.sleep(5)
+            time.sleep(8)
 
     if _wait_port(MC_PORT, 300):
         print("  ✅ MC Server hazır!")
         _panel_log("[Sistem] ✅ MC oyuncuları bekliyor!")
         _start_mc_tunnel()
     else:
-        print("  ⚠️  MC port timeout (300s)")
+        print("  ⚠️  MC port timeout 300s")
 
 
 def _start_mc_tunnel():
@@ -379,10 +379,9 @@ optimize_all("main" if IS_MAIN else "agent")
 
 if IS_MAIN:
     print(f"\n{'━'*56}")
-    print(f"  🟢 ANA SUNUCU v12.0 — FULL PANEL :{PORT}")
-    print(f"  URL    : https://wc-tsgd.onrender.com")
-    print(f"  Memory : SerialGC | Xmx=240MB | Non-heap≈150MB | Python≈90MB ≈ 480MB")
-    print(f"  Swap   : zram+disk+agent → 512MB+ virtual")
+    print(f"  🟢 ANA SUNUCU v12.0 — Flask + lazy cluster :{PORT}")
+    print(f"  Memory: G1GC Xmx=280MB | lazy cluster | bootstrap=~455MB")
+    print(f"  Panel URL: https://wc-tsgd.onrender.com")
     print(f"{'━'*56}\n")
     panel = start_panel()
     threading.Thread(target=auto_start, daemon=True).start()

@@ -1,5 +1,5 @@
 """
-⛏️  Minecraft Yönetim Paneli — v12.0 (SerialGC + wc-tsgd.onrender.com)
+⛏️  Minecraft Yönetim Paneli — v10.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 v10.0: NBD kaldırıldı → Resource Pool entegrasyonu
   - /api/agent/register + heartbeat
@@ -24,7 +24,68 @@ import eventlet
 eventlet.monkey_patch()
 
 from flask import Flask, request, jsonify, send_file, abort, Response
-from cluster import vcluster, cluster_api
+# cluster.py LAZY LOAD — MC bootstrap sırasında bellek kullanma
+# vcluster ve cluster_api, MC başladıktan sonra yüklenir
+_cluster_loaded = False
+_vcluster_inst  = None
+_cluster_api    = None
+
+class _LazyVCluster:
+    """
+    MC bootstrap sırasında cluster.py'yi yüklemez.
+    İlk gerçek çağrıda yükler.
+    """
+    def _load(self):
+        global _cluster_loaded, _vcluster_inst, _cluster_api
+        if not _cluster_loaded:
+            try:
+                import cluster as _cm
+                _vcluster_inst  = _cm.vcluster
+                _cluster_api    = _cm.cluster_api
+                _cluster_loaded = True
+            except Exception as e:
+                print(f"[LazyCluster] ⚠️  cluster.py yüklenemedi: {e}")
+        return _vcluster_inst
+
+    def __getattr__(self, name):
+        inst = self._load()
+        if inst is None:
+            if name == "_agents":
+                return {}
+            if name == "_lock":
+                import threading
+                return threading.Lock()
+            return lambda *a, **kw: None
+        return getattr(inst, name)
+
+    def summary(self):
+        inst = self._load()
+        if inst is None:
+            return {"total": 0, "healthy": 0, "resources": {}, "agents": []}
+        return inst.summary()
+
+    def set_socketio(self, sio):
+        inst = self._load()
+        if inst: inst.set_socketio(sio)
+
+    def register_agent(self, *a, **kw):
+        inst = self._load()
+        if inst: return inst.register_agent(*a, **kw)
+
+    @property
+    def _agents(self):
+        inst = self._load()
+        return inst._agents if inst else {}
+
+    @property
+    def _lock(self):
+        inst = self._load()
+        if inst: return inst._lock
+        import threading
+        return threading.Lock()
+
+vcluster    = _LazyVCluster()
+cluster_api = None   # Blueprint MC başladıktan sonra register edilir
 from flask_socketio import SocketIO, emit
 
 # ── Ayarlar ───────────────────────────────────────────────────
@@ -33,9 +94,9 @@ MC_JAR     = MC_DIR / "server.jar"
 MC_PORT    = 25565
 PANEL_PORT  = int(os.environ.get("PORT", "5000"))
 # ── Çalışma Modu ─────────────────────────────────────────────────────────────
-# MC_ONLY=1   → (Kullanılmıyor) Eski mod. Panel artık her zaman Flask ile çalışır.
-#               Ana panel URL: https://wc-tsgd.onrender.com
-#               Xmx=240MB (SerialGC ile G1GC'ye göre 45MB tasarruf).
+# MC_ONLY=1   → Flask/SocketIO yok. Sadece JVM + minimal HTTP API çalışır.
+#               ~90MB kazanım → Xmx 280MB→370MB.
+#               Panel UI başka bir agent'ta (WORKER_URL env ile) çalışır.
 #
 # WORKER_URL  → Bu process panel agent'i. JVM ana sunucuda (WORKER_URL).
 #               start/stop/command → WORKER_URL'e proxy edilir.
@@ -65,8 +126,22 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
                     ping_timeout=60, ping_interval=25)
-if cluster_api: app.register_blueprint(cluster_api)
-vcluster.set_socketio(socketio)
+# cluster Blueprint MC başladıktan sonra lazy register edilir
+# vcluster.set_socketio → MC bootstrap bitmeden set edilmez (hafifçe geciktir)
+def _register_cluster_blueprint():
+    """MC başladıktan sonra çağrılır — cluster blueprint'ini kaydet."""
+    global cluster_api
+    try:
+        import cluster as _cm
+        cluster_api = _cm.cluster_api
+        if cluster_api:
+            try:
+                app.register_blueprint(cluster_api)
+            except Exception:
+                pass   # Zaten kayıtlıysa AssertionError — görmezden gel
+        _cm.vcluster.set_socketio(socketio)
+    except Exception as e:
+        print(f"[Panel] ⚠️  cluster blueprint: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -415,46 +490,47 @@ def get_jvm_args():
             break
     us_ok = bool(us_path)
 
+    # ── Xmx hesabı — SADECE FİZİKSEL RAM baz alınır ──────────────────────
+    #
+    # Render cgroup: 512MB FİZİKSEL. Page cache dahil. Aşılırsa → SIGKILL.
+    # UserSwap GC spike'larını yumuşatır ama Xmx'i artırmaz
+    # (dosya sayfaları page cache üzerinden RAM'e sayılır).
+    #
+    # MC_ONLY=1  (Panel ayrı agent):
+    #   512 - 110(jvm meta/code/stack) - 32(os) = 370MB Xmx
+    #
+    # MC_ONLY=0  (Panel + MC aynı yerde):
+    #   512 - 90(flask) - 110(jvm meta) - 32(os) = 280MB Xmx
+    #
     # ══════════════════════════════════════════════════════════════
-    # JVM Bellek Bütçesi  (512MB fiziksel Render limiti)
+    # 512MB bütçe — lazy cluster ile MC bootstrap güvenli
     # ══════════════════════════════════════════════════════════════
     #
-    # G1GC gizli overhead (dökümante edilmez):
-    #   Card table      : ~16MB
-    #   Region metadata : ~8MB
-    #   GC threads (4)  : ~12MB stack
-    #   Remembered sets : ~10MB
-    #   Humongous bölge : ~4MB
-    #   TOPLAM G1GC     : ~50MB EKSTRA
+    # FULL mod (Flask + lazy cluster):
+    #   Python/Flask (cluster yüklü DEĞİL) : ~55MB
+    #   JVM non-heap (meta+code+stack)      : ~120MB
+    #   JVM heap (Xmx)                      : 280MB (bootstrap için yeterli!)
+    #   Kernel/OS                           : ~30MB
+    #   ────────────────────────────────────────────
+    #   MC BOOTSTRAP TOPLAM                 : ~485MB ✓
     #
-    # SerialGC ile bu overhead ~5MB → 45MB tasarruf!
+    #   MC başladıktan sonra cluster yüklenir:
+    #   + cluster/Python ek                 : ~40MB
+    #   = ~525MB → swap ile karşılanır      ✓
     #
-    # FULL mod bütçesi (Flask+MC birlikte):
-    #   Python/Flask/SocketIO/cluster : ~90MB
-    #   JVM native (SerialGC)         : ~50MB
-    #   Metaspace (Paper sınıfları)   : 64MB (cap)
-    #   Class space                   : 16MB
-    #   Code cache                    : 20MB
-    #   Thread stacks (256k×20)       :  5MB
-    #   JVM TOPLAM non-heap           :~155MB
-    #   Xmx                           : 240MB
-    #   OS/buffer                     :  27MB
-    #   ─────────────────────────────────────
-    #   TOPLAM                        :~512MB ✓
+    # MC_ONLY mod (minimal HTTP, cluster eager):
+    #   Python minimal                      : ~20MB
+    #   JVM non-heap                        : ~120MB
+    #   JVM heap (Xmx)                      : 340MB
+    #   ────────────────────────────────────────────
+    #   TOPLAM                              : ~480MB ✓
     #
-    # MC_ONLY bütçesi (artık kullanılmıyor — panel wc-tsgd.onrender.com'da)
-    #   Python minimal                : ~20MB
-    #   JVM non-heap                  :~155MB
-    #   Xmx                           : 320MB
-    #   ─────────────────────────────────────
-    #   TOPLAM                        :~495MB ✓
-    #
-    xmx_mb = 320 if MC_ONLY else 240
-    xms_mb = 16   # çok lazy start — JVM mümkün olduğunca az RAM ile başlasın
+    xmx_mb = 340 if MC_ONLY else 280
+    xms_mb = 16   # çok lazy — JVM sadece ihtiyacı kadar büyüsün
 
     log(f"[Panel] 🧠 {'MC_ONLY' if MC_ONLY else 'FULL'} "
         f"RAM={phys_mb}MB Xmx={xmx_mb}M "
-        f"GC=SerialGC "
+        f"GC=G1GC(küçük) "
         f"UserSwap={'✅ ' + us_path if us_ok else '❌'}")
 
     cmd_prefix = ["env", f"LD_PRELOAD={us_path}", "java"] if us_ok else ["java"]
@@ -462,34 +538,40 @@ def get_jvm_args():
     return cmd_prefix + [
         f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
 
-        # ── Non-heap kısıtları (toplam ≈ 100MB) ─────────────────
-        "-XX:MaxMetaspaceSize=64m",          # Paper için yeterli
+        # Non-heap — agresif kısıtlama (toplam ~120MB)
+        "-XX:MaxMetaspaceSize=72m",          # Paper 1.21.1 için yeterli
         "-XX:CompressedClassSpaceSize=16m",
-        "-XX:ReservedCodeCacheSize=20m",     # JIT kod cache
-        "-Xss256k",                          # thread stack (default 512k)
+        "-XX:ReservedCodeCacheSize=20m",     # JIT cache küçült
+        "-Xss192k",                          # thread stack (default 512k → 192k)
 
-        # ── SerialGC — tek thread GC, sıfır overhead ─────────────
-        # G1GC'ye göre ~45MB tasarruf (card table, region meta, GC thread'ler yok)
-        # 1-5 oyunculu küçük sunucu için ideal: GC pause <200ms
-        "-XX:+UseSerialGC",
-        "-XX:MinHeapFreeRatio=10",           # agresif heap küçültme
-        "-XX:MaxHeapFreeRatio=25",           # boş alanı hızlı bırak
-        "-XX:NewRatio=3",                    # young:old = 1:3 (küçük young gen)
-        "-XX:SoftRefLRUPolicyMSPerMB=0",     # soft ref'leri hemen bırak
+        # G1GC — küçük bölgeler, bootstrap sırasında da GC çalışır
+        # SerialGC KULLANMA: bootstrap sırasında GC yapmaz → OOM
+        "-XX:+UseG1GC",
+        "-XX:+ParallelRefProcEnabled",
+        "-XX:MaxGCPauseMillis=150",
+        "-XX:+UnlockExperimentalVMOptions",
+        "-XX:+DisableExplicitGC",
+        "-XX:G1HeapRegionSize=2m",           # küçük region → daha sık GC
+        "-XX:G1NewSizePercent=10",           # young gen küçük (daha sık GC)
+        "-XX:G1MaxNewSizePercent=20",
+        "-XX:G1ReservePercent=10",
+        "-XX:InitiatingHeapOccupancyPercent=15",  # erken GC başlat
+        "-XX:SoftRefLRUPolicyMSPerMB=0",     # soft ref hemen bırak
+        "-XX:+UseStringDeduplication",
 
-        # ── Sıkıştırma ────────────────────────────────────────────
+        # Sıkıştırma
         "-XX:+UseCompressedOops",
         "-XX:+UseCompressedClassPointers",
 
-        # ── Genel ─────────────────────────────────────────────────
+        # Genel
         "-XX:NativeMemoryTracking=off",
         "-XX:-OmitStackTraceInFastThrow",
-        "-XX:-HeapDumpOnOutOfMemoryError",   # disk boşluğu kritik
+        "-XX:-HeapDumpOnOutOfMemoryError",
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8",
         "-Dcom.mojang.eula.agree=true",
         "-Djava.awt.headless=true",
-        "-Dlog4j2.formatMsgNoLookups=true",  # Log4Shell koruması
+        "-Dlog4j2.formatMsgNoLookups=true",
 
         "-jar", str(MC_JAR), "--nogui",
     ]
@@ -561,6 +643,10 @@ def start_server():
         return False, str(e)
     threading.Thread(target=_stdout_reader, daemon=True).start()
     log(f"[Panel] 🛡️  Java PID={mc_process.pid} (OOM adj child-preexec ✅)")
+
+    # MC başladı — şimdi cluster blueprint'ini yükle (lazy)
+    threading.Thread(target=_register_cluster_blueprint, daemon=True).start()
+
     return True, "Başlatılıyor..."
 
 
@@ -594,66 +680,50 @@ def send_command(cmd: str) -> bool:
 
 def _ram_watchdog():
     """
-    512MB cgroup limiti aşılmadan önce belleği boşalt.
-    Hedef: fiziksel RAM kullanımını daima < 460MB tut
-    (52MB güvenlik tampon bölgesi).
+    Bellek baskısını sürekli izle.
+    512MB fiziksel limit aşılmadan swap'a geçilmesini sağla.
     """
     import psutil
-    _level = 0   # 0=normal 1=uyarı 2=kritik 3=acil
+    _consecutive_low = 0
     while True:
-        eventlet.sleep(3)
+        eventlet.sleep(4)
         try:
             mem  = psutil.virtual_memory()
             swp  = psutil.swap_memory()
-            used_mb  = mem.used      // 1024 // 1024
-            avail_mb = mem.available // 1024 // 1024
+            # Gerçek kullanılabilir = fiziksel boş + swap boş
+            phys_avail_mb = mem.available  // 1024 // 1024
+            swap_free_mb  = swp.free       // 1024 // 1024
 
-            # Seviye belirle
-            if   avail_mb < 40:   new_level = 3   # OOM eşiği
-            elif avail_mb < 80:   new_level = 2   # kritik
-            elif avail_mb < 130:  new_level = 1   # uyarı
-            else:                 new_level = 0
-
-            if new_level != _level:
-                if new_level > 0:
-                    log(f"[RAM] ⚠️  Seviye={new_level} "
-                        f"used={used_mb}MB avail={avail_mb}MB "
-                        f"swap_free={swp.free//1024//1024}MB")
-                _level = new_level
-
-            # Seviye 1: Kernel cache boşalt
-            if _level >= 1:
+            # Fiziksel RAM kritik eşikte (<80MB) — agresif temizlik
+            if phys_avail_mb < 80:
+                _consecutive_low += 1
+                # Kernel sayfa cache'ini boşalt
                 try: open("/proc/sys/vm/drop_caches","w").write("1")
                 except: pass
+                # swappiness'i maksimuma çek (kernel swap'ı tercih etsin)
                 try: open("/proc/sys/vm/swappiness","w").write("200")
                 except: pass
 
-            # Seviye 2: MC entity temizliği + JVM GC tetikle
-            if _level >= 2:
-                send_command("kill @e[type=item]")
-                send_command("kill @e[type=experience_orb]")
-                # SerialGC: System.gc() → tam GC çalışır, heap shrinks
-                if mc_process and mc_process.poll() is None:
-                    try: mc_process.stdin.write(b"gc\n"); mc_process.stdin.flush()
-                    except: pass
-                try: open("/proc/sys/vm/drop_caches","w").write("3")
+                if _consecutive_low >= 3:
+                    # MC'ye temizlik komutları
+                    send_command("kill @e[type=item]")
+                    send_command("kill @e[type=experience_orb]")
+                if _consecutive_low >= 6:
+                    send_command("save-all")
+                    # View distance'ı geçici düşür
+                    send_command("minecraft:view-distance 4")
+                log(f"[Panel] ⚠️  RAM kritik: phys={phys_avail_mb}MB swap_free={swap_free_mb}MB")
+
+            elif phys_avail_mb < 150:
+                _consecutive_low = max(0, _consecutive_low - 1)
+                try: open("/proc/sys/vm/drop_caches","w").write("1")
                 except: pass
 
-            # Seviye 3: View distance düşür + save + emergency GC
-            if _level >= 3:
-                send_command("minecraft:view-distance 4")
-                send_command("save-all flush")
-                log("[RAM] 🚨 ACİL: View distance 4'e düşürüldü")
-                # JVM'e SIGUSR1 gönder — GC tetikle (HotSpot)
-                if mc_process and mc_process.poll() is None:
-                    try:
-                        import signal
-                        os.kill(mc_process.pid, signal.SIGUSR1)
-                    except: pass
-
-            # Normal seviye: view distance geri al
-            if _level == 0 and swp.free // 1024 // 1024 > 500:
-                send_command("minecraft:view-distance 8")
+            else:
+                _consecutive_low = 0
+                # Yeterli swap varsa view distance'ı geri getir
+                if swap_free_mb > 1000:
+                    send_command("minecraft:view-distance 8")
 
         except: pass
 
@@ -1999,7 +2069,7 @@ def _run_mc_only():
             preexec_fn=_cs,
         )
         threading.Thread(target=_reader, daemon=True).start()
-        _mc_log(f"[MC_ONLY] 🚀 Java PID={mc_process.pid} Xmx=370MB")
+        _mc_log(f"[MC_ONLY] 🚀 Java PID={mc_process.pid} Xmx=340MB")
         return True, f"Başlatıldı PID={mc_process.pid}"
 
     class _Handler(BaseHTTPRequestHandler):
@@ -2112,11 +2182,10 @@ def _run_mc_only():
 # ══════════════════════════════════════════════════════════════
 
 if not MC_ONLY:
-    threading.Thread(target=_ram_monitor,          daemon=True).start()
-    threading.Thread(target=_ram_watchdog,         daemon=True).start()
-    threading.Thread(target=_pool_health_watchdog, daemon=True).start()
-    threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
-    # cluster.py kendi thread'lerini başlatır
+    threading.Thread(target=_ram_monitor,  daemon=True).start()
+    threading.Thread(target=_ram_watchdog, daemon=True).start()
+    # cluster.py thread'leri MC başladıktan sonra lazy yüklenir
+    # _pool_health_watchdog ve _pool_auto_optimize cluster içinde
 
 if __name__ == "__main__":
     MC_DIR.mkdir(parents=True, exist_ok=True)
