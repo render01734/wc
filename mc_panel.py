@@ -176,6 +176,7 @@ def _parse_mc_output(line: str):
         try: _bootstrap_done.set()
         except Exception: pass
 
+    # iostream error → stats/ veya playerdata/ eksik — aninda olustur
     if "iostream error" in line or "statistics file loading failed" in line:
         threading.Thread(target=_ensure_runtime_dirs, daemon=True).start()
 
@@ -189,7 +190,7 @@ def _players_list():
 
 
 def _ensure_runtime_dirs():
-    """iostream error geldiginde cagrilir — dizinleri garantile."""
+    """iostream error geldiginde cagrilir — dizinleri aninda garantile."""
     import subprocess as _sp3
     for _d in [
         MC_DIR / "world" / "data" / "stats",
@@ -203,6 +204,35 @@ def _ensure_runtime_dirs():
     try:
         _sp3.run(["chmod", "-R", "777", str(MC_DIR)], capture_output=True, timeout=10)
     except Exception: pass
+
+
+def _backup_players_to_agents():
+    """players/*.json dosyalarini agent disk'e yedekle."""
+    players_dir = MC_DIR / "players"
+    agents = [a for a in _agents.values() if a.get("healthy")]
+    if not agents or not players_dir.exists():
+        return 0
+    best = max(agents,
+               key=lambda a: a.get("info", {}).get("disk", {}).get("store_free_gb", 0),
+               default=None)
+    if not best:
+        return 0
+    backed = 0
+    for pf in players_dir.glob("*.json"):
+        if not pf.is_file() or pf.stat().st_size == 0:
+            continue
+        try:
+            data = pf.read_bytes()
+            req  = _urllib_req.Request(
+                best["url"] + f"/api/files/players/{pf.name}",
+                data=data, method="PUT",
+                headers={"Content-Type": "application/octet-stream"})
+            _urllib_req.urlopen(req, timeout=30)
+            backed += 1
+        except Exception: pass
+    if backed:
+        log(f"[Players] {backed} dosya agent'a yedeklendi")
+    return backed
 
 
 def _tps_monitor():
@@ -752,8 +782,8 @@ def download_paper():
 def _clean_player_files():
     """
     OYUNCU DOSYALARI ASLA SILINMEZ.
-    Bozuk .json -> players_corrupted/ TASINIR (silinmez).
-    Agent yedek varsa geri yuklenir.
+    Bozuk .json dosyalari players_corrupted/ klasorune TASINIR.
+    Agent yedek varsa geri yuklenir, yoksa Cuberite sifirdan baslar.
     """
     import json as _j, shutil as _sh, subprocess as _spe
 
@@ -898,7 +928,7 @@ def write_server_config():
         webadmin.write_text("[WebAdmin]\nEnabled=false\n")
 
     # ── Tüm gerekli dizinler + chmod 777 ─────────────────────────
-    # iostream error kaynagi: stats/ ve playerdata/ yok
+    # iostream error kaynagi: stats/ ve playerdata/ dizinleri yok
     import subprocess as _sp
     _mkdirs = [
         MC_DIR / "players",
@@ -921,36 +951,41 @@ def write_server_config():
     for _d in _mkdirs:
         _d.mkdir(parents=True, exist_ok=True)
     try:
-        _sp.run(["chmod", "-R", "777", str(MC_DIR)],
-                capture_output=True, timeout=15)
+        _sp.run(["chmod", "-R", "777", str(MC_DIR)], capture_output=True, timeout=15)
         log("[Panel] chmod 777 /minecraft OK")
     except Exception as _ce:
         log(f"[Panel] chmod uyarisi: {_ce}")
 
-    # scoreboard.dat — HER ZAMAN SIL, Cuberite kendi olusturur
+    # scoreboard.dat — HER ZAMAN SIL, Cuberite kendi dogru formatinda yazar
     sbd = MC_DIR / "world" / "data" / "scoreboard.dat"
     if sbd.exists():
         try:
             sbd.unlink()
-            log("[Panel] scoreboard.dat silindi - Cuberite sifirdan yazar")
+            log("[Panel] scoreboard.dat silindi")
         except Exception: pass
 
-    # OYUNCU DOSYALARI ASLA SILINMEZ
-    # _clean_player_files() bozuklari players_corrupted/'a tasir
+    # OYUNCU DOSYALARI ASLA SILINMEZ — _clean_player_files() halleder
 
 
 
 def get_cuberite_cmd() -> list:
-    """Cuberite C++ baslatma komutu. Shell wrapper ile chmod + dizin garantisi."""
+    """
+    Cuberite C++ baslatma komutu.
+    Shell wrapper: baslamadan once chmod + dizinler + scoreboard sil.
+    """
     wrapper = MC_DIR / "_start_cuberite.sh"
     wrapper.write_text(
         "#!/bin/sh\n"
         f"chmod -R 777 {MC_DIR} 2>/dev/null || true\n"
         f"mkdir -p {MC_DIR}/world/data/stats "
+        f"{MC_DIR}/world/data "
         f"{MC_DIR}/world/playerdata "
         f"{MC_DIR}/players "
         f"{MC_DIR}/world_nether/data/stats "
+        f"{MC_DIR}/world_the_end/data/stats "
         f"{MC_DIR}/logs 2>/dev/null || true\n"
+        f"chmod 777 {MC_DIR}/world/data {MC_DIR}/world/data/stats "
+        f"{MC_DIR}/world/playerdata {MC_DIR}/players 2>/dev/null || true\n"
         f"rm -f {MC_DIR}/world/data/scoreboard.dat 2>/dev/null || true\n"
         f"exec {MC_BIN}\n"
     )
@@ -1038,35 +1073,6 @@ def start_server():
     return True, "Başlatılıyor..."
 
 
-def _backup_players_to_agents():
-    """players/*.json dosyalarini agent disk'e yedekle."""
-    players_dir = MC_DIR / "players"
-    agents = [a for a in _agents.values() if a.get("healthy")]
-    if not agents or not players_dir.exists():
-        return 0
-    best = max(agents,
-               key=lambda a: a.get("info", {}).get("disk", {}).get("store_free_gb", 0),
-               default=None)
-    if not best:
-        return 0
-    backed = 0
-    for pf in players_dir.glob("*.json"):
-        if not pf.is_file() or pf.stat().st_size == 0:
-            continue
-        try:
-            data = pf.read_bytes()
-            req  = _urllib_req.Request(
-                best["url"] + f"/api/files/players/{pf.name}",
-                data=data, method="PUT",
-                headers={"Content-Type": "application/octet-stream"})
-            _urllib_req.urlopen(req, timeout=30)
-            backed += 1
-        except Exception: pass
-    if backed:
-        log(f"[Players] {backed} dosya agent'a yedeklendi")
-    return backed
-
-
 def stop_server(force=False):
     global mc_process
     if IS_PROXY:
@@ -1076,14 +1082,13 @@ def stop_server(force=False):
         return False, "Server çalışmıyor"
     server_state["status"] = "stopping"
     socketio.emit("server_status", server_state)
-    try: _backup_players_to_agents()
-    except Exception: pass
     if force:
         mc_process.kill()
     else:
-        send_command("save"); time.sleep(2); send_command("stop")
-        try: _backup_players_to_agents()
-        except Exception: pass
+        # Cuberite konsol komutu: "stop" (save komutu yok — otomatik kaydeder)
+        send_command("stop"); time.sleep(3)
+    try: _backup_players_to_agents()
+    except Exception: pass
     return True, "Durduruluyor..."
 
 
