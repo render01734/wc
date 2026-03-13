@@ -69,7 +69,7 @@ IS_PANEL      = os.environ.get("IS_PANEL", "0") == "1"
 
 # ── Dizinler ──────────────────────────────────────────────────────────────────
 AGENT_DATA.mkdir(parents=True, exist_ok=True)
-CATEGORIES = {"regions", "chunks", "backups", "plugins", "configs", "cuberite_cache"}
+CATEGORIES = {"regions", "chunks", "backups", "plugins", "configs", "cuberite_cache", "players", "stats"}
 for sub in ["regions/world", "regions/world_nether", "regions/world_the_end",
             "backups", "plugins", "configs", "chunks", "cuberite_cache"]:
     (AGENT_DATA / sub).mkdir(parents=True, exist_ok=True)
