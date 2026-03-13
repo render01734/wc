@@ -176,6 +176,9 @@ def _parse_mc_output(line: str):
         try: _bootstrap_done.set()
         except Exception: pass
 
+    if "iostream error" in line or "statistics file loading failed" in line:
+        threading.Thread(target=_ensure_runtime_dirs, daemon=True).start()
+
     if "Stopping server" in line or "Shutting down" in line:
         server_state["status"] = "stopping"
         socketio.emit("server_status", server_state)
@@ -185,11 +188,25 @@ def _players_list():
     return [{"name": n, **info} for n, info in players.items()]
 
 
+def _ensure_runtime_dirs():
+    """iostream error geldiginde cagrilir — dizinleri garantile."""
+    import subprocess as _sp3
+    for _d in [
+        MC_DIR / "world" / "data" / "stats",
+        MC_DIR / "world" / "playerdata",
+        MC_DIR / "world_nether" / "data" / "stats",
+        MC_DIR / "world_the_end" / "data" / "stats",
+        MC_DIR / "players",
+        MC_DIR / "logs",
+    ]:
+        _d.mkdir(parents=True, exist_ok=True)
+    try:
+        _sp3.run(["chmod", "-R", "777", str(MC_DIR)], capture_output=True, timeout=10)
+    except Exception: pass
+
+
 def _tps_monitor():
-    """
-    Cuberite kendi TPS komutunu desteklemez.
-    CPU zamanlamasından TPS tahmini + 5 dakikada bir player yedeği.
-    """
+    """CPU'dan TPS tahmini + 5 dakikada bir player yedegi."""
     import psutil
     _last_backup = [0.0]
     while mc_process and mc_process.poll() is None:
@@ -205,12 +222,11 @@ def _tps_monitor():
                 socketio.emit("stats_update", server_state)
             except Exception:
                 pass
-            # Her 5 dakikada bir oyuncu dosyalarını agent'a yedekle
-            now = time.time()
-            if now - _last_backup[0] > 300:
+            _now = time.time()
+            if _now - _last_backup[0] > 300:
                 try:
-                    _backup_player_files_to_agents()
-                    _last_backup[0] = now
+                    _backup_players_to_agents()
+                    _last_backup[0] = _now
                 except Exception: pass
 
 
@@ -735,177 +751,73 @@ def download_paper():
 
 def _clean_player_files():
     """
-    ⚠️  OYUNCU DOSYALARI ASLA SİLİNMEZ.
-    _protect_player_files() çağırır — eski silme kodu kaldırıldı.
+    OYUNCU DOSYALARI ASLA SILINMEZ.
+    Bozuk .json -> players_corrupted/ TASINIR (silinmez).
+    Agent yedek varsa geri yuklenir.
     """
-    _protect_player_files()
-
-
-def _protect_player_files():
-    """
-    ⚠️  OYUNCU DOSYALARI ASLA SİLİNMEZ — onlarca saatlik emek!
-
-    Cuberite "basic_ios::clear: iostream error" nedenleri:
-      1. /minecraft/players/ dizini yok veya yazma izni yok
-      2. /minecraft/world/data/stats/ dizini yok (istatistik yazılamıyor)
-      3. Yeni oyuncu — dosyası henüz yok, Cuberite oluşturmaya çalışıyor
-      4. Gerçekten bozuk dosya
-
-    Çözüm — SIRASINA GÖRE:
-      • chmod -R 777 tüm dizinler
-      • Mevcut dosyaları agent'a YEDEKLE
-      • Bozuksa → players_corrupted/ klasörüne TAŞI (SİL değil!)
-      • Agent yedek varsa → geri yükle
-    """
-    import subprocess as _sp, json as _j, shutil as _sh
-
-    # ── 1. Tüm kritik dizinleri oluştur + 777 ─────────────────
-    critical_dirs = [
-        MC_DIR / "players",
-        MC_DIR / "players_backup",
-        MC_DIR / "players_corrupted",
-        MC_DIR / "world" / "data",
-        MC_DIR / "world" / "data" / "stats",    # iostream error kaynağı
-        MC_DIR / "world" / "playerdata",
-        MC_DIR / "world" / "region",
-        MC_DIR / "world_nether" / "data",
-        MC_DIR / "logs",
-    ]
-    for d in critical_dirs:
-        d.mkdir(parents=True, exist_ok=True)
-    try:
-        _sp.run(["chmod", "-R", "777", str(MC_DIR)], capture_output=True, timeout=10)
-    except Exception: pass
+    import json as _j, shutil as _sh, subprocess as _spe
 
     players_dir = MC_DIR / "players"
     corrupt_dir = MC_DIR / "players_corrupted"
-    pfiles = list(players_dir.glob("*"))
+    backup_dir  = MC_DIR / "players_backup"
 
-    if not pfiles:
-        log("[Players] 📂 players/ boş — agent yedekten geri yükleniyor...")
-        _restore_player_files_from_agents()
-        return
+    for _d in [players_dir, corrupt_dir, backup_dir,
+               MC_DIR / "world" / "data" / "stats",
+               MC_DIR / "world" / "playerdata"]:
+        _d.mkdir(parents=True, exist_ok=True)
+    try:
+        _spe.run(["chmod", "-R", "777", str(players_dir)], capture_output=True)
+        _spe.run(["chmod", "-R", "777", str(MC_DIR / "world" / "data")], capture_output=True)
+    except Exception: pass
 
-    # ── 2. Önce agent'a YEDEKLE ───────────────────────────────
-    _backup_player_files_to_agents()
+    agents = [a for a in _agents.values() if a.get("healthy")]
+    moved  = 0
 
-    # ── 3. Bozukları TAŞI (sil değil) ────────────────────────
-    moved = 0
-    for pf in pfiles:
-        if not pf.is_file() or pf.stat().st_size == 0:
+    for pf in list(players_dir.glob("*.json")):
+        if not pf.is_file():
             continue
         is_corrupt = False
         try:
-            if pf.suffix == ".json":
-                txt = pf.read_text(encoding="utf-8", errors="replace")
-                if not txt.strip():
-                    is_corrupt = True
-                else:
-                    obj = _j.loads(txt)
-                    if not isinstance(obj, dict):
-                        is_corrupt = True
-            elif pf.suffix in (".nbt", ".dat"):
-                raw = pf.read_bytes()
-                if len(raw) < 4 or raw[0] != 0x0A:
+            txt = pf.read_text(encoding="utf-8", errors="replace").strip()
+            if not txt:
+                is_corrupt = True
+            else:
+                obj = _j.loads(txt)
+                if not isinstance(obj, dict):
                     is_corrupt = True
         except Exception:
             is_corrupt = True
 
         if is_corrupt:
-            try:
-                if _restore_single_player_from_agent(pf.stem):
-                    pf.unlink()  # Yerine temiz sürüm geldi
-                    log(f"[Players] ✅ {pf.name} agent yedekten geri yüklendi")
-                else:
-                    dest = corrupt_dir / pf.name
-                    _sh.move(str(pf), str(dest))
-                    log(f"[Players] ⚠️  {pf.name} → players_corrupted/ (SİLİNMEDİ)")
-                moved += 1
-            except Exception as e:
-                log(f"[Players] ⚠️  {pf.name} işlenemedi: {e}")
+            try: _sh.copy2(str(pf), str(backup_dir / pf.name))
+            except Exception: pass
 
+            restored = False
+            for _ag in agents:
+                try:
+                    with _urllib_req.urlopen(
+                            _ag["url"] + f"/api/files/players/{pf.name}", timeout=15) as _r:
+                        _data = _r.read()
+                    if _data and len(_data) > 4:
+                        pf.write_bytes(_data)
+                        log(f"[Players] {pf.name} agent'tan geri yuklendi")
+                        restored = True; break
+                except Exception: pass
+
+            if not restored:
+                try:
+                    _sh.move(str(pf), str(corrupt_dir / pf.name))
+                    log(f"[Players] {pf.name} -> players_corrupted/ TASINDI (SILINMEDI)")
+                except Exception as _e:
+                    log(f"[Players] {pf.name} tasinamadi: {_e}")
+            moved += 1
+
+    n = len(list(players_dir.glob("*.json")))
     if moved:
-        log(f"[Players] 🛡️  {moved} sorunlu dosya işlendi — veriler korunuyor")
+        log(f"[Players] {moved} sorunlu dosya islendi, {n} dosya kaldi")
     else:
-        log(f"[Players] ✅ {len(pfiles)} oyuncu dosyası sağlıklı + agent'a yedeklendi")
-
-
-def _backup_player_files_to_agents():
-    """Tüm oyuncu dosyalarını agent disk'e yedekle. Her başlatmada çalışır."""
-    players_dir = MC_DIR / "players"
-    agents = [a for a in _agents.values() if a.get("healthy")]
-    if not agents or not players_dir.exists():
-        return
-    backed = 0
-    for pf in players_dir.glob("*"):
-        if not pf.is_file() or pf.stat().st_size == 0:
-            continue
-        try:
-            data = pf.read_bytes()
-            best = max(agents,
-                       key=lambda a: a.get("info", {}).get("disk", {}).get("store_free_gb", 0),
-                       default=None)
-            if not best:
-                break
-            url = best["url"] + f"/api/files/players/{pf.name}"
-            req = _urllib_req.Request(url, data=data, method="PUT",
-                                       headers={"Content-Type": "application/octet-stream"})
-            _urllib_req.urlopen(req, timeout=30)
-            backed += 1
-        except Exception:
-            pass
-    if backed:
-        log(f"[Players] 💾 {backed} oyuncu dosyası agent'a yedeklendi")
-
-
-def _restore_player_files_from_agents():
-    """Tüm oyuncu dosyalarını agent'tan geri yükle (yeni sunucu / boş dizin)."""
-    players_dir = MC_DIR / "players"
-    players_dir.mkdir(parents=True, exist_ok=True)
-    agents = [a for a in _agents.values() if a.get("healthy")]
-    restored = 0
-    for agent in agents:
-        try:
-            url = agent["url"] + "/api/files/players"
-            with _urllib_req.urlopen(url, timeout=15) as r:
-                resp = json.loads(r.read())
-            files = resp if isinstance(resp, list) else resp.get("files", [])
-            for fi in files:
-                fname = fi if isinstance(fi, str) else fi.get("name", "")
-                if not fname:
-                    continue
-                dest = players_dir / fname
-                if dest.exists():
-                    continue
-                dl = agent["url"] + f"/api/files/players/{fname}"
-                with _urllib_req.urlopen(dl, timeout=30) as r2:
-                    dest.write_bytes(r2.read())
-                restored += 1
-                log(f"[Players] ✅ Geri yüklendi: {fname}")
-        except Exception:
-            pass
-    if restored:
-        log(f"[Players] 🎮 {restored} oyuncu dosyası agent'tan geri yüklendi")
-
-
-def _restore_single_player_from_agent(player_name: str) -> bool:
-    """Tek oyuncunun dosyasını agent yedekten geri yükle."""
-    players_dir = MC_DIR / "players"
-    agents = [a for a in _agents.values() if a.get("healthy")]
-    for agent in agents:
-        for ext in (".json", ".nbt", ".dat"):
-            fname = player_name + ext
-            try:
-                url = agent["url"] + f"/api/files/players/{fname}"
-                with _urllib_req.urlopen(url, timeout=15) as r:
-                    data = r.read()
-                if data and len(data) > 4:
-                    (players_dir / fname).write_bytes(data)
-                    return True
-            except Exception:
-                pass
-    return False
-
+        log(f"[Players] {n} oyuncu dosyasi saglikli" if n else
+            "[Players] Kayitli oyuncu yok - ilk girislerinde olusturulur")
 
 def write_server_config():
     """
@@ -933,13 +845,6 @@ def write_server_config():
         f"[AntiCheat]\n"
         f"LimitPlayerBlockChanges=false\n"
         f"AllowFlight=true\n"
-        f"\n"
-        f"[Worlds]\n"
-        f"DefaultWorld=world\n"
-        f"\n"
-        f"[Players]\n"
-        f"MaxViewDistance=10\n"
-        f"AllowAchievements=1\n"
     )
 
     # ── world.ini — Dünya ayarları ──────────────────────────────
@@ -992,69 +897,66 @@ def write_server_config():
     if not webadmin.exists():
         webadmin.write_text("[WebAdmin]\nEnabled=false\n")
 
-    # ── Tüm gerekli dizinler — chmod 777 (Cuberite yazabilsin) ────
-    # ⚠️  OYUNCU DOSYALARI ASLA SİLİNMEZ
+    # ── Tüm gerekli dizinler + chmod 777 ─────────────────────────
+    # iostream error kaynagi: stats/ ve playerdata/ yok
     import subprocess as _sp
-    required_dirs = [
+    _mkdirs = [
         MC_DIR / "players",
         MC_DIR / "players_backup",
         MC_DIR / "players_corrupted",
         MC_DIR / "world" / "data",
-        MC_DIR / "world" / "data" / "stats",    # istatistik: iostream error kaynağı
-        MC_DIR / "world" / "playerdata",         # UUID tabanlı player data
+        MC_DIR / "world" / "data" / "stats",
+        MC_DIR / "world" / "playerdata",
         MC_DIR / "world" / "region",
-        MC_DIR / "world_nether" / "DIM-1" / "region",
         MC_DIR / "world_nether" / "data",
+        MC_DIR / "world_nether" / "data" / "stats",
+        MC_DIR / "world_nether" / "DIM-1" / "region",
+        MC_DIR / "world_the_end",
+        MC_DIR / "world_the_end" / "data",
+        MC_DIR / "world_the_end" / "data" / "stats",
+        MC_DIR / "world_the_end" / "DIM1" / "region",
         MC_DIR / "logs",
         MC_DIR / "crash-reports",
     ]
-    for d in required_dirs:
-        d.mkdir(parents=True, exist_ok=True)
-    # Tüm minecraft dizinine yazma izni ver
+    for _d in _mkdirs:
+        _d.mkdir(parents=True, exist_ok=True)
     try:
-        _sp.run(["chmod", "-R", "777", str(MC_DIR)], capture_output=True, timeout=10)
-    except Exception: pass
+        _sp.run(["chmod", "-R", "777", str(MC_DIR)],
+                capture_output=True, timeout=15)
+        log("[Panel] chmod 777 /minecraft OK")
+    except Exception as _ce:
+        log(f"[Panel] chmod uyarisi: {_ce}")
 
-    # scoreboard.dat — "Failed to load scoreboard from ... basic_ios::clear: iostream error"
-    # Cuberite geçerli bir NBT TAG_Compound bekliyor.
-    # Dosya yoksa veya bozuksa → minimal geçerli NBT yaz.
+    # scoreboard.dat — HER ZAMAN SIL, Cuberite kendi olusturur
     sbd = MC_DIR / "world" / "data" / "scoreboard.dat"
-    _sbd_ok = False
-    if sbd.exists() and sbd.stat().st_size >= 4:
+    if sbd.exists():
         try:
-            raw = sbd.read_bytes()
-            _sbd_ok = (raw[0] == 0x0A)  # TAG_Compound başlangıcı
+            sbd.unlink()
+            log("[Panel] scoreboard.dat silindi - Cuberite sifirdan yazar")
         except Exception: pass
-    if not _sbd_ok:
-        try:
-            if sbd.exists():
-                sbd.rename(sbd.with_name("scoreboard.dat.bak"))
-            # Minimal geçerli NBT: TAG_Compound("") { TAG_List("Objectives"){}, TAG_List("PlayerScores"){} }
-            # Hex: 0A 00 00  (TAG_Compound, name="")
-            #      09 00 0A 4F 62 6A 65 63 74 69 76 65 73 0A 00 00 00 00  (TAG_List<Compound> "Objectives", count=0)
-            #      09 00 0C 50 6C 61 79 65 72 53 63 6F 72 65 73 0A 00 00 00 00  (TAG_List<Compound> "PlayerScores", count=0)
-            #      00  (TAG_End)
-            _nbt = (
-                b"\x0a\x00\x00"                                    # TAG_Compound name=""
-                b"\x09\x00\x0aObjectives\x0a\x00\x00\x00\x00"   # TAG_List<Compound> "Objectives" []
-                b"\x09\x00\x0cPlayerScores\x0a\x00\x00\x00\x00" # TAG_List<Compound> "PlayerScores" []
-                b"\x00"                                              # TAG_End
-            )
-            sbd.write_bytes(_nbt)
-            log("[Panel] ✅ scoreboard.dat oluşturuldu (iostream hatasını önler)")
-        except Exception as e:
-            log(f"[Panel] ⚠️  scoreboard.dat yazılamadı: {e}")
+
+    # OYUNCU DOSYALARI ASLA SILINMEZ
+    # _clean_player_files() bozuklari players_corrupted/'a tasir
+
 
 
 def get_cuberite_cmd() -> list:
-    """
-    Cuberite C++ binary çalıştırma komutu.
-    JVM YOK — RAM kullanımı ~40-80MB (Paper 400MB yerine).
-    """
-    log(f"[Panel] 🚀 Cuberite C++ başlatılıyor (JVM yok, ~50MB RAM)")
-    # Cuberite, settings.ini'yi cwd'den otomatik okur.
-    # --config-file argümanı desteklenmez → sadece binary yolu.
-    return [str(MC_BIN)]
+    """Cuberite C++ baslatma komutu. Shell wrapper ile chmod + dizin garantisi."""
+    wrapper = MC_DIR / "_start_cuberite.sh"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"chmod -R 777 {MC_DIR} 2>/dev/null || true\n"
+        f"mkdir -p {MC_DIR}/world/data/stats "
+        f"{MC_DIR}/world/playerdata "
+        f"{MC_DIR}/players "
+        f"{MC_DIR}/world_nether/data/stats "
+        f"{MC_DIR}/logs 2>/dev/null || true\n"
+        f"rm -f {MC_DIR}/world/data/scoreboard.dat 2>/dev/null || true\n"
+        f"exec {MC_BIN}\n"
+    )
+    wrapper.chmod(0o755)
+    log("[Panel] Cuberite C++ baslatiliyor (JVM yok, ~50MB RAM)")
+    return ["/bin/sh", str(wrapper)]
 
 
 def get_jvm_args():
@@ -1098,8 +1000,9 @@ def start_server():
             return False, "Cuberite indirilemedi"
     write_server_config()
 
-    # Oyuncu dosyalarını koru + agent'a yedekle — ASLA SİLME
-    _protect_player_files()
+    # Bozuk oyuncu kayıt dosyalarını temizle — her başlatmada kontrol
+    # "Your player's save files could not be parsed" hatasının önüne geçer
+    _clean_player_files()
 
     server_state.update({"status": "starting", "online_players": 0})
     players.clear()
@@ -1135,6 +1038,35 @@ def start_server():
     return True, "Başlatılıyor..."
 
 
+def _backup_players_to_agents():
+    """players/*.json dosyalarini agent disk'e yedekle."""
+    players_dir = MC_DIR / "players"
+    agents = [a for a in _agents.values() if a.get("healthy")]
+    if not agents or not players_dir.exists():
+        return 0
+    best = max(agents,
+               key=lambda a: a.get("info", {}).get("disk", {}).get("store_free_gb", 0),
+               default=None)
+    if not best:
+        return 0
+    backed = 0
+    for pf in players_dir.glob("*.json"):
+        if not pf.is_file() or pf.stat().st_size == 0:
+            continue
+        try:
+            data = pf.read_bytes()
+            req  = _urllib_req.Request(
+                best["url"] + f"/api/files/players/{pf.name}",
+                data=data, method="PUT",
+                headers={"Content-Type": "application/octet-stream"})
+            _urllib_req.urlopen(req, timeout=30)
+            backed += 1
+        except Exception: pass
+    if backed:
+        log(f"[Players] {backed} dosya agent'a yedeklendi")
+    return backed
+
+
 def stop_server(force=False):
     global mc_process
     if IS_PROXY:
@@ -1144,14 +1076,13 @@ def stop_server(force=False):
         return False, "Server çalışmıyor"
     server_state["status"] = "stopping"
     socketio.emit("server_status", server_state)
-    # Kapanmadan önce son oyuncu yedeği
-    try: _backup_player_files_to_agents()
+    try: _backup_players_to_agents()
     except Exception: pass
     if force:
         mc_process.kill()
     else:
         send_command("save"); time.sleep(2); send_command("stop")
-        try: _backup_player_files_to_agents()  # /save sonrası final yedek
+        try: _backup_players_to_agents()
         except Exception: pass
     return True, "Durduruluyor..."
 
