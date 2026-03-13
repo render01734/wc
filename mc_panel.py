@@ -280,7 +280,7 @@ def _best_agent_by_disk() -> dict | None:
         agents = [a for a in _agents.values() if a["healthy"]]
     if not agents:
         return None
-    return max(agents, key=lambda a: a["info"].get("disk", {}).get("store_free_gb", 0))
+    return max(agents, key=lambda a: a["info"].get("disk", {}).get("free_gb", 0))
 
 
 def _best_agent_by_ram() -> dict | None:
@@ -303,15 +303,10 @@ def _pool_health_watchdog():
                 ag["info"]      = r
                 ag["healthy"]   = True
                 ag["last_ping"] = time.time()
-                # vcluster._agents ile senkronize et
-                vcluster.heartbeat_agent(ag["node_id"], r)
             else:
                 # 90sn yanıt yoksa unhealthy
                 if time.time() - ag["last_ping"] > 90:
                     ag["healthy"] = False
-                    with vcluster._lock:
-                        if ag["node_id"] in vcluster._agents:
-                            vcluster._agents[ag["node_id"]]["healthy"] = False
         socketio.emit("pool_update", vcluster.summary())
 
 
@@ -321,7 +316,7 @@ def _pool_auto_optimize():
     1. Eski region'ları agent'a taşı → ana sunucuda disk aç → swap büyüt
     2. Düşük RAM'de JVM dışı cache devreye girer
     """
-    time.sleep(30)    # Sunucu stabil olana kadar bekle
+    time.sleep(120)   # Sunucu stabil olana kadar bekle
     while True:
         try:
             _auto_archive_old_regions()
@@ -330,7 +325,7 @@ def _pool_auto_optimize():
         time.sleep(600)   # 10 dakikada bir
 
 
-def _auto_archive_old_regions(older_than_days: int = 2):
+def _auto_archive_old_regions(older_than_days: int = 5):
     import shutil as _sh
     best = _best_agent_by_disk()
     if not best:
@@ -345,8 +340,8 @@ def _auto_archive_old_regions(older_than_days: int = 2):
         mc_used_gb = 0.0
     render_limit_gb = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
     used_gb = 4.0 + mc_used_gb
-    if used_gb < render_limit_gb * 0.50:
-        return  # Disk %50'den az doluysa gerek yok
+    if used_gb < render_limit_gb * 0.65:
+        return  # Disk %65'ten az doluysa gerek yok
 
     archived  = 0
     freed_mb  = 0
@@ -380,6 +375,242 @@ def _auto_archive_old_regions(older_than_days: int = 2):
 
     return archived, freed_mb
 
+
+
+# ══════════════════════════════════════════════════════════════
+#  AGENT AKTIF KULLLANIM — RAM Cache + Disk Sync Daemon'ları
+#  ─────────────────────────────────────────────────────────────
+#  _region_disk_daemon  → yeni/değişen .mca dosyaları agent disk'e iter
+#  _region_cache_daemon → sık erişilen region'ları agent RAM'e cache'ler
+#  _region_restore      → Cuberite başlamadan önce agent'tan geri yükle
+# ══════════════════════════════════════════════════════════════
+
+# Hangi region'lar agent disk'te (offloaded = yerel kopyası silindi)
+_offloaded: set[str]  = set()   # "world/r.0.0.mca" gibi
+_synced:    set[str]  = set()   # yerel + agent'ta eşzamanlı
+_region_lock = threading.Lock()
+
+# Agent disk'e gönder — PUT /api/files/regions/<dim>/<name>
+def _push_region(rf: Path, dim: str, agent: dict, delete_local: bool = False) -> bool:
+    try:
+        data = rf.read_bytes()
+        url  = agent["url"] + f"/api/files/regions/{dim}/{rf.name}"
+        req  = _urllib_req.Request(
+            url, data=data, method="PUT",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        _urllib_req.urlopen(req, timeout=120)
+        key  = f"{dim}/{rf.name}"
+        with _region_lock:
+            if delete_local:
+                try: rf.unlink()
+                except Exception: pass
+                _offloaded.add(key)
+                _synced.discard(key)
+            else:
+                _synced.add(key)
+        return True
+    except Exception as e:
+        log(f"[RegionSync] ⚠️  {rf.name} → agent hatası: {e}")
+        return False
+
+
+# Agent disk'ten geri yükle — GET /api/files/regions/<dim>/<name>
+def _restore_region(dim: str, name: str, agent: dict) -> bool:
+    try:
+        url = agent["url"] + f"/api/files/regions/{dim}/{name}"
+        with _urllib_req.urlopen(url, timeout=60) as r:
+            data = r.read()
+        dest = MC_DIR / dim / "region" / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        key = f"{dim}/{name}"
+        with _region_lock:
+            _offloaded.discard(key)
+            _synced.add(key)
+        return True
+    except Exception:
+        return False
+
+
+# Agent RAM cache'e küçük/sık region bas
+def _push_region_cache(rf: Path, dim: str, agent: dict) -> bool:
+    if rf.stat().st_size > 4 * 1024 * 1024:  # 4MB'dan büyük → sadece disk
+        return False
+    try:
+        data = rf.read_bytes()
+        import gzip, base64
+        compressed = gzip.compress(data, compresslevel=1)
+        url  = agent["url"] + "/api/cache/set"
+        body = {"key": f"region:{dim}:{rf.name}", "value": base64.b64encode(compressed).decode(),
+                "ttl": 3600}
+        req  = _urllib_req.Request(
+            url, data=json.dumps(body).encode(), method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        _urllib_req.urlopen(req, timeout=30)
+        return True
+    except Exception:
+        return False
+
+
+def _region_disk_daemon():
+    """
+    Arka planda sürekli çalışır.
+    Yeni veya değişen .mca region dosyalarını agent disk'e iter.
+    Disk %60+ doluysa eski region'ları offload eder (yerel siler).
+    """
+    log("[RegionSync] 🟢 Disk sync daemon başladı")
+    _seen_mtime: dict[str, float] = {}  # rf.key → son gönderilen mtime
+    DIMS = [
+        ("world",          MC_DIR / "world"          / "region"),
+        ("world_nether",   MC_DIR / "world_nether"   / "region"),
+        ("world_the_end",  MC_DIR / "world_the_end"  / "region"),
+    ]
+
+    while True:
+        try:
+            agents = [a for a in _agents.values() if a["healthy"]]
+            if not agents:
+                time.sleep(30)
+                continue
+
+            # En çok disk alanı olan agent'ı seç
+            best = max(agents, key=lambda a: a["info"].get("disk", {}).get("store_free_gb", 0))
+            if best["info"].get("disk", {}).get("store_free_gb", 0) < 0.1:
+                time.sleep(60)
+                continue
+
+            # Disk kullanımını hesapla
+            try:
+                mc_used_gb = sum(f.stat().st_size for f in MC_DIR.rglob("*") if f.is_file()) / 1e9
+            except Exception:
+                mc_used_gb = 0.0
+            disk_pct = (4.0 + mc_used_gb) / float(os.environ.get("RENDER_DISK_LIMIT_GB", "18")) * 100
+
+            now = time.time()
+            for dim, region_dir in DIMS:
+                if not region_dir.exists():
+                    continue
+                for rf in sorted(region_dir.glob("*.mca"), key=lambda f: f.stat().st_mtime):
+                    key  = f"{dim}/{rf.name}"
+                    mt   = rf.stat().st_mtime
+                    age_days = (now - mt) / 86400
+
+                    # Değişmemişse ve zaten sync'se geç
+                    if _seen_mtime.get(key) == mt and key in _synced:
+                        # Disk %60+ doluysa ve 1 günden eskiyse offload et
+                        if disk_pct > 60 and age_days > 1 and key not in _offloaded:
+                            if _push_region(rf, dim, best, delete_local=True):
+                                log(f"[RegionSync] 📦 Offload: {rf.name} ({rf.stat().st_size//1024}KB → agent disk, disk={disk_pct:.0f}%)")
+                        continue
+
+                    # Yeni veya değişmiş — agent disk'e gönder
+                    # Aktif oyuncu bölgesi (son 10 dakika) → offload etme, sadece sync
+                    delete = disk_pct > 60 and age_days > 0.5
+                    if _push_region(rf, dim, best, delete_local=delete):
+                        _seen_mtime[key] = mt
+                        if delete:
+                            log(f"[RegionSync] 📤 Sync+Offload: {rf.name}")
+                        else:
+                            log(f"[RegionSync] 📤 Sync: {rf.name} ({rf.stat().st_size//1024}KB)")
+
+        except Exception as e:
+            log(f"[RegionSync] ⚠️  Hata: {e}")
+
+        time.sleep(15)  # 15 saniyede bir tara
+
+
+def _region_cache_daemon():
+    """
+    Arka planda çalışır.
+    Son 30 dakika içinde erişilen küçük region'ları agent RAM cache'e yükler.
+    Cache hit → agent'tan, cache miss → diskten okur (Cuberite kendi okur).
+    """
+    log("[RegionCache] 🟢 RAM cache daemon başladı")
+    DIMS = [
+        ("world",         MC_DIR / "world"         / "region"),
+        ("world_nether",  MC_DIR / "world_nether"  / "region"),
+        ("world_the_end", MC_DIR / "world_the_end" / "region"),
+    ]
+    _cached_keys: set[str] = set()
+
+    while True:
+        try:
+            agents = [a for a in _agents.values() if a["healthy"]]
+            if not agents:
+                time.sleep(60)
+                continue
+
+            # En çok boş RAM'li agent
+            best_ram = max(agents, key=lambda a: a["info"].get("ram", {}).get("free_mb", 0))
+            free_mb  = best_ram["info"].get("ram", {}).get("free_mb", 0)
+            if free_mb < 50:
+                time.sleep(60)
+                continue
+
+            now      = time.time()
+            pushed   = 0
+            for dim, region_dir in DIMS:
+                if not region_dir.exists():
+                    continue
+                for rf in region_dir.glob("*.mca"):
+                    key = f"region:{dim}:{rf.name}"
+                    if key in _cached_keys:
+                        continue
+                    # Son 30 dakikada erişildiyse cache'e yükle
+                    try:
+                        atime = rf.stat().st_atime
+                    except Exception:
+                        atime = rf.stat().st_mtime
+                    if (now - atime) < 1800:
+                        if _push_region_cache(rf, dim, best_ram):
+                            _cached_keys.add(key)
+                            pushed += 1
+                            free_mb -= rf.stat().st_size // (1024 * 1024)
+                            if free_mb < 50 or pushed >= 20:
+                                break
+                if pushed >= 20 or free_mb < 50:
+                    break
+
+            if pushed > 0:
+                log(f"[RegionCache] 🧠 {pushed} region agent RAM'e yüklendi")
+
+        except Exception as e:
+            log(f"[RegionCache] ⚠️  Hata: {e}")
+
+        time.sleep(60)  # 1 dakikada bir
+
+
+def _region_restore_all():
+    """
+    Cuberite başlamadan önce offload edilmiş region'ları geri yükle.
+    Tüm agent'lardaki region listesini al ve gerekli olanları indir.
+    """
+    agents = [a for a in _agents.values() if a["healthy"]]
+    if not agents:
+        return
+    log("[RegionSync] 🔄 Offload'lu region'lar geri yükleniyor...")
+    restored = 0
+    for agent in agents:
+        try:
+            for dim in ["world", "world_nether", "world_the_end"]:
+                url  = agent["url"] + f"/api/files/regions/{dim}"
+                try:
+                    with _urllib_req.urlopen(url, timeout=15) as r:
+                        files = json.loads(r.read())
+                except Exception:
+                    files = []
+                for fname in files:
+                    key  = f"{dim}/{fname}"
+                    dest = MC_DIR / dim / "region" / fname
+                    if not dest.exists():
+                        if _restore_region(dim, fname, agent):
+                            restored += 1
+        except Exception:
+            pass
+    if restored > 0:
+        log(f"[RegionSync] ✅ {restored} region geri yüklendi")
 
 # ══════════════════════════════════════════════════════════════
 #  MC SERVER YÖNETİMİ
@@ -603,6 +834,10 @@ def start_server():
     players.clear()
     socketio.emit("server_status", server_state)
     socketio.emit("players_update", [])
+    # Offload edilmiş region'ları agent'tan geri yükle
+    threading.Thread(target=_region_restore_all, daemon=True).start()
+    time.sleep(2)  # Küçük bekleme — kritik region'lar için
+
     cmd = get_cuberite_cmd()
     log(f"[Panel] 🚀 Cuberite C++ başlatılıyor (JVM yok)...")
     try:
@@ -641,7 +876,7 @@ def stop_server(force=False):
     if force:
         mc_process.kill()
     else:
-        send_command("save"); time.sleep(1); send_command("stop")
+        send_command("/save"); time.sleep(1); send_command("/stop")
     return True, "Durduruluyor..."
 
 
@@ -655,23 +890,6 @@ def send_command(cmd: str) -> bool:
             return True
         except: pass
     return False
-
-
-def _push_to_agent_cache(data: bytes, key: str) -> bool:
-    """Veriyi en boş RAM'li agent'a gönder."""
-    best = _best_agent_by_ram()
-    if not best:
-        return False
-    try:
-        req = _urllib_req.Request(
-            best["url"] + f"/api/cache/{key}",
-            data=data, method="PUT",
-            headers={"Content-Type": "application/octet-stream"},
-        )
-        _urllib_req.urlopen(req, timeout=30)
-        return True
-    except Exception:
-        return False
 
 
 def _ram_watchdog():
@@ -705,17 +923,15 @@ def _ram_watchdog():
                     send_command("kill @e[type=item]")
                     send_command("kill @e[type=experience_orb]")
                 if _consecutive_low >= 6:
-                    send_command("save")
-                    # View distance'ı geçici düşür (Cuberite komutu yok, sadece log)
-                    log("[Panel] ⚠️  RAM kritik — view distance düşürülemiyor (Cuberite)")
+                    send_command("save-all")
+                    # View distance'ı geçici düşür
+                    send_command("minecraft:view-distance 4")
                 log(f"[Panel] ⚠️  RAM kritik: phys={phys_avail_mb}MB swap_free={swap_free_mb}MB")
 
             elif phys_avail_mb < 150:
                 _consecutive_low = max(0, _consecutive_low - 1)
                 try: open("/proc/sys/vm/drop_caches","w").write("1")
                 except: pass
-                # RAM baskısı var → eski region'ları agent'a taşı
-                threading.Thread(target=_auto_archive_old_regions, args=(1,), daemon=True).start()
 
             else:
                 _consecutive_low = 0
@@ -841,16 +1057,11 @@ def api_agent_heartbeat():
         _pool_register(tunnel, nid, d)
         vcluster.register_agent(tunnel, nid, d)
     else:
-        # Tunnel yok → sadece mevcut kaydı güncelle
-        with _agents_lock:
-            if nid in _agents:
-                _agents[nid]["info"]      = d
-                _agents[nid]["last_ping"] = time.time()
-                _agents[nid]["healthy"]   = True
+        # Tunnel yok (Render EXTERNAL_URL henüz set olmamış) → sadece info güncelle
         with vcluster._lock:
             if nid in vcluster._agents:
                 vcluster._agents[nid]["info"]       = d
-                vcluster._agents[nid]["last_ping"]  = time.time()
+                vcluster._agents[nid]["last_ping"]  = __import__("time").time()
                 vcluster._agents[nid]["healthy"]    = True
                 vcluster._agents[nid]["fail_count"] = 0
     socketio.emit("pool_update", vcluster.summary())
@@ -951,6 +1162,29 @@ def api_pool_proxy_stop():
     for ag in agents:
         _agent_json(ag, "POST", "/api/proxy/stop")
     return jsonify({"ok": True})
+
+
+@app.route("/api/pool/sync/status")
+def api_pool_sync_status():
+    with _region_lock:
+        offloaded = list(_offloaded)
+        synced    = list(_synced)
+    agents = [a for a in _agents.values() if a["healthy"]]
+    total_disk = sum(a["info"].get("disk", {}).get("store_used_gb", 0) for a in agents)
+    total_ram  = sum(a["info"].get("ram",  {}).get("cache_mb", 0)      for a in agents)
+    return jsonify({
+        "ok": True,
+        "offloaded":          len(offloaded),
+        "synced":             len(synced),
+        "agent_disk_used_gb": round(total_disk, 2),
+        "agent_ram_cache_mb": total_ram,
+    })
+
+
+@app.route("/api/pool/restore", methods=["POST"])
+def api_pool_restore():
+    threading.Thread(target=_region_restore_all, daemon=True).start()
+    return jsonify({"ok": True, "msg": "Geri yükleme başlatıldı"})
 
 
 @app.route("/api/pool/archive/regions", methods=["POST"])
@@ -1227,7 +1461,7 @@ def api_world_backup():
     if not src.exists(): return jsonify({"ok":False,"error":"Dünya bulunamadı"})
     ts=datetime.now().strftime("%Y%m%d_%H%M%S"); dest=MC_DIR/"backups"/f"{world}_{ts}.zip"
     dest.parent.mkdir(exist_ok=True)
-    send_command("save"); time.sleep(2)
+    send_command("save-off"); time.sleep(1); send_command("save-all"); time.sleep(2)
     with zipfile.ZipFile(str(dest),"w",zipfile.ZIP_DEFLATED) as z:
         for fp in src.rglob("*"):
             if fp.is_file(): z.write(fp,fp.relative_to(MC_DIR))
@@ -1512,7 +1746,7 @@ select.set-inp option{background:#1e1e1e}
   <div class="pool-bar hidden" id="pool-bar">
     <span style="color:var(--a2)">🔗 Aktif Agentlar:</span>
     <span id="pool-bar-text" style="color:var(--t2);font-size:11px">bağlı agent yok</span>
-    <span id="pool-res-bar" style="color:var(--a1);font-family:var(--mono);font-size:10px;margin-left:auto"></span>
+    <span id="pool-res-bar" style="color:var(--a1);font-family:var(--mono);font-size:10px;margin-left:auto"></span> &nbsp; <span id="pool-sync-info" style="color:var(--t2);font-size:10px"></span>
   </div>
   <div class="pages">
 
@@ -1714,7 +1948,7 @@ select.set-inp option{background:#1e1e1e}
         <button class="btn b-ghost" onclick="cmd('weather rain')">🌧️ Yağmur</button>
         <button class="btn b-ghost" onclick="cmd('difficulty peaceful')">😊 Peaceful</button>
         <button class="btn b-ghost" onclick="cmd('difficulty hard')">🔴 Hard</button>
-        <button class="btn b-ghost" onclick="cmd('save')">💾 Kaydet</button>
+        <button class="btn b-ghost" onclick="cmd('save-all')">💾 Kaydet</button>
         <button class="btn b-ghost" onclick="cmd('kill @e[type=!player]')">⚡ Mob Temizle</button>
       </div>
     </div>
@@ -1882,13 +2116,9 @@ function setTunnel(d){
 function copyAddr(){if(mcAddr){navigator.clipboard.writeText(mcAddr);notify('Kopyalandı!','ok');}}
 
 function updatePool(d){
-  poolData=d||{total:0,healthy:0,virtual_machine:{},disk:{},cpu:{},agents:[]};
-  const h=poolData.healthy||0;
-  // vcluster.summary() → virtual_machine / disk / cpu anahtarları
-  const vm=poolData.virtual_machine||{}, dsk=poolData.disk||{}, cpuStat=poolData.cpu||{};
-  const cacheMB=(vm.agent_cache_mb||0)+(vm.local_cache_mb||0),
-        diskGB=dsk.remote_gb||0,
-        cpu=cpuStat.total_cores||0;
+  poolData=d||{total:0,healthy:0,resources:{},agents:[]};
+  const h=poolData.healthy||0,res=poolData.resources||{};
+  const cacheMB=res.cache_used_mb||0,diskGB=res.disk_free_gb||0,cpu=res.cpu_cores||0;
   // topbar
   document.getElementById('tb-agents').textContent=h;
   document.getElementById('tb-cache').textContent=cacheMB+'MB';
@@ -1954,6 +2184,15 @@ function renderPoolAgents(agents){
     </div>`;
   }).join('');
 }
+
+async function loadSyncStatus(){
+  try {
+    const d = await fetch('/api/pool/sync/status').then(r=>r.json());
+    const el = document.getElementById('pool-sync-info');
+    if(el) el.textContent = `📦 ${d.offloaded} offload | 🔄 ${d.synced} sync | Disk:${d.agent_disk_used_gb}GB | RAM:${d.agent_ram_cache_mb}MB`;
+  } catch(e) {}
+}
+setInterval(loadSyncStatus, 30000);
 
 async function loadPoolStatus(){
   const d=await fetch('/api/pool/status').then(r=>r.json()).catch(()=>({}));
@@ -2181,7 +2420,7 @@ def _run_mc_only():
                         mc_process.kill()
                     else:
                         try:
-                            mc_process.stdin.write(b"save\nstop\n")
+                            mc_process.stdin.write(b"save-all\nstop\n")
                             mc_process.stdin.flush()
                         except Exception: pass
                     self._send(200, {"ok": True, "msg": "Durduruluyor"})
@@ -2345,6 +2584,8 @@ def _minimal_http_phase():
     threading.Thread(target=_ram_watchdog,         daemon=True).start()
     threading.Thread(target=_pool_health_watchdog, daemon=True).start()
     threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
+    threading.Thread(target=_region_disk_daemon,   daemon=True).start()
+    threading.Thread(target=_region_cache_daemon,  daemon=True).start()
     _register_cluster_blueprint()
 
     print(f"[Phase2] 🚀 Flask+SocketIO :{PANEL_PORT} başlatılıyor...", flush=True)
@@ -2378,6 +2619,8 @@ if __name__ == "__main__":
         threading.Thread(target=_ram_watchdog,         daemon=True).start()
         threading.Thread(target=_pool_health_watchdog, daemon=True).start()
         threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
+        threading.Thread(target=_region_disk_daemon,   daemon=True).start()
+        threading.Thread(target=_region_cache_daemon,  daemon=True).start()
         def _auto_start_mc():
             import time as _t; _t.sleep(3)
             try: start_server()
