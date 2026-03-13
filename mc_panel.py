@@ -488,12 +488,13 @@ def write_server_config():
     settings.write_text(
         f"[Server]\n"
         f"Ports={MC_PORT}\n"
-        f"MaxPlayers=20\n"
+        f"MaxPlayers=10\n"           # 20→10: her oyuncu ~3MB Lua belleği
         f"OnlineMode=false\n"        # Render'da auth sunucusuna erişim yok
         f"Motd=\u00A7aRender MC • Cuberite 1.8.8\n"
         f"AllowFlight=true\n"
         f"Description=Cuberite 1.8.8 on Render\n"
         f"ShutdownMessage=Server kapaniyor...\n"
+        f"MaxViewDistance=4\n"       # 10→4: 400→64 chunk/oyuncu — Lua OOM önlemi
         f"\n"
         f"[Authentication]\n"
         f"Authenticate=false\n"      # Offline mode
@@ -501,54 +502,76 @@ def write_server_config():
         f"[AntiCheat]\n"
         f"LimitPlayerBlockChanges=false\n"
         f"AllowFlight=true\n"
+        f"\n"
+        f"[Worlds]\n"
+        f"DefaultWorld=world\n"
+        f"World=world\n"
+        # Nether ve End KAPATILDI — her dünya ~30MB Lua + chunk belleği
     )
 
-    # ── world.ini — Dünya ayarları ──────────────────────────────
+    # ── world.ini — Dünya ayarları (her başlatmada yaz) ─────────
     world_ini = MC_DIR / "world.ini"
-    if not world_ini.exists():
-        world_ini.write_text(
-            f"[General]\n"
-            f"Dimension=Overworld\n"
-            f"WorldType=Normal\n"
-            f"Seed=12345\n"
-            f"Difficulty=1\n"          # Normal
-            f"Gamemode=0\n"            # Survival
-            f"PVPEnabled=1\n"
-            f"AllowFlight=1\n"
-            f"\n"
-            f"[SpawnPosition]\n"
-            f"X=0\n"
-            f"Y=64\n"
-            f"Z=0\n"
-            f"\n"
-            f"[Mobs]\n"
-            f"MaxMobDistanceFromPlayer=80\n"
-            f"MaxAnimals=8\n"          # Azaltıldı (RAM tasarrufu)
-            f"MaxMonsters=40\n"        # Azaltıldı
-            f"MaxWaterMobs=3\n"
-            f"\n"
-            f"[Chunking]\n"
-            f"ChunkDestroyTimer=60\n"  # 60sn kullanılmayan chunk kaldır
-            f"LimitedHeightWorld=false\n"
-        )
+    world_ini.write_text(
+        f"[General]\n"
+        f"Dimension=Overworld\n"
+        f"WorldType=Normal\n"
+        f"Seed=12345\n"
+        f"Difficulty=1\n"
+        f"Gamemode=0\n"
+        f"PVPEnabled=1\n"
+        f"AllowFlight=1\n"
+        f"\n"
+        f"[SpawnPosition]\n"
+        f"X=0\n"
+        f"Y=64\n"
+        f"Z=0\n"
+        f"\n"
+        f"[Mobs]\n"
+        f"MaxMobDistanceFromPlayer=50\n"  # 80→50
+        f"MaxAnimals=4\n"               # 8→4 Lua belleği
+        f"MaxMonsters=20\n"             # 40→20
+        f"MaxWaterMobs=2\n"
+        f"\n"
+        f"[Chunking]\n"
+        f"ChunkDestroyTimer=30\n"       # 60→30sn: chunk'ları daha hızlı boşalt
+        f"LimitedHeightWorld=false\n"
+        f"MaxLoadedChunks=200\n"        # Maksimum yüklü chunk sayısı
+    )
 
     # ── webadmin.ini — Cuberite web admin (kapalı, Panel var) ──
     webadmin = MC_DIR / "webadmin.ini"
     if not webadmin.exists():
         webadmin.write_text("[WebAdmin]\nEnabled=false\n")
 
-    # ── Nether/End dizinleri ────────────────────────────────────
+    # ── Temel dizinler ──────────────────────────────────────────
     (MC_DIR / "world" / "region").mkdir(parents=True, exist_ok=True)
-    (MC_DIR / "world_nether").mkdir(parents=True, exist_ok=True)
+    # world_nether ve world_the_end KAPATILDI (RAM tasarrufu)
+    # scoreboard.dat bozuksa Lua crash yapar — her başlatmada temizle
+    for _corrupted in [
+        MC_DIR / "world" / "data" / "scoreboard.dat",
+        MC_DIR / "scoreboard.dat",
+    ]:
+        if _corrupted.exists():
+            try:
+                _corrupted.unlink()
+                log(f"[Panel] 🗑️  Temizlendi: {_corrupted.name}")
+            except Exception:
+                pass
 
 
 def get_cuberite_cmd() -> list:
     """
     Cuberite C++ binary çalıştırma komutu.
     JVM YOK — RAM kullanımı ~40-80MB (Paper 400MB yerine).
+    MALLOC_ARENA_MAX=1 → memory fragmentation azaltır.
+    MALLOC_MMAP_THRESHOLD_ → küçük alloc'lar mmap'e gitmez → daha az RSS.
     """
-    log(f"[Panel] 🚀 Cuberite C++ başlatılıyor (JVM yok, ~50MB RAM)")
+    log(f"[Panel] 🚀 Cuberite C++ başlatılıyor (JVM yok, ~50-80MB RSS)")
     return [
+        "env",
+        "MALLOC_ARENA_MAX=1",
+        "MALLOC_MMAP_THRESHOLD_=131072",
+        "MALLOC_TRIM_THRESHOLD_=131072",
         str(MC_BIN),
         "--config-file", str(MC_DIR / "settings.ini"),
     ]
@@ -636,7 +659,7 @@ def stop_server(force=False):
     if force:
         mc_process.kill()
     else:
-        send_command("/save"); time.sleep(1); send_command("/stop")
+        send_command("save"); time.sleep(1); send_command("stop")  # Cuberite: slash olmadan
     return True, "Durduruluyor..."
 
 
@@ -683,7 +706,7 @@ def _ram_watchdog():
                     send_command("kill @e[type=item]")
                     send_command("kill @e[type=experience_orb]")
                 if _consecutive_low >= 6:
-                    send_command("save-all")
+                    send_command("save")
                     # View distance'ı geçici düşür
                     send_command("minecraft:view-distance 4")
                 log(f"[Panel] ⚠️  RAM kritik: phys={phys_avail_mb}MB swap_free={swap_free_mb}MB")
@@ -1198,7 +1221,7 @@ def api_world_backup():
     if not src.exists(): return jsonify({"ok":False,"error":"Dünya bulunamadı"})
     ts=datetime.now().strftime("%Y%m%d_%H%M%S"); dest=MC_DIR/"backups"/f"{world}_{ts}.zip"
     dest.parent.mkdir(exist_ok=True)
-    send_command("save-off"); time.sleep(1); send_command("save-all"); time.sleep(2)
+    # save-off Cuberite'de yok; time.sleep(1); send_command("save"); time.sleep(2)
     with zipfile.ZipFile(str(dest),"w",zipfile.ZIP_DEFLATED) as z:
         for fp in src.rglob("*"):
             if fp.is_file(): z.write(fp,fp.relative_to(MC_DIR))
@@ -1685,7 +1708,7 @@ select.set-inp option{background:#1e1e1e}
         <button class="btn b-ghost" onclick="cmd('weather rain')">🌧️ Yağmur</button>
         <button class="btn b-ghost" onclick="cmd('difficulty peaceful')">😊 Peaceful</button>
         <button class="btn b-ghost" onclick="cmd('difficulty hard')">🔴 Hard</button>
-        <button class="btn b-ghost" onclick="cmd('save-all')">💾 Kaydet</button>
+        <button class="btn b-ghost" onclick="cmd('save')">💾 Kaydet</button>
         <button class="btn b-ghost" onclick="cmd('kill @e[type=!player]')">⚡ Mob Temizle</button>
       </div>
     </div>
@@ -2148,7 +2171,7 @@ def _run_mc_only():
                         mc_process.kill()
                     else:
                         try:
-                            mc_process.stdin.write(b"save-all\nstop\n")
+                            mc_process.stdin.write(b"save\nstop\n")  # Cuberite: slash yok, save komutu
                             mc_process.stdin.flush()
                         except Exception: pass
                     self._send(200, {"ok": True, "msg": "Durduruluyor"})
