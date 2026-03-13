@@ -1029,13 +1029,12 @@ def write_server_config():
     except Exception as _ce:
         log(f"[Panel] chmod uyarisi: {_ce}")
 
-    # scoreboard.dat — HER ZAMAN SIL, Cuberite kendi dogru formatinda yazar
+    # scoreboard.dat — Geçerli boş JSON yaz; silmek basic_ios::clear hatasına yol açar
     sbd = MC_DIR / "world" / "data" / "scoreboard.dat"
-    if sbd.exists():
-        try:
-            sbd.unlink()
-            log("[Panel] scoreboard.dat silindi")
-        except Exception: pass
+    try:
+        sbd.write_text('{"Objectives":[],"Teams":[],"DisplaySlots":{}}')
+        log("[Panel] scoreboard.dat sıfırlandı (boş JSON)")
+    except Exception: pass
 
     # OYUNCU DOSYALARI ASLA SILINMEZ — _clean_player_files() halleder
 
@@ -1063,8 +1062,8 @@ def get_cuberite_cmd() -> list:
         f"\n"
         # İzin ver
         f"chmod -R 777 {MC_DIR}\n"
-        # scoreboard.dat sil — Cuberite kendi yazar (sadece warning, crash değil)
-        f"rm -f {MC_DIR}/world/data/scoreboard.dat\n"
+        # scoreboard.dat — boş geçerli JSON yaz; silmek basic_ios::clear hatasına yol açar
+        f'printf \'{{\"Objectives\":[],\"Teams\":[],\"DisplaySlots\":{{}}}}\' > {MC_DIR}/world/data/scoreboard.dat\n'
         # Çalışma dizinine geç
         f"cd {MC_DIR}\n"
         # Başlat
