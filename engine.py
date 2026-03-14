@@ -642,6 +642,7 @@ class PlayerConn:
                     if not self._spawned and self.cs_info:
                         self._spawned = True
                         self.play_state = True
+                        print(f"[JOIN] {self.username} → {self.backend_host}:{self.backend_port}")
                         asyncio.ensure_future(bcast_spawn(self))
                     continue
 
@@ -670,12 +671,9 @@ class PlayerConn:
                     continue
 
                 if self.state == "login":
-                    if pid == 0x00:
-                        try:
-                            self.username, _ = mc_str_dec(payload)
-                            self.cs_info = cs_state.register(self.username, self)
-                            print(f"[JOIN] {self.username}")
-                        except Exception: pass
+                    # Login Start zaten _pre_read_client_hello'da okundu ve cs_info set edildi.
+                    # Bu noktaya offline modda hic paket gelmez (sifreleme yok).
+                    # Yine de her paketi backend'e ilet.
                     self.server_w.write(raw); await self.server_w.drain()
                     continue
 
@@ -764,30 +762,77 @@ class PlayerConn:
     async def _pre_read_client_hello(self):
         """Backend aramadan ONCE istemcinin Handshake + Login Start paketlerini
         oku. Boylece self.state ve self.username dogru set edilir, kick
-        gonderilebilir hale gelir."""
+        gonderilebilir hale gelir.
+
+        KRITIK: MC 1.8 her zaman once next_state=1 (status ping) yapar, SONRA
+        next_state=2 (login) ile gercek baglantiyi yapar. Status ping'e yanlis
+        paket gonderilirse client NullPointerException firlatir.
+        Bu fonksiyon status ping'i tamamen handle eder ve True dondurur.
+        Login paketi icin self.state='login' set eder, False dondurur.
+        """
         self._client_buf = []
+        self._is_status  = False
         try:
             pid, payload, raw = await asyncio.wait_for(
-                pkt_read(self.client_r, -1), timeout=5.0)
-            self._client_buf.append(raw)
-            if pid == 0x00:
+                pkt_read(self.client_r, -1), timeout=8.0)
+            if pid != 0x00:
+                return   # beklenmedik paket, baglantiyi kapat
+
+            # Handshake paketini parse et: proto_ver, host, port, next_state
+            p = 0
+            _proto, p = vi_dec(payload, p)
+            _host,  p = mc_str_dec(payload, p)
+            p += 2                        # port (2 byte)
+            next_state, _ = vi_dec(payload, p)
+
+            if next_state == 1:
+                # ── STATUS PING ──────────────────────────────────────────────
+                # Status Request paketi oku (0x00, bos)
+                self._is_status = True
                 try:
-                    p = 0
-                    _, p = vi_dec(payload, p)
-                    _, p = mc_str_dec(payload, p)
-                    p += 2
-                    ns, _ = vi_dec(payload, p)
-                    if ns == 2:
-                        self.state = "login"
+                    await asyncio.wait_for(pkt_read(self.client_r, -1), timeout=3.0)
                 except Exception:
                     pass
-            if self.state == "login":
+
+                # Gercek oyuncu sayisini hesapla
+                n_players = sum(1 for c in list(_active) if c.username != "?")
+                n_backends = len(load_backends())
+
+                status_json = json.dumps({
+                    "version":     {"name": "1.8.9", "protocol": 47},
+                    "players":     {"max": 999, "online": n_players, "sample": []},
+                    "description": {"text": f"\u00a7aWC-Engine \u00a77\u2503 \u00a7e{n_backends} sunucu \u00a77| \u00a7f{n_players} oyuncu"}
+                })
+                # Status Response: 0x00 + String(JSON)
+                self.client_w.write(pkt_make(0x00, mc_str_enc(status_json), -1))
+                await self.client_w.drain()
+
+                # Ping-Pong: client 0x01 + 8-byte long gonderir, ayni longu geri don
+                try:
+                    ppid, ppay, _ = await asyncio.wait_for(
+                        pkt_read(self.client_r, -1), timeout=3.0)
+                    if ppid == 0x01 and len(ppay) >= 8:
+                        self.client_w.write(pkt_make(0x01, ppay[:8], -1))
+                        await self.client_w.drain()
+                except Exception:
+                    pass
+                # Status bitti, baglanti kapanacak
+                return
+
+            elif next_state == 2:
+                # ── LOGIN ────────────────────────────────────────────────────
+                self.state = "login"
+                self._client_buf.append(raw)   # Handshake'i buffer'a ekle
+
+                # Login Start paketini oku (0x00 + username)
                 pid2, payload2, raw2 = await asyncio.wait_for(
-                    pkt_read(self.client_r, -1), timeout=5.0)
+                    pkt_read(self.client_r, -1), timeout=8.0)
                 self._client_buf.append(raw2)
                 if pid2 == 0x00:
                     try:
                         self.username, _ = mc_str_dec(payload2)
+                        # cs_info'yu BURADA register et — pipe_c2s artik bu paketi gormez
+                        self.cs_info = cs_state.register(self.username, self)
                     except Exception:
                         pass
         except Exception:
@@ -810,6 +855,18 @@ class PlayerConn:
     async def run(self):
         # 1. Istemcinin ilk paketlerini backend aramadan once oku
         await self._pre_read_client_hello()
+
+        # Status ping'i _pre_read_client_hello tamamen handle etti, bitir
+        if getattr(self, "_is_status", False):
+            try: self.client_w.close()
+            except Exception: pass
+            return
+
+        # Login paketi alınamadıysa baglanti geçersiz, kapat
+        if self.state != "login":
+            try: self.client_w.close()
+            except Exception: pass
+            return
 
         backends = load_backends()
         if not backends:
@@ -852,15 +909,14 @@ class PlayerConn:
                 except Exception:
                     pass
             else:
-                print(f"[WARN] Uykuda olan/Ölü sunucu atlandi: {lbl} ({b['host']}:{b['port']})")
+                print(f"[WARN] Uykuda olan/Olu sunucu atlandi: {lbl} ({b['host']}:{b['port']})")
 
-        # 2. Hic backend bulunamadi — state ne olursa olsun kick gonder
+        # 2. Hic backend bulunamadi — Login state'deyiz, kick gonder
         if not connected:
-            print("[ERR] Gecerli/Uyanik GameServer bulunamadi!")
-            msg = ("Sunucular uykudaydi ve su an UYANDIRILIYOR!\n\n"
-                   "Lutfen 40 saniye sonra TEKRAR GIRIS YAPIN.")
+            print(f"[ERR] Gecerli/Uyanik GameServer bulunamadi! ({self.username})")
+            msg = ("Sunucular su an UYANDIRILIYOR!\n\n"
+                   "Lutfen 30-40 saniye sonra TEKRAR GIRIS YAPIN.")
             try:
-                # comp=-1: login asamasinda henuz sikilstirma yok
                 self.client_w.write(pkt_kick(msg, -1))
                 await self.client_w.drain()
             except Exception:
