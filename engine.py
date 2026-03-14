@@ -483,22 +483,6 @@ def save_backends(b):
     pathlib.Path(BACKENDS_FILE).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(BACKENDS_FILE).write_text(json.dumps(b, indent=2))
 
-def _cleanup_stale_backends():
-    """90 saniyedir heartbeat gelmeyen backend'leri sil."""
-    while True:
-        time.sleep(30)
-        try:
-            backends = load_backends()
-            now = time.time()
-            alive = [b for b in backends
-                     if now - b.get("last_seen", now) < 90]
-            if len(alive) != len(backends):
-                removed = len(backends) - len(alive)
-                save_backends(alive)
-                print(f"[CLEAN] {removed} eski backend silindi.")
-        except Exception as e:
-            print(f"[CLEAN] hata: {e}")
-
 def pick_backend():
     backends = load_backends()
     if not backends: return None
@@ -745,38 +729,18 @@ class PlayerConn:
                 except Exception: pass
 
     async def run(self):
-        backends = load_backends()
-        if not backends:
+        b = pick_backend()
+        if not b:
             print(f"[WARN] Backend yok! {self.peer}")
             self.client_w.close(); return
-
-        # Player count bazlı sırala (en kalabalık önce)
-        counts = {}
-        for c in list(_active):
-            k = f"{c.backend_host}:{c.backend_port}"
-            counts[k] = counts.get(k, 0) + 1
-        ordered = sorted(backends,
-                         key=lambda x: counts.get(f"{x['host']}:{x['port']}", 0),
-                         reverse=True)
-
-        connected = False
-        for b in ordered:
-            if counts.get(f"{b['host']}:{b['port']}", 0) >= 998:
-                continue
-            try:
-                await self.connect_backend(b)
-                connected = True
-                break
-            except Exception as e:
-                print(f"[ERR] Backend {b['host']}:{b['port']} basarisiz: {e}")
-
-        if not connected:
-            print(f"[WARN] Tum backendler basarisiz! {self.peer}")
+        try:
+            await self.connect_backend(b)
+        except Exception as e:
+            print(f"[ERR] Backend: {e}")
             self.client_w.close(); return
-
         async with _active_lock:
             _active.append(self)
-        print(f"[CONN] {self.peer} -> {self.backend_host}:{self.backend_port} ({len(_active)} aktif)")
+        print(f"[CONN] {self.peer} -> {b['host']}:{b['port']} ({len(_active)} aktif)")
         await asyncio.gather(self.pipe_s2c(), self.pipe_c2s())
 
 
@@ -860,24 +824,6 @@ def _build_html():
     except Exception:
         addr_block = '<p style="color:#f8b400">Tunnel baslatiliyor...</p>'
 
-    if MODE == "gameserver":
-        label = os.environ.get("SERVER_LABEL", "GameServer")
-        proxy = os.environ.get("PROXY_URL", "—")
-        body  = f"""
-          <p style="color:#4ecca3;font-size:1rem;margin:12px 0">
-            ✅ GameServer aktif — <b>{label}</b></p>
-          <p style="color:#aaa;font-size:.85rem">
-            Oyuncular proxy üzerinden bağlanır: <b>{proxy}</b></p>
-          <p style="color:#aaa;font-size:.85rem;margin-top:8px">
-            Bu adres sadece gameserver yönetim sayfasıdır.</p>"""
-        return HTML.format(
-            addr_block=addr_block,
-            player_count="—",
-            block_count="—",
-            server_count="1",
-            rows=body,
-        )
-
     backends = load_backends()
     counts = {}
     for c in list(_active):
@@ -921,27 +867,15 @@ class _H(http.server.BaseHTTPRequestHandler):
             label = data.get("label", f"{host}:{port}")
             if not host or not port: self._r(400, "missing host/port"); return
             backends = load_backends()
-            now = time.time()
+            key   = f"{host}:{port}"
             found = False
-            # Önce label ile ara (bore port değişmiş olabilir)
             for b in backends:
-                if b.get("label") == label:
-                    b["host"] = host
-                    b["port"] = int(port)
-                    b["last_seen"] = now
-                    found = True; break
-            # Label yoksa host:port ile ara
+                if f"{b['host']}:{b['port']}" == key:
+                    b["label"] = label; found = True; break
             if not found:
-                for b in backends:
-                    if f"{b['host']}:{b['port']}" == f"{host}:{port}":
-                        b["label"] = label
-                        b["last_seen"] = now
-                        found = True; break
-            if not found:
-                backends.append({"host": host, "port": int(port),
-                                 "label": label, "last_seen": now})
+                backends.append({"host": host, "port": int(port), "label": label})
             save_backends(backends)
-            print(f"[REG] {label} ({host}:{port})")
+            print(f"[REG] {label} ({key})")
             self._r(200, "ok")
         else:
             self._r(404, "not found")
@@ -988,18 +922,6 @@ def run_bore(port=MC_PORT):
         except Exception as e:
             print(f"[BORE] hata: {e}")
         time.sleep(10)
-
-
-def _heartbeat_loop():
-    """Gameserver modunda 30sn'de bir proxy'ye kayıt yenile."""
-    while True:
-        time.sleep(30)
-        try:
-            addr = pathlib.Path(BORE_FILE).read_text().strip()
-            if addr:
-                _register_with_proxy(addr)
-        except Exception:
-            pass
 
 
 def _register_with_proxy(bore_addr):
@@ -1086,12 +1008,10 @@ def main():
 
     if MODE == "proxy":
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
-        threading.Thread(target=_cleanup_stale_backends, daemon=True).start()
         asyncio.run(run_proxy_async())
 
     elif MODE == "gameserver":
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
-        threading.Thread(target=_heartbeat_loop, daemon=True).start()
         run_cuberite()
 
     elif MODE == "all":
