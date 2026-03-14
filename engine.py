@@ -811,95 +811,62 @@ HTML = """\
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet">
   <style>
-    :root{{
-      --bg:#0d0f1a;--panel:#111827;--border:#1e3a5f;
-      --accent:#00ffc8;--accent2:#0099ff;
-      --warn:#f8b400;--err:#ff4f4f;--dim:#4a5568;--text:#cbd5e0;
-    }}
+    :root{{--bg:#0d0f1a;--panel:#111827;--border:#1e3a5f;--accent:#00ffc8;--accent2:#0099ff;--warn:#f8b400;--err:#ff4f4f;--dim:#4a5568;--text:#cbd5e0;}}
     *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;
-          min-height:100vh;padding:20px;
-          background-image:
-            radial-gradient(ellipse 80% 60% at 50% -10%,#0a2a4a55,transparent),
-            repeating-linear-gradient(0deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px),
-            repeating-linear-gradient(90deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px);}}
+    body{{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;min-height:100vh;padding:20px;
+          background-image:radial-gradient(ellipse 80% 60% at 50% -10%,#0a2a4a55,transparent),
+          repeating-linear-gradient(0deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px),
+          repeating-linear-gradient(90deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px);}}
     .wrap{{max-width:920px;margin:0 auto;display:flex;flex-direction:column;gap:14px}}
-    .header{{display:flex;align-items:center;justify-content:space-between;
-             border-bottom:1px solid var(--border);padding-bottom:12px}}
-    .logo{{font-family:'Rajdhani',sans-serif;font-size:1.7rem;font-weight:700;
-           color:var(--accent);letter-spacing:.08em;text-shadow:0 0 20px #00ffc855}}
+    .header{{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);padding-bottom:12px}}
+    .logo{{font-family:'Rajdhani',sans-serif;font-size:1.7rem;font-weight:700;color:var(--accent);letter-spacing:.08em;text-shadow:0 0 20px #00ffc855}}
     .logo span{{color:var(--text);font-weight:400}}
-    .live-dot{{width:8px;height:8px;border-radius:50%;background:var(--accent);
-               display:inline-block;margin-right:6px;box-shadow:0 0 6px var(--accent);
-               animation:blink 1.4s ease-in-out infinite}}
+    .live-dot{{width:8px;height:8px;border-radius:50%;background:var(--accent);display:inline-block;margin-right:6px;box-shadow:0 0 6px var(--accent);animation:blink 1.4s ease-in-out infinite}}
     @keyframes blink{{0%,100%{{opacity:1;transform:scale(1)}}50%{{opacity:.4;transform:scale(.7)}}}}
-    .addr-box{{background:linear-gradient(135deg,#0a2a4a,#0a1a35);
-               border:1px solid var(--accent);border-radius:8px;
-               padding:12px 18px;display:flex;align-items:center;gap:14px;
-               box-shadow:0 0 24px #00ffc81a}}
+    .addr-box{{background:linear-gradient(135deg,#0a2a4a,#0a1a35);border:1px solid var(--accent);border-radius:8px;padding:12px 18px;display:flex;align-items:center;gap:14px;box-shadow:0 0 24px #00ffc81a}}
     .addr-lbl{{font-size:.68rem;color:var(--dim);white-space:nowrap}}
-    .addr-val{{font-size:1.25rem;color:var(--accent);flex:1;word-break:break-all;
-               text-shadow:0 0 12px #00ffc844}}
-    .copy-btn{{background:#00ffc815;border:1px solid var(--accent);color:var(--accent);
-               border-radius:6px;padding:6px 14px;font-size:.73rem;cursor:pointer;
-               font-family:'Share Tech Mono',monospace;transition:all .15s;white-space:nowrap}}
+    .addr-val{{font-size:1.25rem;color:var(--accent);flex:1;word-break:break-all;text-shadow:0 0 12px #00ffc844}}
+    .copy-btn{{background:#00ffc815;border:1px solid var(--accent);color:var(--accent);border-radius:6px;padding:6px 14px;font-size:.73rem;cursor:pointer;font-family:'Share Tech Mono',monospace;transition:all .15s;white-space:nowrap}}
     .copy-btn:hover{{background:var(--accent);color:#000}}
     .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}
-    .stat{{background:var(--panel);border:1px solid var(--border);
-           border-radius:8px;padding:14px 16px;position:relative;overflow:hidden}}
-    .stat::before{{content:'';position:absolute;inset:0;
-                   background:linear-gradient(135deg,#00ffc808,transparent);pointer-events:none}}
-    .stat-val{{font-size:2rem;color:var(--accent);font-family:'Rajdhani',sans-serif;
-               font-weight:700;line-height:1}}
+    .stat{{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px;position:relative;overflow:hidden}}
+    .stat::before{{content:'';position:absolute;inset:0;background:linear-gradient(135deg,#00ffc808,transparent);pointer-events:none}}
+    .stat-val{{font-size:2rem;color:var(--accent);font-family:'Rajdhani',sans-serif;font-weight:700;line-height:1}}
     .stat-lbl{{font-size:.68rem;color:var(--dim);margin-top:4px}}
     .panel{{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden}}
-    .panel-hdr{{display:flex;align-items:center;justify-content:space-between;
-                padding:9px 16px;border-bottom:1px solid var(--border);background:#0a1428}}
+    .panel-hdr{{display:flex;align-items:center;justify-content:space-between;padding:9px 16px;border-bottom:1px solid var(--border);background:#0a1428}}
     .panel-hdr-title{{font-size:.72rem;color:var(--accent);letter-spacing:.1em;text-transform:uppercase}}
     table{{width:100%;border-collapse:collapse}}
-    th{{color:var(--dim);font-size:.68rem;padding:7px 16px;text-align:left;
-        text-transform:uppercase;letter-spacing:.08em;background:#0a1428;
-        border-bottom:1px solid var(--border)}}
+    th{{color:var(--dim);font-size:.68rem;padding:7px 16px;text-align:left;text-transform:uppercase;letter-spacing:.08em;background:#0a1428;border-bottom:1px solid var(--border)}}
     td{{padding:8px 16px;font-size:.82rem;border-bottom:1px solid #1e3a5f33}}
     tr:last-child td{{border-bottom:none}}
     tr:hover td{{background:#1e3a5f22}}
-    .sdot{{width:7px;height:7px;border-radius:50%;background:var(--accent);
-           display:inline-block;margin-right:6px;box-shadow:0 0 5px var(--accent);
-           animation:blink 1.4s infinite}}
+    .sdot{{width:7px;height:7px;border-radius:50%;background:var(--accent);display:inline-block;margin-right:6px;box-shadow:0 0 5px var(--accent);animation:blink 1.4s infinite}}
     .son{{color:var(--accent)}}
-    .badges{{display:flex;flex-wrap:wrap;gap:6px;padding:12px 16px;
-             border-top:1px solid var(--border)}}
-    .badge{{background:#00ffc808;border:1px solid #00ffc830;color:var(--accent);
-            font-size:.63rem;padding:3px 10px;border-radius:20px;letter-spacing:.05em}}
-    .con-toolbar{{display:flex;align-items:center;justify-content:space-between;
-                  padding:7px 14px;background:#070d1a;border-bottom:1px solid var(--border)}}
+    .badges{{display:flex;flex-wrap:wrap;gap:6px;padding:12px 16px;border-top:1px solid var(--border)}}
+    .badge{{background:#00ffc808;border:1px solid #00ffc830;color:var(--accent);font-size:.63rem;padding:3px 10px;border-radius:20px;letter-spacing:.05em}}
+    .con-toolbar{{display:flex;align-items:center;justify-content:space-between;padding:7px 14px;background:#070d1a;border-bottom:1px solid var(--border)}}
     .win-btns{{display:flex;gap:6px}}
     .wb{{width:10px;height:10px;border-radius:50%}}
     .wb-r{{background:#ff5f56}}.wb-y{{background:#ffbd2e}}.wb-g{{background:#27c93f}}
     .con-title{{font-size:.68rem;color:var(--dim);letter-spacing:.1em;margin-left:8px}}
     .con-right{{display:flex;align-items:center;gap:6px;flex-wrap:wrap}}
-    .flt{{background:transparent;border:1px solid var(--border);color:var(--dim);
-          font-family:'Share Tech Mono',monospace;font-size:.63rem;
-          border-radius:4px;padding:3px 8px;cursor:pointer;transition:all .15s}}
+    .flt{{background:transparent;border:1px solid var(--border);color:var(--dim);font-family:'Share Tech Mono',monospace;font-size:.63rem;border-radius:4px;padding:3px 8px;cursor:pointer;transition:all .15s}}
     .flt.on{{border-color:var(--accent);color:var(--accent)}}
     .flt:hover{{border-color:var(--accent2);color:var(--accent2)}}
-    .clr{{background:transparent;border:1px solid var(--border);color:var(--dim);
-          font-family:'Share Tech Mono',monospace;font-size:.63rem;
-          border-radius:4px;padding:3px 8px;cursor:pointer;transition:all .15s}}
+    .clr{{background:transparent;border:1px solid var(--border);color:var(--dim);font-family:'Share Tech Mono',monospace;font-size:.63rem;border-radius:4px;padding:3px 8px;cursor:pointer;transition:all .15s}}
     .clr:hover{{border-color:var(--err);color:var(--err)}}
     .sse-ind{{display:flex;align-items:center;gap:4px;font-size:.62rem;color:var(--dim)}}
     .sse-d{{width:6px;height:6px;border-radius:50%;background:var(--dim)}}
     .sse-d.live{{background:var(--accent);box-shadow:0 0 4px var(--accent)}}
-    #con{{background:#070d1a;height:320px;overflow-y:auto;
-          padding:10px 14px;font-size:.76rem;line-height:1.75;scroll-behavior:smooth}}
+    #con{{background:#070d1a;height:340px;overflow-y:auto;padding:10px 14px;font-size:.76rem;line-height:1.75;scroll-behavior:smooth}}
     #con::-webkit-scrollbar{{width:4px}}
     #con::-webkit-scrollbar-track{{background:#0a0f1e}}
     #con::-webkit-scrollbar-thumb{{background:#1e3a5f;border-radius:3px}}
     .ll{{display:flex;gap:8px}}
     .lt{{color:var(--dim);flex-shrink:0;font-size:.66rem;padding-top:1px}}
     .lm{{word-break:break-all;flex:1}}
-    @media(max-width:600px){{.stats{{grid-template-columns:repeat(2,1fr)}}
-      .addr-val{{font-size:1rem}}.flt{{font-size:.55rem;padding:2px 5px}}}}
+    @media(max-width:600px){{.stats{{grid-template-columns:repeat(2,1fr)}}.addr-val{{font-size:1rem}}.flt{{font-size:.55rem;padding:2px 5px}}}}
   </style>
 </head>
 <body>
@@ -907,28 +874,18 @@ HTML = """\
   <div class="header">
     <div class="logo">⛏ WC<span>-ENGINE</span></div>
     <div style="font-size:.72rem;color:var(--dim)">
-      <span class="live-dot"></span>
-      {mode_label} &bull; <span id="hdr-p">{player_count}</span> oyuncu aktif
+      <span class="live-dot"></span>{mode_label} &bull; <span id="hdr-p">{player_count}</span> oyuncu aktif
     </div>
   </div>
-
   {addr_block}
-
   <div class="stats">
     <div class="stat"><div class="stat-val" id="s-p">{player_count}</div><div class="stat-lbl">Toplam Oyuncu</div></div>
     <div class="stat"><div class="stat-val" id="s-b">{block_count}</div><div class="stat-lbl">Blok Değişikliği</div></div>
     <div class="stat"><div class="stat-val" id="s-s">{server_count}</div><div class="stat-lbl">Game Server</div></div>
   </div>
-
   <div class="panel">
-    <div class="panel-hdr">
-      <span class="panel-hdr-title">Game Servers</span>
-      <span style="font-size:.68rem;color:var(--dim)">otomatik yenilenir</span>
-    </div>
-    <table id="srv-tbl">
-      <tr><th>Sunucu</th><th>Oyuncu</th><th>Durum</th></tr>
-      {rows}
-    </table>
+    <div class="panel-hdr"><span class="panel-hdr-title">Game Servers</span><span style="font-size:.68rem;color:var(--dim)">otomatik yenilenir</span></div>
+    <table id="srv-tbl"><tr><th>Sunucu</th><th>Oyuncu</th><th>Durum</th></tr>{rows}</table>
     <div class="badges">
       <span class="badge">Ultra Hafif</span><span class="badge">Crack Girişi</span>
       <span class="badge">Ortak Dünya</span><span class="badge">Cross-Server Chat</span>
@@ -936,7 +893,6 @@ HTML = """\
       <span class="badge">999 Oyuncu</span>
     </div>
   </div>
-
   <div class="panel">
     <div class="con-toolbar">
       <div style="display:flex;align-items:center">
@@ -970,16 +926,10 @@ HTML = """\
   }}
   function applyFilter(){{
     const f=activeFilter;
-    con.querySelectorAll('.ll').forEach(el=>{{
-      const m=el.dataset.msg||'';
-      el.style.display=(!f||f.split(',').some(k=>m.includes('['+k+']')))?'':'none';
-    }});
+    con.querySelectorAll('.ll').forEach(el=>{{const m=el.dataset.msg||'';el.style.display=(!f||f.split(',').some(k=>m.includes('['+k+']')))?'':'none';}});
   }}
   document.querySelectorAll('.flt').forEach(btn=>{{
-    btn.addEventListener('click',()=>{{
-      document.querySelectorAll('.flt').forEach(b=>b.classList.remove('on'));
-      btn.classList.add('on');activeFilter=btn.dataset.f;applyFilter();
-    }});
+    btn.addEventListener('click',()=>{{document.querySelectorAll('.flt').forEach(b=>b.classList.remove('on'));btn.classList.add('on');activeFilter=btn.dataset.f;applyFilter();}});
   }});
   document.getElementById('clrBtn').addEventListener('click',()=>{{con.innerHTML='';allLines=[];}});
   function addLine(e){{
@@ -988,8 +938,7 @@ HTML = """\
     const el=renderLine(e);
     const f=activeFilter;
     if(f&&!f.split(',').some(k=>e.msg.includes('['+k+']')))el.style.display='none';
-    con.appendChild(el);
-    if(autoScroll)con.scrollTop=con.scrollHeight;
+    con.appendChild(el);if(autoScroll)con.scrollTop=con.scrollHeight;
   }}
   fetch('/api/logs/history').then(r=>r.json()).then(arr=>{{con.innerHTML='';arr.forEach(e=>addLine(e));}}).catch(()=>{{}});
   function connectSSE(){{
@@ -1073,7 +1022,6 @@ class _H(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            # ── SSE: canlı log akışı ────────────────────────
             if self.path == "/api/logs/stream":
                 import queue as _q
                 q = _q.Queue(maxsize=200)
@@ -1099,7 +1047,6 @@ class _H(http.server.BaseHTTPRequestHandler):
                         if q in _SSE_CLIENTS: _SSE_CLIENTS.remove(q)
                 return
 
-            # ── Log geçmişi ─────────────────────────────────
             if self.path == "/api/logs/history":
                 with _LOG_LOCK: data = list(_LOG_BUF)
                 body = json.dumps(data).encode()
@@ -1109,7 +1056,6 @@ class _H(http.server.BaseHTTPRequestHandler):
                 self.end_headers(); self.wfile.write(body)
                 return
 
-            # ── Canlı stats ─────────────────────────────────
             if self.path == "/api/status":
                 rows, backends = _build_rows()
                 bore = _get_bore()
@@ -1128,7 +1074,6 @@ class _H(http.server.BaseHTTPRequestHandler):
                 self.end_headers(); self.wfile.write(body)
                 return
 
-            # ── Ana sayfa ────────────────────────────────────
             body = _build_html().encode()
             self.send_response(200)
             self.send_header("Content-Type",   "text/html; charset=utf-8")
@@ -1136,9 +1081,9 @@ class _H(http.server.BaseHTTPRequestHandler):
             self.end_headers(); self.wfile.write(body)
 
         except (BrokenPipeError, ConnectionResetError):
-            pass  # istemci bağlantıyı kesti — normal, loglanmaz
-        except Exception as e:
-            pass  # diğer ağ hataları da sessizce yut
+            pass
+        except Exception:
+            pass
 
     def do_POST(self):
         try:
@@ -1185,10 +1130,7 @@ class _H(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    # handle_error override: BrokenPipe + ConnectionReset'i tamamen bastır
-    def handle_error(self, request, client_address):
-        pass
-
+    def handle_error(self, request, client_address): pass
     def log_message(self, *_): pass
 
 
@@ -1223,8 +1165,34 @@ def _health_check_loop():
 #  BORE TUNNEL
 # ══════════════════════════════════════════════════════════
 
+def _strip_ansi(text):
+    import re
+    return re.sub(r'\x1b\[[0-9;]*[mK]|\x1b\[\d*[A-Za-z]|\x1b\(\w', '', text)
+
+
+def _wait_for_port(port, timeout=60):
+    """Verilen port dinlenmeye başlayana kadar bekle."""
+    import socket
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=1)
+            s.close()
+            return True
+        except Exception:
+            time.sleep(1)
+    return False
+
+
 def run_bore(port=MC_PORT):
     import re
+    # Gameserver modunda: önce Cuberite hazır olsun, sonra bore başlasın
+    if MODE == "gameserver":
+        print(f"[BORE] Cuberite port {port} bekleniyor...")
+        if _wait_for_port(port, timeout=120):
+            print(f"[BORE] Port {port} hazir, tunnel baslatiliyor...")
+        else:
+            print(f"[BORE] UYARI: Port {port} 120sn icinde acilmadi, yine de deneniyor...")
     while True:
         try:
             pathlib.Path(BORE_FILE).unlink(missing_ok=True)
@@ -1232,7 +1200,8 @@ def run_bore(port=MC_PORT):
                 ["bore", "local", str(port), "--to", "bore.pub"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             for line in proc.stdout:
-                line = line.rstrip()
+                line = _strip_ansi(line.rstrip())
+                if not line: continue
                 print(f"[BORE] {line}")
                 m = re.search(r"bore\.pub:(\d+)", line)
                 if m:
@@ -1241,7 +1210,6 @@ def run_bore(port=MC_PORT):
                     if MODE == "gameserver":
                         _register_with_proxy(addr)
             proc.wait()
-            # Bore koptu — gameserver modundaysa önce unregister et
             if MODE == "gameserver":
                 _unregister_from_proxy()
         except FileNotFoundError:
@@ -1251,20 +1219,24 @@ def run_bore(port=MC_PORT):
         time.sleep(10)
 
 
-def _register_with_proxy(bore_addr):
+def _register_with_proxy(bore_addr, retries=5):
     proxy_url = os.environ.get("PROXY_URL", "")
     if not proxy_url: return
     label = os.environ.get("SERVER_LABEL", "GameServer")
     host, port_str = bore_addr.split(":")
-    try:
-        body = json.dumps({"host": host, "port": int(port_str), "label": label}).encode()
-        req  = urllib.request.Request(
-            f"{proxy_url}/api/register", data=body,
-            headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=10)
-        print(f"[REG] Proxy kayit: {proxy_url} ({label})")
-    except Exception as e:
-        print(f"[REG] Kayit hatasi: {e}")
+    body = json.dumps({"host": host, "port": int(port_str), "label": label}).encode()
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                f"{proxy_url}/api/register", data=body,
+                headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
+            print(f"[REG] Proxy kayit: {proxy_url} ({label})")
+            return
+        except Exception as e:
+            print(f"[REG] Kayit hatasi (deneme {attempt}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(5 * attempt)
 
 
 def _unregister_from_proxy():
@@ -1332,10 +1304,29 @@ def run_cuberite():
     os.mkfifo(fifo)
     subprocess.Popen(["tail", "-f", "/dev/null"],
                      stdout=open(fifo, "wb"), stderr=subprocess.DEVNULL)
+
+    def _pipe_output(stream, prefix="[MC]"):
+        """Cuberite stdout/stderr'ini log tamponuna aktar."""
+        try:
+            for raw in stream:
+                line = raw.rstrip() if isinstance(raw, str) else raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    print(f"{prefix} {line}")
+        except Exception:
+            pass
+
     while True:
-        proc = subprocess.Popen([mc_bin], cwd=mc_dir, stdin=open(fifo, "rb"))
-        proc.wait()
-        print("[MC] Cuberite kapandi, 5sn sonra yeniden baslatiliyor...")
+        print(f"[MC] Cuberite baslatiliyor: {mc_bin}")
+        proc = subprocess.Popen(
+            [mc_bin], cwd=mc_dir,
+            stdin=open(fifo, "rb"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, bufsize=1)
+        threading.Thread(target=_pipe_output,
+                         args=(proc.stdout, "[MC]"), daemon=True).start()
+        ret = proc.wait()
+        print(f"[MC] Cuberite kapandi (kod={ret}), 5sn sonra yeniden baslatiliyor...")
         time.sleep(5)
 
 
