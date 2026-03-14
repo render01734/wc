@@ -33,41 +33,30 @@ _SSE_CLIENTS = []
 _SSE_LOCK    = threading.Lock()
 
 _LOG_COLORS = {
-    "[CONN]":   "#4ecca3",
-    "[JOIN]":   "#4ecca3",
-    "[QUIT]":   "#f8b400",
-    "[BORE]":   "#7ec8e3",
-    "[REG]":    "#a8edea",
-    "[UNREG]":  "#f8b400",
-    "[PROXY]":  "#4ecca3",
-    "[HTTP]":   "#555",
-    "[MC]":     "#c5a3ff",
-    "[CFG]":    "#555",
-    "[STATE]":  "#555",
-    "[ERR]":    "#ff6b6b",
-    "[WARN]":   "#f8b400",
-    "[HEALTH]": "#f8b400",
-    "[PVP]":    "#ff6b6b",
-    "[START]":  "#4ecca3",
+    "[CONN]":   "#4ecca3", "[JOIN]":   "#4ecca3",
+    "[QUIT]":   "#f8b400", "[BORE]":   "#7ec8e3",
+    "[REG]":    "#a8edea", "[UNREG]":  "#f8b400",
+    "[PROXY]":  "#4ecca3", "[HTTP]":   "#555",
+    "[MC]":     "#c5a3ff", "[CFG]":    "#555",
+    "[STATE]":  "#555",    "[ERR]":    "#ff6b6b",
+    "[WARN]":   "#f8b400", "[HEALTH]": "#f8b400",
+    "[PVP]":    "#ff6b6b", "[START]":  "#4ecca3",
 }
 
 def _log_color(line):
     for tag, color in _LOG_COLORS.items():
-        if tag in line:
-            return color
+        if tag in line: return color
     return "#c8c8c8"
 
 class _TeeLogger:
-    def __init__(self, orig):
-        self._orig = orig
+    def __init__(self, orig): self._orig = orig
     def write(self, text):
         self._orig.write(text)
         stripped = text.strip()
         if stripped:
             ts    = datetime.datetime.now().strftime("%H:%M:%S")
             entry = {"ts": ts, "msg": stripped, "color": _log_color(stripped)}
-            with _LOG_LOCK:
-                _LOG_BUF.append(entry)
+            with _LOG_LOCK: _LOG_BUF.append(entry)
             payload = f"data: {json.dumps(entry)}\n\n"
             with _SSE_LOCK:
                 dead = []
@@ -75,8 +64,8 @@ class _TeeLogger:
                     try:    q.put_nowait(payload)
                     except: dead.append(q)
                 for q in dead: _SSE_CLIENTS.remove(q)
-    def flush(self):   self._orig.flush()
-    def isatty(self):  return False
+    def flush(self):  self._orig.flush()
+    def isatty(self): return False
 
 sys.stdout = _TeeLogger(sys.stdout)
 sys.stderr = _TeeLogger(sys.stderr)
@@ -823,22 +812,18 @@ HTML = """\
   <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet">
   <style>
     :root{{
-      --bg:#0d0f1a; --panel:#111827; --border:#1e3a5f;
-      --accent:#00ffc8; --accent2:#0099ff;
-      --warn:#f8b400; --err:#ff4f4f; --dim:#4a5568; --text:#cbd5e0;
+      --bg:#0d0f1a;--panel:#111827;--border:#1e3a5f;
+      --accent:#00ffc8;--accent2:#0099ff;
+      --warn:#f8b400;--err:#ff4f4f;--dim:#4a5568;--text:#cbd5e0;
     }}
     *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{
-      background:var(--bg);color:var(--text);
-      font-family:'Share Tech Mono',monospace;
-      min-height:100vh;padding:20px;
-      background-image:
-        radial-gradient(ellipse 80% 60% at 50% -10%,#0a2a4a55,transparent),
-        repeating-linear-gradient(0deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px),
-        repeating-linear-gradient(90deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px);
-    }}
+    body{{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;
+          min-height:100vh;padding:20px;
+          background-image:
+            radial-gradient(ellipse 80% 60% at 50% -10%,#0a2a4a55,transparent),
+            repeating-linear-gradient(0deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px),
+            repeating-linear-gradient(90deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px);}}
     .wrap{{max-width:920px;margin:0 auto;display:flex;flex-direction:column;gap:14px}}
-
     .header{{display:flex;align-items:center;justify-content:space-between;
              border-bottom:1px solid var(--border);padding-bottom:12px}}
     .logo{{font-family:'Rajdhani',sans-serif;font-size:1.7rem;font-weight:700;
@@ -848,7 +833,6 @@ HTML = """\
                display:inline-block;margin-right:6px;box-shadow:0 0 6px var(--accent);
                animation:blink 1.4s ease-in-out infinite}}
     @keyframes blink{{0%,100%{{opacity:1;transform:scale(1)}}50%{{opacity:.4;transform:scale(.7)}}}}
-
     .addr-box{{background:linear-gradient(135deg,#0a2a4a,#0a1a35);
                border:1px solid var(--accent);border-radius:8px;
                padding:12px 18px;display:flex;align-items:center;gap:14px;
@@ -860,7 +844,6 @@ HTML = """\
                border-radius:6px;padding:6px 14px;font-size:.73rem;cursor:pointer;
                font-family:'Share Tech Mono',monospace;transition:all .15s;white-space:nowrap}}
     .copy-btn:hover{{background:var(--accent);color:#000}}
-
     .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}
     .stat{{background:var(--panel);border:1px solid var(--border);
            border-radius:8px;padding:14px 16px;position:relative;overflow:hidden}}
@@ -869,7 +852,6 @@ HTML = """\
     .stat-val{{font-size:2rem;color:var(--accent);font-family:'Rajdhani',sans-serif;
                font-weight:700;line-height:1}}
     .stat-lbl{{font-size:.68rem;color:var(--dim);margin-top:4px}}
-
     .panel{{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden}}
     .panel-hdr{{display:flex;align-items:center;justify-content:space-between;
                 padding:9px 16px;border-bottom:1px solid var(--border);background:#0a1428}}
@@ -889,15 +871,13 @@ HTML = """\
              border-top:1px solid var(--border)}}
     .badge{{background:#00ffc808;border:1px solid #00ffc830;color:var(--accent);
             font-size:.63rem;padding:3px 10px;border-radius:20px;letter-spacing:.05em}}
-
-    /* ── Console ── */
     .con-toolbar{{display:flex;align-items:center;justify-content:space-between;
                   padding:7px 14px;background:#070d1a;border-bottom:1px solid var(--border)}}
     .win-btns{{display:flex;gap:6px}}
     .wb{{width:10px;height:10px;border-radius:50%}}
-    .wb-r{{background:#ff5f56}} .wb-y{{background:#ffbd2e}} .wb-g{{background:#27c93f}}
+    .wb-r{{background:#ff5f56}}.wb-y{{background:#ffbd2e}}.wb-g{{background:#27c93f}}
     .con-title{{font-size:.68rem;color:var(--dim);letter-spacing:.1em;margin-left:8px}}
-    .con-right{{display:flex;align-items:center;gap:8px}}
+    .con-right{{display:flex;align-items:center;gap:6px;flex-wrap:wrap}}
     .flt{{background:transparent;border:1px solid var(--border);color:var(--dim);
           font-family:'Share Tech Mono',monospace;font-size:.63rem;
           border-radius:4px;padding:3px 8px;cursor:pointer;transition:all .15s}}
@@ -919,26 +899,25 @@ HTML = """\
     .lt{{color:var(--dim);flex-shrink:0;font-size:.66rem;padding-top:1px}}
     .lm{{word-break:break-all;flex:1}}
     @media(max-width:600px){{.stats{{grid-template-columns:repeat(2,1fr)}}
-      .addr-val{{font-size:1rem}}.flt{{display:none}}}}
+      .addr-val{{font-size:1rem}}.flt{{font-size:.55rem;padding:2px 5px}}}}
   </style>
 </head>
 <body>
 <div class="wrap">
-
   <div class="header">
     <div class="logo">⛏ WC<span>-ENGINE</span></div>
-    <div style="font-size:.72rem;color:var(--dim)" id="hdr-status">
+    <div style="font-size:.72rem;color:var(--dim)">
       <span class="live-dot"></span>
-      {mode_label} &bull; <span id="hdr-players">{player_count}</span> oyuncu aktif
+      {mode_label} &bull; <span id="hdr-p">{player_count}</span> oyuncu aktif
     </div>
   </div>
 
   {addr_block}
 
   <div class="stats">
-    <div class="stat"><div class="stat-val" id="s-players">{player_count}</div><div class="stat-lbl">Toplam Oyuncu</div></div>
-    <div class="stat"><div class="stat-val" id="s-blocks">{block_count}</div><div class="stat-lbl">Blok Değişikliği</div></div>
-    <div class="stat"><div class="stat-val" id="s-servers">{server_count}</div><div class="stat-lbl">Game Server</div></div>
+    <div class="stat"><div class="stat-val" id="s-p">{player_count}</div><div class="stat-lbl">Toplam Oyuncu</div></div>
+    <div class="stat"><div class="stat-val" id="s-b">{block_count}</div><div class="stat-lbl">Blok Değişikliği</div></div>
+    <div class="stat"><div class="stat-val" id="s-s">{server_count}</div><div class="stat-lbl">Game Server</div></div>
   </div>
 
   <div class="panel">
@@ -965,40 +944,30 @@ HTML = """\
         <span class="con-title">CANLI KONSOL</span>
       </div>
       <div class="con-right">
-        <button class="flt on"  data-f="">TÜMÜ</button>
-        <button class="flt"     data-f="ERR">HATA</button>
-        <button class="flt"     data-f="WARN">UYARI</button>
-        <button class="flt"     data-f="CONN,JOIN,QUIT">OYUNCU</button>
-        <button class="flt"     data-f="BORE,REG">TUNNEL</button>
-        <button class="flt"     data-f="MC">MC</button>
-        <button class="clr"     id="clrBtn">TEMİZLE</button>
+        <button class="flt on" data-f="">TÜMÜ</button>
+        <button class="flt" data-f="ERR">HATA</button>
+        <button class="flt" data-f="WARN">UYARI</button>
+        <button class="flt" data-f="CONN,JOIN,QUIT">OYUNCU</button>
+        <button class="flt" data-f="BORE,REG">TUNNEL</button>
+        <button class="flt" data-f="MC">MC</button>
+        <button class="clr" id="clrBtn">TEMİZLE</button>
         <div class="sse-ind"><div class="sse-d" id="sseDot"></div><span id="sseLbl">bağlanıyor</span></div>
       </div>
     </div>
-    <div id="con"><div style="color:#2a4a6a;font-size:.73rem">— konsol yükleniyor —</div></div>
+    <div id="con"><div style="color:#2a4a6a;font-size:.73rem;padding:4px">— konsol yükleniyor —</div></div>
   </div>
-
 </div>
 <script>
 (function(){{
-  const con=document.getElementById('con');
-  const dot=document.getElementById('sseDot');
-  const lbl=document.getElementById('sseLbl');
-  let autoScroll=true, activeFilter='', allLines=[];
-
-  con.addEventListener('scroll',()=>{{
-    autoScroll=con.scrollTop+con.clientHeight>=con.scrollHeight-30;
-  }});
-
+  const con=document.getElementById('con'),dot=document.getElementById('sseDot'),lbl=document.getElementById('sseLbl');
+  let autoScroll=true,activeFilter='',allLines=[];
+  con.addEventListener('scroll',()=>{{autoScroll=con.scrollTop+con.clientHeight>=con.scrollHeight-30;}});
   function esc(s){{return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
-
   function renderLine(e){{
-    const d=document.createElement('div');
-    d.className='ll'; d.dataset.msg=e.msg;
+    const d=document.createElement('div');d.className='ll';d.dataset.msg=e.msg;
     d.innerHTML='<span class="lt">'+e.ts+'</span><span class="lm" style="color:'+e.color+'">'+esc(e.msg)+'</span>';
     return d;
   }}
-
   function applyFilter(){{
     const f=activeFilter;
     con.querySelectorAll('.ll').forEach(el=>{{
@@ -1006,18 +975,13 @@ HTML = """\
       el.style.display=(!f||f.split(',').some(k=>m.includes('['+k+']')))?'':'none';
     }});
   }}
-
   document.querySelectorAll('.flt').forEach(btn=>{{
     btn.addEventListener('click',()=>{{
       document.querySelectorAll('.flt').forEach(b=>b.classList.remove('on'));
-      btn.classList.add('on');
-      activeFilter=btn.dataset.f;
-      applyFilter();
+      btn.classList.add('on');activeFilter=btn.dataset.f;applyFilter();
     }});
   }});
-
   document.getElementById('clrBtn').addEventListener('click',()=>{{con.innerHTML='';allLines=[];}});
-
   function addLine(e){{
     allLines.push(e);
     if(allLines.length>600){{allLines.shift();const f=con.querySelector('.ll');if(f)f.remove();}}
@@ -1027,27 +991,21 @@ HTML = """\
     con.appendChild(el);
     if(autoScroll)con.scrollTop=con.scrollHeight;
   }}
-
-  fetch('/api/logs/history').then(r=>r.json()).then(arr=>{{
-    con.innerHTML='';arr.forEach(e=>addLine(e));
-  }}).catch(()=>{{}});
-
+  fetch('/api/logs/history').then(r=>r.json()).then(arr=>{{con.innerHTML='';arr.forEach(e=>addLine(e));}}).catch(()=>{{}});
   function connectSSE(){{
-    dot.className='sse-d'; lbl.textContent='bağlanıyor...';
+    dot.className='sse-d';lbl.textContent='bağlanıyor...';
     const es=new EventSource('/api/logs/stream');
     es.onopen=()=>{{dot.className='sse-d live';lbl.textContent='canlı';}};
     es.onmessage=e=>{{try{{addLine(JSON.parse(e.data));}}catch(x){{}}}};
-    es.onerror=()=>{{dot.className='sse-d';lbl.textContent='yeniden bağlanıyor...';
-      es.close();setTimeout(connectSSE,3000);}};
+    es.onerror=()=>{{dot.className='sse-d';lbl.textContent='yeniden bağlanıyor...';es.close();setTimeout(connectSSE,3000);}};
   }}
   connectSSE();
-
   function refreshStats(){{
     fetch('/api/status').then(r=>r.json()).then(d=>{{
-      document.getElementById('s-players').textContent=d.players;
-      document.getElementById('s-blocks').textContent=d.blocks;
-      document.getElementById('s-servers').textContent=d.servers;
-      document.getElementById('hdr-players').textContent=d.players;
+      document.getElementById('s-p').textContent=d.players;
+      document.getElementById('s-b').textContent=d.blocks;
+      document.getElementById('s-s').textContent=d.servers;
+      document.getElementById('hdr-p').textContent=d.players;
       const t=document.getElementById('srv-tbl');
       if(t)t.innerHTML='<tr><th>Sunucu</th><th>Oyuncu</th><th>Durum</th></tr>'+d.table_rows;
       if(d.addr){{const av=document.querySelector('.addr-val');if(av)av.textContent=d.addr;}}
@@ -1073,7 +1031,8 @@ def _build_rows():
         rows += (f'<tr><td>{label}</td><td>{n} oyuncu</td>'
                  f'<td><span class="sdot"></span><span class="son">Aktif</span></td></tr>')
     if not rows:
-        rows = '<tr><td colspan="3" style="color:#4a5568;text-align:center;padding:18px">Game server bekleniyor...</td></tr>'
+        rows = ('<tr><td colspan="3" style="color:#4a5568;text-align:center;padding:18px">'
+                'Game server bekleniyor...</td></tr>')
     return rows, backends
 
 
@@ -1113,107 +1072,122 @@ def _build_html():
 class _H(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
-        # ── SSE: canlı log akışı ──────────────────────────────
-        if self.path == "/api/logs/stream":
-            import queue as _q
-            q = _q.Queue(maxsize=200)
-            with _SSE_LOCK:
-                _SSE_CLIENTS.append(q)
-            self.send_response(200)
-            self.send_header("Content-Type",  "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            try:
-                while True:
-                    try:
-                        payload = q.get(timeout=25)
-                        self.wfile.write(payload.encode())
-                        self.wfile.flush()
-                    except _q.Empty:
-                        self.wfile.write(b": ping\n\n")
-                        self.wfile.flush()
-            except Exception:
-                pass
-            finally:
-                with _SSE_LOCK:
-                    if q in _SSE_CLIENTS: _SSE_CLIENTS.remove(q)
-            return
+        try:
+            # ── SSE: canlı log akışı ────────────────────────
+            if self.path == "/api/logs/stream":
+                import queue as _q
+                q = _q.Queue(maxsize=200)
+                with _SSE_LOCK: _SSE_CLIENTS.append(q)
+                self.send_response(200)
+                self.send_header("Content-Type",      "text/event-stream")
+                self.send_header("Cache-Control",     "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                try:
+                    while True:
+                        try:
+                            payload = q.get(timeout=25)
+                            self.wfile.write(payload.encode())
+                            self.wfile.flush()
+                        except _q.Empty:
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                except Exception:
+                    pass
+                finally:
+                    with _SSE_LOCK:
+                        if q in _SSE_CLIENTS: _SSE_CLIENTS.remove(q)
+                return
 
-        # ── Log geçmişi ───────────────────────────────────────
-        if self.path == "/api/logs/history":
-            with _LOG_LOCK:
-                data = list(_LOG_BUF)
-            body = json.dumps(data).encode()
+            # ── Log geçmişi ─────────────────────────────────
+            if self.path == "/api/logs/history":
+                with _LOG_LOCK: data = list(_LOG_BUF)
+                body = json.dumps(data).encode()
+                self.send_response(200)
+                self.send_header("Content-Type",   "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+                return
+
+            # ── Canlı stats ─────────────────────────────────
+            if self.path == "/api/status":
+                rows, backends = _build_rows()
+                bore = _get_bore()
+                payload = {
+                    "players":    len(_active),
+                    "blocks":     len(world_state.blocks),
+                    "servers":    len(backends),
+                    "mode":       MODE.upper(),
+                    "addr":       bore or "",
+                    "table_rows": rows,
+                }
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type",   "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+                return
+
+            # ── Ana sayfa ────────────────────────────────────
+            body = _build_html().encode()
             self.send_response(200)
-            self.send_header("Content-Type",   "application/json")
+            self.send_header("Content-Type",   "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers(); self.wfile.write(body)
-            return
 
-        # ── Canlı stats (AJAX) ────────────────────────────────
-        if self.path == "/api/status":
-            rows, backends = _build_rows()
-            bore = _get_bore()
-            payload = {
-                "players":    len(_active),
-                "blocks":     len(world_state.blocks),
-                "servers":    len(backends),
-                "mode":       MODE.upper(),
-                "addr":       bore or "",
-                "table_rows": rows,
-            }
-            body = json.dumps(payload).encode()
-            self.send_response(200)
-            self.send_header("Content-Type",   "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers(); self.wfile.write(body)
-            return
-
-        # ── Ana sayfa ─────────────────────────────────────────
-        body = _build_html().encode()
-        self.send_response(200)
-        self.send_header("Content-Type",   "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers(); self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # istemci bağlantıyı kesti — normal, loglanmaz
+        except Exception as e:
+            pass  # diğer ağ hataları da sessizce yut
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        try: data = json.loads(self.rfile.read(length))
-        except Exception: self._r(400, "bad json"); return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            try: data = json.loads(self.rfile.read(length))
+            except Exception: self._r(400, "bad json"); return
 
-        if self.path == "/api/register":
-            host  = data.get("host"); port = data.get("port")
-            label = data.get("label", f"{host}:{port}")
-            if not host or not port: self._r(400, "missing host/port"); return
-            backends = load_backends()
-            found = False
-            for b in backends:
-                if b.get("label") == label:
-                    b["host"] = host; b["port"] = int(port); found = True; break
-            if not found:
-                backends.append({"host": host, "port": int(port), "label": label})
-            save_backends(backends)
-            print(f"[REG] {label} ({host}:{port})")
-            self._r(200, "ok")
+            if self.path == "/api/register":
+                host  = data.get("host"); port = data.get("port")
+                label = data.get("label", f"{host}:{port}")
+                if not host or not port: self._r(400, "missing host/port"); return
+                backends = load_backends()
+                found = False
+                for b in backends:
+                    if b.get("label") == label:
+                        b["host"] = host; b["port"] = int(port); found = True; break
+                if not found:
+                    backends.append({"host": host, "port": int(port), "label": label})
+                save_backends(backends)
+                print(f"[REG] {label} ({host}:{port})")
+                self._r(200, "ok")
 
-        elif self.path == "/api/unregister":
-            label = data.get("label", "")
-            if not label: self._r(400, "missing label"); return
-            backends = load_backends()
-            backends = [b for b in backends if b.get("label") != label]
-            save_backends(backends)
-            print(f"[UNREG] {label}")
-            self._r(200, "ok")
+            elif self.path == "/api/unregister":
+                label = data.get("label", "")
+                if not label: self._r(400, "missing label"); return
+                backends = load_backends()
+                backends = [b for b in backends if b.get("label") != label]
+                save_backends(backends)
+                print(f"[UNREG] {label}")
+                self._r(200, "ok")
 
-        else:
-            self._r(404, "not found")
+            else:
+                self._r(404, "not found")
+
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _r(self, code, msg):
-        b = msg.encode()
-        self.send_response(code)
-        self.send_header("Content-Length", str(len(b)))
-        self.end_headers(); self.wfile.write(b)
+        try:
+            b = msg.encode()
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # handle_error override: BrokenPipe + ConnectionReset'i tamamen bastır
+    def handle_error(self, request, client_address):
+        pass
 
     def log_message(self, *_): pass
 
