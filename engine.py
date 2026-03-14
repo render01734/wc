@@ -537,9 +537,8 @@ def pick_backend():
     if not backends: return None
     counts = {}
     for c in list(_active):
-        if c.username != "?":
-            k = f"{c.backend_host}:{c.backend_port}"
-            counts[k] = counts.get(k, 0) + 1
+        k = f"{c.backend_host}:{c.backend_port}"
+        counts[k] = counts.get(k, 0) + 1
     for b in sorted(backends,
                     key=lambda x: counts.get(f"{x['host']}:{x['port']}", 0),
                     reverse=False):  # En az dolu sunucuyu seç
@@ -774,8 +773,7 @@ class PlayerConn:
                 _active.remove(self)
                 # Sadece gerçek isimle girenlerin QUIT mesajını bas (pingleri yoksay)
                 if self.username != "?":
-                    gercek_oyuncu_sayisi = sum(1 for c in list(_active) if c.username != "?")
-                    print(f"[QUIT] {self.username} ({gercek_oyuncu_sayisi} aktif)")
+                    print(f"[QUIT] {self.username} ({len(_active)} aktif)")
         for w in (self.client_w, self.server_w):
             if w:
                 try: w.close()
@@ -973,10 +971,8 @@ def _build_rows():
     backends = load_backends()
     counts = {}
     for c in list(_active):
-        # Sadece oyuna tam girenleri ("?" olmayanları) say
-        if c.username != "?":
-            k = f"{c.backend_host}:{c.backend_port}"
-            counts[k] = counts.get(k, 0) + 1
+        k = f"{c.backend_host}:{c.backend_port}"
+        counts[k] = counts.get(k, 0) + 1
     rows = ""
     for b in backends:
         k     = f"{b['host']}:{b['port']}"
@@ -1013,12 +1009,9 @@ def _build_html():
                       '⏳ Tunnel başlatılıyor...</div></div>')
 
     rows, backends = _build_rows()
-    # Toplam listeyi degil, sadece isimsiz olmayanlari sayiyoruz
-    real_player_count = sum(1 for c in list(_active) if c.username != "?")
-
     return HTML.format(
         addr_block   = addr_block,
-        player_count = real_player_count,
+        player_count = len(_active),
         block_count  = len(world_state.blocks),
         server_count = len(backends),
         rows         = rows,
@@ -1067,10 +1060,8 @@ class _H(http.server.BaseHTTPRequestHandler):
             if self.path == "/api/status":
                 rows, backends = _build_rows()
                 bore = _get_bore()
-                # API icin de sadece gercek oyunculari saydiriyoruz
-                real_player_count = sum(1 for c in list(_active) if c.username != "?")
                 payload = {
-                    "players":    real_player_count,
+                    "players":    len(_active),
                     "blocks":     len(world_state.blocks),
                     "servers":    len(backends),
                     "mode":       MODE.upper(),
