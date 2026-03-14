@@ -1,7 +1,7 @@
 services:
 
   # ══════════════════════════════════════════════════════════════
-  #  ANA PROXY  —  wc-yccy.onrender.com  (bir kere kurulur)
+  #  ANA PROXY  —  wc-yccy.onrender.com
   # ══════════════════════════════════════════════════════════════
   - type: web
     name: wc-yccy
@@ -12,7 +12,7 @@ services:
       - key: PORT
         value: "8080"
       - key: ENGINE_MODE
-        value: proxy
+        value: all  # <-- BURASI DEĞİŞTİ (proxy -> all)
       - key: DATA_DIR
         value: /data
     disk:
@@ -24,19 +24,7 @@ services:
 
   # ══════════════════════════════════════════════════════════════
   #  GAMESERVER  —  yeni sunucu açmak için sadece bu bloğu kopyala
-  #  Başka HİÇBİR ŞEY değiştirme — proxy, etiket otomatik ayarlanır
   # ══════════════════════════════════════════════════════════════
   - type: web
     name: wc-gameserver-1
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    plan: free
-    envVars:
-      - key: PORT
-        value: "8080"
-    disk:
-      name: gs1-world
-      mountPath: /server/world
-      sizeGB: 1
-    healthCheckPath: /
-    autoDeploy: true
+    # ... (kodun geri kalanı aynı)
