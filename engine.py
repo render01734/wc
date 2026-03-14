@@ -3,14 +3,9 @@
 ⛏️  Minecraft Distributed World Engine  —  Tek Dosya
 ═══════════════════════════════════════════════════════════
   • MC 1.8 offline protokol MITM (şifresiz → tam kontrol)
-  • Cross-server entity sync:
-      - Farklı Cuberite'deki oyuncular birbirini gerçek
-        oyuncu olarak GÖRÜR (isim etiketi dahil)
-      - Birbirlerine SALDIRABILIR (PvP)
-      - Blok değişiklikleri tüm sunucularda senkron
-      - Chat tüm sunuculara iletilir
-  • Merkezi Envanter: Cuberite Lua Plugin + Proxy API
-  • Oyuncu limiti: 999
+  • Cross-server entity sync (PvP, Chat, Blok)
+  • Merkezi Envanter: Python Log Avcısı + Cuberite Stdin
+  • Akıllı Failover: Uyuyan sunuculari pingler ve uyandirir
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -177,7 +172,7 @@ g_PluginInfo = {
     Name = "WCSync",
     Version = "1",
     Date = "2026-03-14",
-    Description = "Merkezi Envanter ve Veri Senkronizasyonu"
+    Description = "Merkezi Envanter Senkronizasyonu"
 }
 """
 
@@ -187,38 +182,32 @@ function Initialize(Plugin)
     Plugin:SetVersion(1)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, OnPlayerJoined)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
-    LOG("[SYNC] WCSync (Merkezi Senkronizasyon) basariyla yuklendi!")
+    cPluginManager:BindConsoleCommand("wcreload", HandleConsoleReload, "Python tetikleyici")
+    LOG("[SYNC] WCSync aktif! OS Sandbox bypass edildi.")
     return true
 end
 
 function OnPlayerJoined(Player)
-    local proxy = os.getenv("PROXY_URL")
-    if proxy and proxy ~= "" then
-        local uuid = Player:GetUUID()
-        local path = "world/players/" .. uuid .. ".json"
-        local name = Player:GetName()
-        -- Sunucudan dosyayi indir
-        local cmd = "curl -s -f -o " .. path .. " " .. proxy .. "/api/player?name=" .. name
-        os.execute(cmd)
-        -- Cuberite'in yeni dosyayi okumasini sagla (Envanter, Zirh, Can, XP esitlenir)
-        Player:LoadFromDisk()
-        LOG("[SYNC] " .. name .. " verileri merkezden cekildi.")
-    end
+    -- Log'a basiyoruz, disaridaki Python bu logu avlayip API indirmesi yapacak!
+    LOG("WCSYNC_JOIN:" .. Player:GetName() .. ":" .. Player:GetUUID())
 end
 
 function OnPlayerDestroyed(Player)
-    local proxy = os.getenv("PROXY_URL")
-    if proxy and proxy ~= "" then
-        -- Cikarken Cuberite'in son durumu diske yazmasini zorla
-        Player:SaveToDisk()
-        local uuid = Player:GetUUID()
-        local path = "world/players/" .. uuid .. ".json"
-        local name = Player:GetName()
-        -- Arka planda API'ye gonder (sunucuyu dondurmamak icin komut sonuna & koyuyoruz)
-        local cmd = "curl -s -X POST -H 'Content-Type: application/json' -d @" .. path .. " " .. proxy .. "/api/player?name=" .. name .. " &"
-        os.execute(cmd)
-        LOG("[SYNC] " .. name .. " verileri merkeze gonderildi.")
+    Player:SaveToDisk()
+    -- Python bunu gorup diske inen son veriyi buluta firlatacak
+    LOG("WCSYNC_QUIT:" .. Player:GetName() .. ":" .. Player:GetUUID())
+end
+
+function HandleConsoleReload(Split)
+    -- Python API'den veriyi indirince bu komutu tetikler!
+    if #Split > 1 then
+        local name = Split[2]
+        cRoot:Get():FindAndDoWithPlayer(name, function(P)
+            P:LoadFromDisk()
+            P:SendMessageSuccess("Verileriniz merkezden esitlendi!")
+        end)
     end
+    return true
 end
 """
 
@@ -228,7 +217,6 @@ def write_configs(server_dir=SERVER_DIR):
     if bins:
         server_dir = str(pathlib.Path(bins[0]).parent)
     
-    # Proxy sunucusunda veritabani (oyuncu) dosyalarini saklayacagimiz klasor
     pathlib.Path(f"{DATA_DIR}/players").mkdir(parents=True, exist_ok=True)
     
     files = {
@@ -324,6 +312,11 @@ def pos_dec(data, pos=0):
     if z >= (1 << 25): z -= (1 << 26)
     return x, y, z, pos + 8
 
+def pkt_kick(reason, comp=-1):
+    # Paket 0x00 Login Kick (Kullanici oyuna girmeden kirmizi ekran verir)
+    payload = mc_str_enc(json.dumps({"text": reason, "color": "yellow"}))
+    return pkt_make(0x00, payload, comp)
+
 # Paket ID'leri (MC 1.8 / protocol 47)
 PID_JOIN_GAME     = 0x01
 PID_CHAT_SC       = 0x02
@@ -414,12 +407,11 @@ class PlayerInfo:
         self.virtual_eid         = virtual_eid
         self.conn                = None
 
-
 class CrossServerState:
     def __init__(self):
         self._lock    = threading.Lock()
-        self._players = {}   # username -> PlayerInfo
-        self._veid    = {}   # virtual_eid -> username
+        self._players = {}
+        self._veid    = {}
         self._counter = 100_000
 
     def register(self, username, conn):
@@ -459,49 +451,31 @@ cs_state = CrossServerState()
 
 
 # -- Paket builder'lar ----------------------------------------
-
-def _ang(deg):
-    return struct.pack("B", int(deg / 360.0 * 256) & 0xFF)
-
-def _fp(coord):
-    return struct.pack(">i", int(coord * 32))
+def _ang(deg): return struct.pack("B", int(deg / 360.0 * 256) & 0xFF)
+def _fp(coord): return struct.pack(">i", int(coord * 32))
 
 def pkt_spawn_player(info, comp=-1):
-    payload = (
-        vi_enc(info.virtual_eid) +
-        mc_str_enc(info.uuid_str) +
-        mc_str_enc(info.username) +
-        vi_enc(0) +
-        _fp(info.x) + _fp(info.y) + _fp(info.z) +
-        _ang(info.yaw) + _ang(info.pitch) +
-        struct.pack(">h", 0) +
-        bytes([0x7F])
-    )
+    payload = (vi_enc(info.virtual_eid) + mc_str_enc(info.uuid_str) + mc_str_enc(info.username) +
+        vi_enc(0) + _fp(info.x) + _fp(info.y) + _fp(info.z) + _ang(info.yaw) + _ang(info.pitch) +
+        struct.pack(">h", 0) + bytes([0x7F]))
     return pkt_make(PID_SPAWN_PLAYER, payload, comp)
 
 def pkt_entity_teleport(info, comp=-1):
-    payload = (
-        vi_enc(info.virtual_eid) +
-        _fp(info.x) + _fp(info.y) + _fp(info.z) +
-        _ang(info.yaw) + _ang(info.pitch) +
-        bytes([1])
-    )
+    payload = (vi_enc(info.virtual_eid) + _fp(info.x) + _fp(info.y) + _fp(info.z) +
+        _ang(info.yaw) + _ang(info.pitch) + bytes([1]))
     return pkt_make(PID_ENT_TELEPORT, payload, comp)
 
 def pkt_destroy_entity(veid, comp=-1):
     return pkt_make(PID_DESTROY_ENT, vi_enc(1) + vi_enc(veid), comp)
 
 def pkt_entity_hurt(eid, comp=-1):
-    # Entity Status: Entity ID = Int (4 byte, NOT VarInt)
     return pkt_make(PID_ENT_STATUS, struct.pack(">i", eid) + bytes([2]), comp)
 
 def pkt_update_health(hp, comp=-1):
-    return pkt_make(PID_UPDATE_HEALTH,
-        struct.pack(">f", max(0.0, hp)) + vi_enc(20) + struct.pack(">f", 5.0), comp)
+    return pkt_make(PID_UPDATE_HEALTH, struct.pack(">f", max(0.0, hp)) + vi_enc(20) + struct.pack(">f", 5.0), comp)
 
 def pkt_chat_msg(text, color="yellow", comp=-1):
-    return pkt_make(PID_CHAT_SC,
-        mc_str_enc(json.dumps({"text": text, "color": color})) + bytes([0]), comp)
+    return pkt_make(PID_CHAT_SC, mc_str_enc(json.dumps({"text": text, "color": color})) + bytes([0]), comp)
 
 
 # ══════════════════════════════════════════════════════════
@@ -511,21 +485,11 @@ def pkt_chat_msg(text, color="yellow", comp=-1):
 _active_lock = asyncio.Lock()
 _active = []
 
-
 def _cross_peers(conn):
-    try:
-        snap = list(_active)
-    except Exception:
-        return []
-    return [
-        c for c in snap
-        if c is not conn
-        and c.play_state
-        and c.cs_info is not None
-        and (c.backend_host != conn.backend_host
-             or c.backend_port != conn.backend_port)
-    ]
-
+    try: snap = list(_active)
+    except Exception: return []
+    return [c for c in snap if c is not conn and c.play_state and c.cs_info is not None and 
+           (c.backend_host != conn.backend_host or c.backend_port != conn.backend_port)]
 
 async def bcast_spawn(new_conn):
     info = new_conn.cs_info
@@ -544,7 +508,6 @@ async def bcast_spawn(new_conn):
             await c.client_w.drain()
         except Exception: pass
 
-
 async def bcast_move(mover):
     info = mover.cs_info
     if not info: return
@@ -554,7 +517,6 @@ async def bcast_move(mover):
             c.client_w.write(pkt_entity_teleport(info, c.comp))
             await c.client_w.drain()
         except Exception: pass
-
 
 async def bcast_despawn(leaver):
     info = leaver.cs_info
@@ -566,7 +528,6 @@ async def bcast_despawn(leaver):
             await c.client_w.drain()
         except Exception: pass
 
-
 async def bcast_chat(sender, msg):
     peers = _cross_peers(sender)
     for c in peers:
@@ -577,7 +538,7 @@ async def bcast_chat(sender, msg):
 
 
 # ══════════════════════════════════════════════════════════
-#  BACKEND YONETIMI
+#  BACKEND YONETIMI + GERCEK PING (HEALTH CHECK)
 # ══════════════════════════════════════════════════════════
 
 def load_backends():
@@ -587,6 +548,24 @@ def load_backends():
 def save_backends(b):
     pathlib.Path(BACKENDS_FILE).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(BACKENDS_FILE).write_text(json.dumps(b, indent=2))
+
+async def check_backend_alive(host, port):
+    """
+    Sadece portun acik olup olmadigina bakmaz!
+    Gercek Minecraft Status Request (Ping) paketi atar. 
+    Sunucu uykudaysa (hibernate) Timeout yer ve False doner.
+    """
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2.0)
+        hs = vi_enc(47) + mc_str_enc("127.0.0.1") + struct.pack(">H", int(port)) + vi_enc(1)
+        writer.write(pkt_make(0x00, hs, -1))
+        writer.write(pkt_make(0x00, b"", -1))
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(10), timeout=2.0)
+        writer.close()
+        return len(data) > 0
+    except Exception:
+        return False
 
 
 # ══════════════════════════════════════════════════════════
@@ -601,7 +580,7 @@ class PlayerConn:
         self.server_w      = None
         self.state         = "handshake"
         self.play_state    = False
-        self.comp          = -1   # her iki yon ayni threshold kullanir
+        self.comp          = -1
         self.username      = "?"
         self.backend_host  = ""
         self.backend_port  = 0
@@ -625,31 +604,22 @@ class PlayerConn:
         try:
             while True:
                 pid, payload, raw = await pkt_read(self.server_r, self.comp)
-
-                # Login
                 if self.state == "login":
-                    if pid == PID_SET_COMP:
-                        # Her iki yon icin de ayni esik
-                        self.comp, _ = vi_dec(payload)
-                    elif pid == PID_LOGIN_OK:
-                        self.state = "play"
+                    if pid == PID_SET_COMP: self.comp, _ = vi_dec(payload)
+                    elif pid == PID_LOGIN_OK: self.state = "play"
                     self.client_w.write(raw)
                     await self.client_w.drain()
                     continue
 
-                # Play: Join Game -> gercek entity ID'yi al
                 if pid == PID_JOIN_GAME and self.cs_info and len(payload) >= 4:
                     try: self.cs_info.real_eid = struct.unpack_from(">i", payload, 0)[0]
                     except Exception: pass
-
-                # Blok degisiklikleri -> world_state'e kaydet
                 elif pid == PID_BLOCK_CHG and len(payload) >= 9:
                     try:
                         x, y, z, p2 = pos_dec(payload)
                         bid, _ = vi_dec(payload, p2)
                         world_state.record(x, y, z, bid)
                     except Exception: pass
-
                 elif pid == PID_MULTI_BLK and len(payload) >= 8:
                     try:
                         cx = struct.unpack_from(">i", payload, 0)[0]
@@ -657,14 +627,11 @@ class PlayerConn:
                         count, p2 = vi_dec(payload, 8)
                         recs = []
                         for _ in range(count):
-                            hp = payload[p2]; p2 += 1
-                            ry = payload[p2]; p2 += 1
+                            hp = payload[p2]; p2 += 1; ry = payload[p2]; p2 += 1
                             bid, p2 = vi_dec(payload, p2)
                             recs.append(((hp >> 4) & 0xF, ry, hp & 0xF, bid))
                         world_state.record_multi(cx, cz, recs)
                     except Exception: pass
-
-                # Oyuncu yuklendi -> blok replay + cross-server spawn
                 elif pid == PID_POS_LOOK_SC and not self._replay_sent:
                     self._replay_sent = True
                     self.client_w.write(raw)
@@ -680,7 +647,6 @@ class PlayerConn:
 
                 self.client_w.write(raw)
                 await self.client_w.drain()
-
         except (asyncio.IncompleteReadError, ConnectionResetError): pass
         except Exception as e: print(f"[S->C] {self.username}: {e}")
         finally: await self._cleanup()
@@ -689,22 +655,17 @@ class PlayerConn:
         try:
             while True:
                 pid, payload, raw = await pkt_read(self.client_r, self.comp)
-
-                # Handshake
                 if self.state == "handshake":
                     if pid == 0x00:
                         try:
                             p = 0
-                            _, p = vi_dec(payload, p)
-                            _, p = mc_str_dec(payload, p)
-                            p += 2
-                            ns, _ = vi_dec(payload, p)
+                            _, p = vi_dec(payload, p); _, p = mc_str_dec(payload, p)
+                            p += 2; ns, _ = vi_dec(payload, p)
                             if ns == 2: self.state = "login"
                         except Exception: pass
                     self.server_w.write(raw); await self.server_w.drain()
                     continue
 
-                # Login
                 if self.state == "login":
                     if pid == 0x00:
                         try:
@@ -715,36 +676,24 @@ class PlayerConn:
                     self.server_w.write(raw); await self.server_w.drain()
                     continue
 
-                # Play
-
-                # Pozisyon (C->S 0x04): X(d) Y(d) Z(d) OnGround(b) = 25 byte
                 if pid == PID_PLAYER_POS and len(payload) >= 25:
                     try:
                         x, y, z = struct.unpack_from(">ddd", payload, 0)
                         cs_state.update_pos(self.username, x=x, y=y, z=z)
-                        if self._spawned:
-                            asyncio.ensure_future(bcast_move(self))
+                        if self._spawned: asyncio.ensure_future(bcast_move(self))
                     except Exception: pass
-
-                # Bakis (C->S 0x05): Yaw(f) Pitch(f) OnGround(b) = 9 byte
                 elif pid == PID_PLAYER_LOOK and len(payload) >= 9:
                     try:
                         yaw, pitch = struct.unpack_from(">ff", payload, 0)
                         cs_state.update_pos(self.username, yaw=yaw, pitch=pitch)
                     except Exception: pass
-
-                # Pozisyon+Bakis (C->S 0x06): X Y Z (d*3=24) Yaw Pitch (f*2=8) OnGround = 33
                 elif pid == PID_PLAYER_PL and len(payload) >= 33:
                     try:
                         x, y, z = struct.unpack_from(">ddd", payload, 0)
                         yaw, pitch = struct.unpack_from(">ff", payload, 24)
-                        cs_state.update_pos(self.username, x=x, y=y, z=z,
-                                            yaw=yaw, pitch=pitch)
-                        if self._spawned:
-                            asyncio.ensure_future(bcast_move(self))
+                        cs_state.update_pos(self.username, x=x, y=y, z=z, yaw=yaw, pitch=pitch)
+                        if self._spawned: asyncio.ensure_future(bcast_move(self))
                     except Exception: pass
-
-                # Saldiri (C->S 0x02 Use Entity): type=1 saldiri
                 elif pid == PID_USE_ENTITY:
                     try:
                         target_veid, p2 = vi_dec(payload, 0)
@@ -753,19 +702,15 @@ class PlayerConn:
                             target = cs_state.by_veid(target_veid)
                             if target and target.conn and target.conn is not self:
                                 asyncio.ensure_future(self._cross_attack(target))
-                                continue   # sunucuya iletme
+                                continue
                     except Exception: pass
-
-                # Chat (C->S 0x01)
                 elif pid == 0x01 and self.play_state:
                     try:
                         msg, _ = mc_str_dec(payload)
-                        asyncio.ensure_future(
-                            bcast_chat(self, f"[{self.username}] {msg}"))
+                        asyncio.ensure_future(bcast_chat(self, f"[{self.username}] {msg}"))
                     except Exception: pass
 
                 self.server_w.write(raw); await self.server_w.drain()
-
         except (asyncio.IncompleteReadError, ConnectionResetError): pass
         except Exception as e: print(f"[C->S] {self.username}: {e}")
         finally: await self._cleanup()
@@ -775,22 +720,16 @@ class PlayerConn:
         target.health = max(0.0, target.health - DMG)
         tc = target.conn
         if not tc or not tc.cs_info: return
-
-        # Hedefe: hasar animasyonu (gercek eid) + yeni can
         try:
             tc.client_w.write(pkt_entity_hurt(tc.cs_info.real_eid, tc.comp))
             tc.client_w.write(pkt_update_health(target.health, tc.comp))
             await tc.client_w.drain()
         except Exception: pass
-
-        # Saldirganin ekraninda: hedefin hasar animasyonu (sanal eid)
         try:
             self.client_w.write(pkt_entity_hurt(target.virtual_eid, self.comp))
             await self.client_w.drain()
         except Exception: pass
-
         print(f"[PVP] {self.username} -> {target.username} ({target.health:.0f}/20 HP)")
-
         if target.health <= 0.0:
             target.health = 20.0
             msg = f"[{target.username} oldu! Olduran: {self.username}]"
@@ -812,7 +751,6 @@ class PlayerConn:
         async with _active_lock:
             if self in _active:
                 _active.remove(self)
-                # Sadece gerçek isimle girenlerin QUIT mesajını bas (pingleri yoksay)
                 if self.username != "?":
                     print(f"[QUIT] {self.username} ({len(_active)} aktif)")
         for w in (self.client_w, self.server_w):
@@ -823,10 +761,8 @@ class PlayerConn:
     async def run(self):
         backends = load_backends()
         if not backends:
-            # Hic sunucu yoksa sessizce kapat
             self.client_w.close(); return
 
-        # En az oyuncu olan sunucudan baslayarak sirala
         counts = {}
         for c in list(_active):
             if c.username != "?":
@@ -835,18 +771,39 @@ class PlayerConn:
                 
         sorted_backends = sorted(backends, key=lambda x: counts.get(f"{x['host']}:{x['port']}", 0))
 
-        # Aktif/uyanik bir sunucu bulana kadar hepsini dene
         connected = False
         for b in sorted_backends:
-            try:
-                await self.connect_backend(b)
-                connected = True
-                break # Baglanti basarili, donguden cik
-            except Exception as e:
-                continue
+            lbl = b.get("label", "")
+            
+            # SUNUCU UYKUDAYSA UYANDIRMA SINYALI AT
+            if "onrender.com" in lbl:
+                async def wakeup(u):
+                    try:
+                        reader, writer = await asyncio.wait_for(asyncio.open_connection(u, 443, ssl=True), 2.0)
+                        writer.write(f"GET /api/status HTTP/1.1\r\nHost: {u}\r\nConnection: close\r\n\r\n".encode())
+                        await writer.drain()
+                        writer.close()
+                    except: pass
+                asyncio.ensure_future(wakeup(lbl))
 
-        # Eger listedeki HICBIR sunucu uyanik degilse baglantiyi kes
+            # HAYALET TÜNELE KARŞI GERÇEK SAĞLIK KONTROLÜ
+            if await check_backend_alive(b["host"], b["port"]):
+                try:
+                    await self.connect_backend(b)
+                    connected = True
+                    break
+                except Exception: pass
+            else:
+                print(f"[WARN] Uykuda olan/Ölü sunucu atlandi: {lbl} ({b['host']}:{b['port']})")
+
         if not connected:
+            print("[ERR] Gecerli/Uyanik GameServer bulunamadi!")
+            if self.state == "login":
+                msg = "Sunucular uykudaydi ve su an UYANDIRILIYOR!\n\nLutfen 40 saniye sonra TEKRAR GIRIS YAPIN."
+                try:
+                    self.client_w.write(pkt_kick(msg, self.comp))
+                    await self.client_w.drain()
+                except: pass
             self.client_w.close()
             return
 
@@ -861,7 +818,7 @@ async def handle_player(cr, cw):
 
 
 # ══════════════════════════════════════════════════════════
-#  HTTP DURUM SAYFASI VE API
+#  HTTP DURUM SAYFASI VE API (VERITABANI BURADA)
 # ══════════════════════════════════════════════════════════
 
 HTML = """\
@@ -1033,7 +990,6 @@ def _build_rows():
     backends = load_backends()
     counts = {}
     for c in list(_active):
-        # Sadece oyuna tam girenleri ("?" olmayanları) say
         if c.username != "?":
             k = f"{c.backend_host}:{c.backend_port}"
             counts[k] = counts.get(k, 0) + 1
@@ -1049,63 +1005,43 @@ def _build_rows():
                 'Game server bekleniyor...</td></tr>')
     return rows, backends
 
-
 def _get_bore():
     try:    return pathlib.Path(BORE_FILE).read_text().strip()
     except: return None
 
-
 def _build_html():
     bore = _get_bore()
     if bore:
-        addr_block = (
-            f'<div class="addr-box">'
-            f'<div><div class="addr-lbl">MİNECRAFT ADRESİ — Sunucu Ekle → bu adresi gir</div>'
-            f'<div class="addr-val">{bore}</div></div>'
-            f'<button class="copy-btn" '
-            f'onclick="navigator.clipboard.writeText(\'{bore}\');'
-            f'this.textContent=\'✓ Kopyalandı\';'
-            f'setTimeout(()=>this.textContent=\'Kopyala\',1500)">Kopyala</button>'
-            f'</div>')
+        addr_block = (f'<div class="addr-box"><div><div class="addr-lbl">MİNECRAFT ADRESİ — Sunucu Ekle → bu adresi gir</div>'
+                      f'<div class="addr-val">{bore}</div></div>'
+                      f'<button class="copy-btn" onclick="navigator.clipboard.writeText(\'{bore}\');'
+                      f'this.textContent=\'✓ Kopyalandı\';setTimeout(()=>this.textContent=\'Kopyala\',1500)">Kopyala</button></div>')
     else:
         addr_block = ('<div class="addr-box" style="border-color:var(--warn)">'
-                      '<div class="addr-val" style="color:var(--warn);font-size:.9rem">'
-                      '⏳ Tunnel başlatılıyor...</div></div>')
+                      '<div class="addr-val" style="color:var(--warn);font-size:.9rem">⏳ Tunnel başlatılıyor...</div></div>')
 
     rows, backends = _build_rows()
-    # Toplam listeyi degil, sadece isimsiz olmayanlari sayiyoruz
     real_player_count = sum(1 for c in list(_active) if c.username != "?")
-
-    return HTML.format(
-        addr_block   = addr_block,
-        player_count = real_player_count,
-        block_count  = len(world_state.blocks),
-        server_count = len(backends),
-        rows         = rows,
-        mode_label   = MODE.upper(),
-    )
-
+    return HTML.format(addr_block=addr_block, player_count=real_player_count, block_count=len(world_state.blocks),
+                       server_count=len(backends), rows=rows, mode_label=MODE.upper())
 
 class _H(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            # === PLAYER DB FETCH (LUA EKLENTISI BURAYA SORAR) ===
+            # === MERKEZİ ENVANTER İNDİRME API'Sİ ===
             if self.path.startswith("/api/player?name="):
                 name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
                 name = "".join(c for c in name if c.isalnum() or c in "-_")
                 filepath = f"{DATA_DIR}/players/{name}.json"
-                
                 if os.path.exists(filepath):
                     body = pathlib.Path(filepath).read_bytes()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self.end_headers(); self.wfile.write(body)
                 else:
-                    self.send_response(404)
-                    self.end_headers()
+                    self.send_response(404); self.end_headers()
                 return
 
             if self.path == "/api/logs/stream":
@@ -1113,21 +1049,18 @@ class _H(http.server.BaseHTTPRequestHandler):
                 q = _q.Queue(maxsize=200)
                 with _SSE_LOCK: _SSE_CLIENTS.append(q)
                 self.send_response(200)
-                self.send_header("Content-Type",      "text/event-stream")
-                self.send_header("Cache-Control",     "no-cache")
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
                 try:
                     while True:
                         try:
                             payload = q.get(timeout=25)
-                            self.wfile.write(payload.encode())
-                            self.wfile.flush()
+                            self.wfile.write(payload.encode()); self.wfile.flush()
                         except _q.Empty:
-                            self.wfile.write(b": ping\n\n")
-                            self.wfile.flush()
-                except Exception:
-                    pass
+                            self.wfile.write(b": ping\n\n"); self.wfile.flush()
+                except Exception: pass
                 finally:
                     with _SSE_LOCK:
                         if q in _SSE_CLIENTS: _SSE_CLIENTS.remove(q)
@@ -1137,7 +1070,7 @@ class _H(http.server.BaseHTTPRequestHandler):
                 with _LOG_LOCK: data = list(_LOG_BUF)
                 body = json.dumps(data).encode()
                 self.send_response(200)
-                self.send_header("Content-Type",   "application/json")
+                self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers(); self.wfile.write(body)
                 return
@@ -1145,48 +1078,36 @@ class _H(http.server.BaseHTTPRequestHandler):
             if self.path == "/api/status":
                 rows, backends = _build_rows()
                 bore = _get_bore()
-                # API icin de sadece gercek oyunculari saydiriyoruz
                 real_player_count = sum(1 for c in list(_active) if c.username != "?")
-                payload = {
-                    "players":    real_player_count,
-                    "blocks":     len(world_state.blocks),
-                    "servers":    len(backends),
-                    "mode":       MODE.upper(),
-                    "addr":       bore or "",
-                    "table_rows": rows,
-                }
+                payload = {"players": real_player_count, "blocks": len(world_state.blocks),
+                           "servers": len(backends), "mode": MODE.upper(), "addr": bore or "", "table_rows": rows}
                 body = json.dumps(payload).encode()
                 self.send_response(200)
-                self.send_header("Content-Type",   "application/json")
+                self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers(); self.wfile.write(body)
                 return
 
-            # Eger mod gameserver ise HTML paneli yerine sadece JSON bas
             if MODE != "proxy":
                 payload = {"status": "active", "mode": MODE}
                 body = json.dumps(payload).encode()
                 self.send_response(200)
-                self.send_header("Content-Type",   "application/json")
+                self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self.end_headers(); self.wfile.write(body)
                 return
 
             body = _build_html().encode()
             self.send_response(200)
-            self.send_header("Content-Type",   "text/html; charset=utf-8")
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers(); self.wfile.write(body)
-
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except Exception:
-            pass
+        except (BrokenPipeError, ConnectionResetError): pass
+        except Exception: pass
 
     def do_POST(self):
         try:
-            # === PLAYER DB SAVE (LUA EKLENTISI BURAYA KAYDEDER) ===
+            # === MERKEZİ ENVANTER YÜKLEME API'Sİ ===
             if self.path.startswith("/api/player?name="):
                 name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
                 name = "".join(c for c in name if c.isalnum() or c in "-_")
@@ -1198,8 +1119,7 @@ class _H(http.server.BaseHTTPRequestHandler):
                 if data:
                     pathlib.Path(filepath).write_bytes(data)
                     self._r(200, "ok")
-                else:
-                    self._r(400, "empty")
+                else: self._r(400, "empty")
                 return
 
             length = int(self.headers.get("Content-Length", 0))
@@ -1207,16 +1127,13 @@ class _H(http.server.BaseHTTPRequestHandler):
             except Exception: self._r(400, "bad json"); return
 
             if self.path == "/api/register":
-                host  = data.get("host"); port = data.get("port")
+                host = data.get("host"); port = data.get("port")
                 label = data.get("label", f"{host}:{port}")
                 if not host or not port: self._r(400, "missing host/port"); return
-                backends = load_backends()
-                found = False
+                backends = load_backends(); found = False
                 for b in backends:
-                    if b.get("label") == label:
-                        b["host"] = host; b["port"] = int(port); found = True; break
-                if not found:
-                    backends.append({"host": host, "port": int(port), "label": label})
+                    if b.get("label") == label: b["host"] = host; b["port"] = int(port); found = True; break
+                if not found: backends.append({"host": host, "port": int(port), "label": label})
                 save_backends(backends)
                 print(f"[REG] {label} ({host}:{port})")
                 self._r(200, "ok")
@@ -1229,12 +1146,8 @@ class _H(http.server.BaseHTTPRequestHandler):
                 save_backends(backends)
                 print(f"[UNREG] {label}")
                 self._r(200, "ok")
-
-            else:
-                self._r(404, "not found")
-
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            else: self._r(404, "not found")
+        except (BrokenPipeError, ConnectionResetError): pass
 
     def _r(self, code, msg):
         try:
@@ -1242,22 +1155,19 @@ class _H(http.server.BaseHTTPRequestHandler):
             self.send_response(code)
             self.send_header("Content-Length", str(len(b)))
             self.end_headers(); self.wfile.write(b)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except (BrokenPipeError, ConnectionResetError): pass
 
     def handle_error(self, request, client_address): pass
     def log_message(self, *_): pass
 
 
 def run_http():
-    # HTTPServer yerine ThreadingHTTPServer kullanıyoruz
     srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _H)
     print(f"[HTTP] Port {HTTP_PORT}")
     srv.serve_forever()
 
 
 def _health_check_loop():
-    """Periyodik olarak backends.json'daki ölü girişleri temizle."""
     import socket
     while True:
         time.sleep(60)
@@ -1270,11 +1180,9 @@ def _health_check_loop():
                     s.close()
                     alive.append(b)
                 except Exception:
-                    print(f"[HEALTH] Ölü backend kaldırıldı: {b.get('label','?')} ({b['host']}:{b['port']})")
-            if len(alive) != len(backends):
-                save_backends(alive)
-        except Exception as e:
-            print(f"[HEALTH] Hata: {e}")
+                    print(f"[HEALTH] Olu backend kaldirildi: {b.get('label','?')} ({b['host']}:{b['port']})")
+            if len(alive) != len(backends): save_backends(alive)
+        except Exception as e: print(f"[HEALTH] Hata: {e}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -1285,35 +1193,26 @@ def _strip_ansi(text):
     import re
     return re.sub(r'\x1b\[[0-9;]*[mK]|\x1b\[\d*[A-Za-z]|\x1b\(\w', '', text)
 
-
 def _wait_for_port(port, timeout=60):
-    """Verilen port dinlenmeye başlayana kadar bekle."""
     import socket
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             s = socket.create_connection(("127.0.0.1", port), timeout=1)
-            s.close()
-            return True
-        except Exception:
-            time.sleep(1)
+            s.close(); return True
+        except Exception: time.sleep(1)
     return False
-
 
 def run_bore(port=MC_PORT):
     import re
-    # Gameserver modunda: önce Cuberite hazır olsun, sonra bore başlasın
     if MODE == "gameserver":
         print(f"[BORE] Cuberite port {port} bekleniyor...")
-        if _wait_for_port(port, timeout=120):
-            print(f"[BORE] Port {port} hazir, tunnel baslatiliyor...")
-        else:
-            print(f"[BORE] UYARI: Port {port} 120sn icinde acilmadi, yine de deneniyor...")
+        if _wait_for_port(port, timeout=120): print(f"[BORE] Port {port} hazir, tunnel baslatiliyor...")
+        else: print(f"[BORE] UYARI: Port {port} acilmadi, deneniyor...")
     while True:
         try:
             pathlib.Path(BORE_FILE).unlink(missing_ok=True)
-            proc = subprocess.Popen(
-                ["bore", "local", str(port), "--to", "bore.pub"],
+            proc = subprocess.Popen(["bore", "local", str(port), "--to", "bore.pub"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             for line in proc.stdout:
                 line = _strip_ansi(line.rstrip())
@@ -1323,17 +1222,12 @@ def run_bore(port=MC_PORT):
                 if m:
                     addr = f"bore.pub:{m.group(1)}"
                     pathlib.Path(BORE_FILE).write_text(addr)
-                    if MODE == "gameserver":
-                        _register_with_proxy(addr)
+                    if MODE == "gameserver": _register_with_proxy(addr)
             proc.wait()
-            if MODE == "gameserver":
-                _unregister_from_proxy()
-        except FileNotFoundError:
-            print("[BORE] bore bulunamadi, 10sn bekleniyor...")
-        except Exception as e:
-            print(f"[BORE] hata: {e}")
+            if MODE == "gameserver": _unregister_from_proxy()
+        except FileNotFoundError: print("[BORE] bore bulunamadi...")
+        except Exception as e: print(f"[BORE] hata: {e}")
         time.sleep(10)
-
 
 def _register_with_proxy(bore_addr, retries=5):
     proxy_url = os.environ.get("PROXY_URL", "")
@@ -1343,17 +1237,13 @@ def _register_with_proxy(bore_addr, retries=5):
     body = json.dumps({"host": host, "port": int(port_str), "label": label}).encode()
     for attempt in range(1, retries + 1):
         try:
-            req = urllib.request.Request(
-                f"{proxy_url}/api/register", data=body,
-                headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(f"{proxy_url}/api/register", data=body, headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=10)
             print(f"[REG] Proxy kayit: {proxy_url} ({label})")
             return
         except Exception as e:
             print(f"[REG] Kayit hatasi (deneme {attempt}/{retries}): {e}")
-            if attempt < retries:
-                time.sleep(5 * attempt)
-
+            if attempt < retries: time.sleep(5 * attempt)
 
 def _unregister_from_proxy():
     proxy_url = os.environ.get("PROXY_URL", "")
@@ -1361,88 +1251,88 @@ def _unregister_from_proxy():
     label = os.environ.get("SERVER_LABEL", "GameServer")
     try:
         body = json.dumps({"label": label}).encode()
-        req  = urllib.request.Request(
-            f"{proxy_url}/api/unregister", data=body,
-            headers={"Content-Type": "application/json"})
+        req  = urllib.request.Request(f"{proxy_url}/api/unregister", data=body, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=5)
         print(f"[UNREG] Proxy kayit silindi: {label}")
-    except Exception as e:
-        print(f"[UNREG] Silme hatasi: {e}")
+    except Exception as e: print(f"[UNREG] Silme hatasi: {e}")
 
 
 # ══════════════════════════════════════════════════════════
-#  CUBERITE BASLATICI
+#  CUBERITE BASLATICI VE LOG AVCISI (PYTHON <-> LUA)
 # ══════════════════════════════════════════════════════════
 
 def run_cuberite():
     write_configs()
-
-    # Cuberite dosyasını bul
     mc_bin = next(iter(glob.glob("/server/**/Cuberite", recursive=True)), None)
-    if not mc_bin: 
-        print("[MC] HATA: Cuberite bulunamadi!")
-        return
-        
+    if not mc_bin: print("[MC] HATA: Cuberite bulunamadi!"); return
     mc_dir = str(pathlib.Path(mc_bin).parent)
     
-    # Render'ın kalıcı diski bağladığı yer ve Cuberite'ın aradığı yer
     persistent_world = "/server/world"
     target_world = f"{mc_dir}/world"
-
-    # Eğer persistent klasör bir şekilde yoksa oluştur
     pathlib.Path(persistent_world).mkdir(parents=True, exist_ok=True)
-
-    # İlk başlatma dosyası (dünyanın kurulu olduğunu belirtir)
     flag = f"{persistent_world}/.initialized"
     if not pathlib.Path(flag).exists():
         print("[MC] Ilk baslatma: dunya ayarlaniyor...")
         pathlib.Path(flag).touch()
 
-    # Eğer Cuberite alt bir klasördeyse, symlink ile kalıcı diske bağla
     if target_world != persistent_world:
         if not os.path.islink(target_world):
             import shutil
             if os.path.exists(target_world):
-                if os.path.isdir(target_world):
-                    shutil.rmtree(target_world, ignore_errors=True)
-                else:
-                    os.remove(target_world)
+                if os.path.isdir(target_world): shutil.rmtree(target_world, ignore_errors=True)
+                else: os.remove(target_world)
             try:
                 os.symlink(persistent_world, target_world)
                 print(f"[MC] Kalici disk baglandi: {target_world} -> {persistent_world}")
-            except Exception as e:
-                print(f"[MC] Disk baglama hatasi: {e}")
+            except Exception as e: print(f"[MC] Disk baglama hatasi: {e}")
 
-    # Cuberite'ı çalıştır
     os.chmod(mc_bin, 0o755)
 
-    def _pipe_output(stream, prefix="[MC]"):
-        """Cuberite stdout/stderr'ini log tamponuna aktar."""
-        try:
-            for raw in stream:
-                line = raw.rstrip() if isinstance(raw, str) else raw.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    print(f"{prefix} {line}")
-        except Exception:
-            pass
-
-    # FIFO yerine doğrudan pipe kullanımı (Deadlock çözümü)
-    tail_proc = subprocess.Popen(
-        ["tail", "-f", "/dev/null"], 
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.DEVNULL
-    )
+    def _pipe_output(stream, proc, prefix="[MC]"):
+        proxy_url = os.environ.get("PROXY_URL", "http://127.0.0.1:8080")
+        for raw in stream:
+            line = raw.rstrip() if isinstance(raw, str) else raw.decode("utf-8", "replace").rstrip()
+            if not line: continue
+            print(f"{prefix} {line}")
+            
+            # LUA "Biri girdi" dediginde -> Python dosyayi ceker, Cuberite'a 'yenile' komutu verir!
+            if "WCSYNC_JOIN:" in line:
+                def _do_join(ln):
+                    try:
+                        parts = ln.split("WCSYNC_JOIN:")[1].strip().split(":")
+                        name, uuid = parts[0], parts[1]
+                        req = urllib.request.Request(f"{proxy_url}/api/player?name={name}")
+                        resp = urllib.request.urlopen(req, timeout=5)
+                        data = resp.read()
+                        p = pathlib.Path(f"/server/world/players/{uuid}.json")
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        p.write_bytes(data)
+                        proc.stdin.write(f"wcreload {name}\n")
+                        proc.stdin.flush()
+                        print(f"[SYNC] {name} envanteri merkezden indirildi.")
+                    except Exception: pass
+                threading.Thread(target=_do_join, args=(line,), daemon=True).start()
+                
+            # LUA "Biri cikti, diske yazdim" dediginde -> Python dosyayi merkeze firlatir!
+            elif "WCSYNC_QUIT:" in line:
+                def _do_quit(ln):
+                    try:
+                        parts = ln.split("WCSYNC_QUIT:")[1].strip().split(":")
+                        name, uuid = parts[0], parts[1]
+                        p = pathlib.Path(f"/server/world/players/{uuid}.json")
+                        if p.exists():
+                            data = p.read_bytes()
+                            req = urllib.request.Request(f"{proxy_url}/api/player?name={name}", data=data, method="POST")
+                            req.add_header("Content-Type", "application/json")
+                            urllib.request.urlopen(req, timeout=5)
+                            print(f"[SYNC] {name} envanteri merkeze kaydedildi.")
+                    except Exception: pass
+                threading.Thread(target=_do_quit, args=(line,), daemon=True).start()
 
     while True:
         print(f"[MC] Cuberite baslatiliyor: {mc_bin}")
-        proc = subprocess.Popen(
-            [mc_bin], cwd=mc_dir,
-            stdin=tail_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True, bufsize=1)
-        threading.Thread(target=_pipe_output,
-                         args=(proc.stdout, "[MC]"), daemon=True).start()
+        proc = subprocess.Popen([mc_bin], cwd=mc_dir, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        threading.Thread(target=_pipe_output, args=(proc.stdout, proc, "[MC]"), daemon=True).start()
         ret = proc.wait()
         print(f"[MC] Cuberite kapandi (kod={ret}), 5sn sonra yeniden baslatiliyor...")
         time.sleep(5)
@@ -1454,12 +1344,10 @@ def run_cuberite():
 
 async def run_proxy_async():
     pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
-    if not pathlib.Path(BACKENDS_FILE).exists():
-        save_backends([])
+    if not pathlib.Path(BACKENDS_FILE).exists(): save_backends([])
     server = await asyncio.start_server(handle_player, "0.0.0.0", MC_PORT, limit=2**20)
     print(f"[PROXY] Port {MC_PORT} - Cross-server entity sync + PvP AKTIF")
-    async with server:
-        await server.serve_forever()
+    async with server: await server.serve_forever()
 
 
 # ══════════════════════════════════════════════════════════
@@ -1474,8 +1362,7 @@ def main():
 |  Cross-server: Entity + PvP + Chat + Blok        |
 +--------------------------------------------------+""")
 
-    if MODE == "config":
-        write_configs(); return
+    if MODE == "config": write_configs(); return
 
     threading.Thread(target=run_http, daemon=True).start()
 
@@ -1483,25 +1370,16 @@ def main():
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
         threading.Thread(target=_health_check_loop, daemon=True).start()
         asyncio.run(run_proxy_async())
-
     elif MODE == "gameserver":
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
         run_cuberite()
-
     elif MODE == "all":
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
         threading.Thread(target=run_cuberite, daemon=True).start()
         time.sleep(3)
         save_backends([{"host": "127.0.0.1", "port": MC_PORT, "label": "LocalCuberite"}])
         asyncio.run(run_proxy_async())
+    elif MODE == "http": run_http()
+    else: print(f"Bilinmeyen mod: {MODE}"); sys.exit(1)
 
-    elif MODE == "http":
-        run_http()
-
-    else:
-        print(f"Bilinmeyen mod: {MODE}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
