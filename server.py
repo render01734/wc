@@ -17,6 +17,8 @@ import pathlib
 
 SETTINGS_INI = """
 [Authentication]
+# Cuberite'de offline mod için doğru anahtar: Authenticate=0
+Authenticate=0
 OnlineMode=0
 ServerID=CuberiteServer
 PlayerRestrictIP=0
