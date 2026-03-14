@@ -771,28 +771,26 @@ class PlayerConn:
         async with _active_lock:
             if self in _active:
                 _active.remove(self)
-                print(f"[QUIT] {self.username} ({len(_active)} aktif)")
+                # Sadece gerçek isimle girenlerin QUIT mesajını bas (pingleri yoksay)
+                if self.username != "?":
+                    print(f"[QUIT] {self.username} ({len(_active)} aktif)")
         for w in (self.client_w, self.server_w):
             if w:
                 try: w.close()
                 except Exception: pass
 
-async def run(self):
+    async def run(self):
         b = pick_backend()
         if not b:
-            # Sadece ping atan servislere backend yok hatasi basma
+            # Sadece ping atan servislere "backend yok" hatasi basma sessizce kapat
             self.client_w.close(); return
-        
         try:
             await self.connect_backend(b)
         except Exception as e:
             self.client_w.close(); return
-            
         async with _active_lock:
             _active.append(self)
-            
-        # [CONN] ve [QUIT] loglarını kaldırdık, sadece [JOIN] ile 
-        # yani oyuncu ismini girdikten sonra log basacak
+        # [CONN] spam'ini engellemek için buradan kaldırdık
         await asyncio.gather(self.pipe_s2c(), self.pipe_c2s())
 
 
@@ -1077,14 +1075,15 @@ class _H(http.server.BaseHTTPRequestHandler):
                 self.end_headers(); self.wfile.write(body)
                 return
 
-# Eğer mod gameserver ise HTML yerine JSON bas
+            # Eger mod gameserver ise HTML paneli yerine sadece JSON bas
             if MODE != "proxy":
                 payload = {"status": "active", "mode": MODE}
                 body = json.dumps(payload).encode()
                 self.send_response(200)
                 self.send_header("Content-Type",   "application/json")
                 self.send_header("Content-Length", str(len(body)))
-                self.end_headers(); self.wfile.write(body)
+                self.end_headers()
+                self.wfile.write(body)
                 return
 
             body = _build_html().encode()
