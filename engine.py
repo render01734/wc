@@ -5,7 +5,7 @@
   • MC 1.8 offline protokol MITM (şifresiz → tam kontrol)
   • Cross-server entity sync (PvP, Chat, Blok)
   • Anti-Dupe: 10 Saniyede Bir Otomatik Kayıt
-  • Stabilizasyon: Race Condition, Drain Lock ve RAM Sızıntı korumaları
+  • Stabilizasyon: Port Kurtarma (SO_REUSEPORT), Drain Lock ve RAM Sızıntı koruması
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -69,8 +69,7 @@ if "wc-yccy" in os.environ.get("RENDER_EXTERNAL_HOSTNAME", ""):
 HTTP_PORT     = int(os.environ.get("PORT", 8080))
 MC_PORT       = int(os.environ.get("MC_PORT", 25565))
 
-# DÜZELTME: 'all' modunda Cuberite ve Proxy çakışmasını engellemek için
-# Cuberite portu 25566 yapıldı. Proxy ana portta (25565) kalmaya devam eder.
+# ALL modunda Cuberite'in Proxy ile port çakışması yapmasını engeller
 CUBERITE_PORT = 25566 if MODE == "all" else MC_PORT
 
 DATA_DIR      = os.environ.get("DATA_DIR", "/data")
@@ -81,7 +80,6 @@ BACKENDS_FILE = f"{DATA_DIR}/backends.json"
 
 _current_bore_addr = None
 
-# SETTINGS_INI artık CUBERITE_PORT değerini dinamik olarak kullanıyor
 SETTINGS_INI = f"""
 [Authentication]
 Authenticate=0
@@ -782,7 +780,6 @@ class PlayerConn:
                 n_players = sum(1 for c in list(_active) if c.username != "?")
                 n_backends = len(load_backends())
 
-                # DÜZELTME: Ping uyumluluğu için istemci versiyonu yansıtılıyor
                 status_json = json.dumps({
                     "version":     {"name": "1.8.x", "protocol": _proto},
                     "players":     {"max": 999, "online": n_players, "sample": []},
@@ -999,7 +996,7 @@ HTML = """\
         <button class="flt on" data-f="">TÜMÜ</button>
         <button class="flt" data-f="ERR">HATA</button>
         <button class="flt" data-f="WARN">UYARI</button>
-        <button class="flt" data-f="CONN,JOIN,QUIT,SYNC">OYOYUNCU</button>
+        <button class="flt" data-f="CONN,JOIN,QUIT,SYNC">OYUNCU</button>
         <button class="flt" data-f="BORE,REG">TUNNEL</button>
         <button class="flt" data-f="MC">MC</button>
         <button class="clr" id="clrBtn">TEMİZLE</button>
@@ -1246,10 +1243,18 @@ class _H(http.server.BaseHTTPRequestHandler):
     def handle_error(self, request, client_address): pass
     def log_message(self, *_): pass
 
+# STABILIZASYON: HTTP server hata verse bile zorla portu devralir
 def run_http():
-    srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _H)
-    print(f"[HTTP] Port {HTTP_PORT}")
-    srv.serve_forever()
+    http.server.ThreadingHTTPServer.allow_reuse_address = True
+    for attempt in range(15):
+        try:
+            srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _H)
+            print(f"[HTTP] Port {HTTP_PORT} aktif.")
+            srv.serve_forever()
+            break
+        except OSError as e:
+            print(f"[HTTP] Port {HTTP_PORT} mesgul, deneniyor... ({attempt+1}/15)")
+            time.sleep(2)
 
 def _health_check_loop():
     import socket
@@ -1461,12 +1466,30 @@ def run_cuberite():
 #  ASYNC PROXY
 # ══════════════════════════════════════════════════════════
 
+# STABILIZASYON: Proxy hata verse bile zorla portu devralir ve cokmesini engeller
 async def run_proxy_async():
     pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     if not pathlib.Path(BACKENDS_FILE).exists(): save_backends([])
-    server = await asyncio.start_server(handle_player, "0.0.0.0", MC_PORT, limit=2**20)
+    
+    server = None
+    for attempt in range(15):
+        try:
+            server = await asyncio.start_server(
+                handle_player, "0.0.0.0", MC_PORT, 
+                limit=2**20, reuse_address=True, reuse_port=True
+            )
+            break
+        except OSError as e:
+            print(f"[PROXY] Port {MC_PORT} asili kalmis, zorla alinmaya calisiliyor... ({attempt+1}/15)")
+            await asyncio.sleep(2)
+            
+    if not server:
+        print(f"[PROXY] KRITIK HATA: {MC_PORT} portu baglanamadi, Render aginda bir sorun olabilir.")
+        return
+        
     print(f"[PROXY] Port {MC_PORT} - Cross-server entity sync + PvP AKTIF")
-    async with server: await server.serve_forever()
+    async with server: 
+        await server.serve_forever()
 
 # ══════════════════════════════════════════════════════════
 #  MAIN
@@ -1503,7 +1526,6 @@ def main():
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
         threading.Thread(target=run_cuberite, daemon=True).start()
         time.sleep(3)
-        # DÜZELTME: Proxy'ye kaydederken yeni Cuberite portunu kullan
         save_backends([{"host": "127.0.0.1", "port": CUBERITE_PORT, "label": "LocalCuberite"}])
         asyncio.run(run_proxy_async())
     elif MODE == "http": run_http()
