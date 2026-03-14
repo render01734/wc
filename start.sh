@@ -12,7 +12,7 @@ else
     export DATA_DIR="${DATA_DIR:-/server/world}"
 
     # Ana proxy — sabit, değişmez
-    export PROXY_URL="https://wc-tsgd.onrender.com"
+    export PROXY_URL="https://wc-yccy.onrender.com"
 
     # Etiket: hostname'den otomatik üret (her Render servisi unique hostname alır)
     export SERVER_LABEL="${SERVER_LABEL:-$(hostname)}"
