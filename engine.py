@@ -999,22 +999,44 @@ def _unregister_from_proxy():
 
 def run_cuberite():
     write_configs()
-    flag = "/server/world/.initialized"
-    if not pathlib.Path(flag).exists():
-        for wp in ["/server/world", "/server/Server/world"]:
-            if pathlib.Path(wp).exists():
-                import shutil
-                for sub in ["regions", "nether", "end"]:
-                    shutil.rmtree(f"{wp}/{sub}", ignore_errors=True)
-                for f in glob.glob(f"{wp}/*.mca") + glob.glob(f"{wp}/*.mcr"):
-                    pathlib.Path(f).unlink(missing_ok=True)
-        pathlib.Path("/server/world").mkdir(parents=True, exist_ok=True)
-        pathlib.Path(flag).touch()
-        print("[MC] Ilk baslatma: eski dunya temizlendi.")
 
+    # Cuberite dosyasını bul
     mc_bin = next(iter(glob.glob("/server/**/Cuberite", recursive=True)), None)
-    if not mc_bin: print("[MC] HATA: Cuberite bulunamadi!"); return
+    if not mc_bin: 
+        print("[MC] HATA: Cuberite bulunamadi!")
+        return
+        
     mc_dir = str(pathlib.Path(mc_bin).parent)
+    
+    # Render'ın kalıcı diski bağladığı yer ve Cuberite'ın aradığı yer
+    persistent_world = "/server/world"
+    target_world = f"{mc_dir}/world"
+
+    # Eğer persistent klasör bir şekilde yoksa oluştur
+    pathlib.Path(persistent_world).mkdir(parents=True, exist_ok=True)
+
+    # İlk başlatma dosyası (dünyanın kurulu olduğunu belirtir)
+    flag = f"{persistent_world}/.initialized"
+    if not pathlib.Path(flag).exists():
+        print("[MC] Ilk baslatma: dunya ayarlaniyor...")
+        pathlib.Path(flag).touch()
+
+    # Eğer Cuberite alt bir klasördeyse, symlink ile kalıcı diske bağla
+    if target_world != persistent_world:
+        if not os.path.islink(target_world):
+            import shutil
+            if os.path.exists(target_world):
+                if os.path.isdir(target_world):
+                    shutil.rmtree(target_world, ignore_errors=True)
+                else:
+                    os.remove(target_world)
+            try:
+                os.symlink(persistent_world, target_world)
+                print(f"[MC] Kalici disk baglandi: {target_world} -> {persistent_world}")
+            except Exception as e:
+                print(f"[MC] Disk baglama hatasi: {e}")
+
+    # Cuberite'ı çalıştır
     os.chmod(mc_bin, 0o755)
     fifo = "/tmp/mc_stdin"
     pathlib.Path(fifo).unlink(missing_ok=True)
