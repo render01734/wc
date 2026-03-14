@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-⛏️  Minecraft Distributed World Engine  —  Tek Dosya
+⛏️  Minecraft Distributed World Engine  —  Tek Dosya (MAX OPTIMIZATION)
 ═══════════════════════════════════════════════════════════
   • MC 1.8 offline protokol MITM (şifresiz → tam kontrol)
   • Cross-server entity sync (PvP, Chat, Blok)
-  • Merkezi Envanter: Python Log Avcısı + Cuberite Stdin
   • Anti-Dupe: 10 Saniyede Bir Otomatik Kayıt
-  • Akıllı Failover: Uyuyan sunuculari pingler ve uyandirir
+  • MAX PERFORMANCE: ViewDistance=4, Network Threshold Tweak
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -19,7 +18,7 @@ import datetime
 #  CANLI LOG TAMPONU  (SSE konsolu için)
 # ══════════════════════════════════════════════════════════
 
-_LOG_BUF     = deque(maxlen=500)
+_LOG_BUF     = deque(maxlen=300) # RAM tasarrufu için 500'den 300'e çekildi
 _LOG_LOCK    = threading.Lock()
 _SSE_CLIENTS = []
 _SSE_LOCK    = threading.Lock()
@@ -72,6 +71,7 @@ BORE_FILE     = "/tmp/bore_address.txt"
 STATE_FILE    = f"{DATA_DIR}/world_state.json"
 BACKENDS_FILE = f"{DATA_DIR}/backends.json"
 
+# OPTİMİZASYON: NetworkCompressionThreshold 256'ya çekildi, gereksiz işlemci yükü azaltıldı.
 SETTINGS_INI = """
 [Authentication]
 Authenticate=0
@@ -86,8 +86,7 @@ Plugin=WCSync
 Description=Distributed World Engine
 MaxPlayers=999
 Ports=25565
-ResourcePackUrl=
-ResourcePackHash=
+NetworkCompressionThreshold=256 
 
 [Worlds]
 DefaultWorld=world
@@ -105,13 +104,11 @@ DbFile=Ranking.sqlite
 
 [RCON]
 Enabled=0
-
-[SlowSQL]
-LogSlowQueries=0
 """.strip()
 
 WEBADMIN_INI = "[WebAdmin]\nEnabled=0\nPort=8081"
 
+# OPTİMİZASYON: MaxViewDistance 4 yapıldı. Render 512MB RAM'de devasa fark yaratır!
 WORLD_INI = """
 [General]
 Gamemode=1
@@ -124,7 +121,7 @@ CommandBlocksEnabled=0
 UseChatPrefixes=1
 
 [SpawnPosition]
-MaxViewDistance=10
+MaxViewDistance=4 
 X=0
 Y=5
 Z=0
@@ -188,7 +185,7 @@ function Initialize(Plugin)
     -- Anti-Dupe: Her 10 saniyede bir tum oyunculari diske yaz
     cRoot:Get():GetDefaultWorld():ScheduleTask(200, PeriodicSave)
     
-    LOG("[SYNC] WCSync aktif! Anti-Dupe periyodik kayit devrede.")
+    LOG("[SYNC] WCSync aktif! Anti-Dupe devrede.")
     return true
 end
 
@@ -946,7 +943,7 @@ HTML = """\
   document.getElementById('clrBtn').addEventListener('click',()=>{{con.innerHTML='';allLines=[];}});
   function addLine(e){{
     allLines.push(e);
-    if(allLines.length>600){{allLines.shift();const f=con.querySelector('.ll');if(f)f.remove();}}
+    if(allLines.length>300){{allLines.shift();const f=con.querySelector('.ll');if(f)f.remove();}}
     const el=renderLine(e);
     const f=activeFilter;
     if(f&&!f.split(',').some(k=>e.msg.includes('['+k+']')))el.style.display='none';
@@ -1285,7 +1282,6 @@ def run_cuberite():
             if not line: continue
             print(f"{prefix} {line}")
             
-            # --- 1. GİRİŞ (Dosya indirme işlemi) ---
             if "WCSYNC_JOIN:" in line:
                 def _do_join(ln):
                     try:
@@ -1314,11 +1310,10 @@ def run_cuberite():
 
                 threading.Thread(target=_do_join, args=(line,), daemon=True).start()
                 
-            # --- 2. ÇIKIŞ & PERİYODİK KAYIT (Merkeze veri gönderme) ---
             elif "WCSYNC_QUIT:" in line or "WCSYNC_SAVE:" in line:
                 def _do_upload(ln):
                     try:
-                        time.sleep(1.5) # Diske yazma payı (Race Condition onleyici)
+                        time.sleep(1.5) 
                         
                         tag = "WCSYNC_QUIT:" if "WCSYNC_QUIT:" in ln else "WCSYNC_SAVE:"
                         parts = ln.split(tag)[1].strip().split(":")
@@ -1335,8 +1330,6 @@ def run_cuberite():
                             req.add_header("Content-Type", "application/json")
                             urllib.request.urlopen(req, timeout=5)
                             
-                            # Log kirliligi yapmamasi adina periyodik save'leri yazdirmayabiliriz. 
-                            # Cikis yapildiginda loga mutlaka basilir.
                             if "QUIT" in tag:
                                 print(f"[SYNC] {name} envanteri merkeze kaydedildi. ({target_p.name})")
                         else:
