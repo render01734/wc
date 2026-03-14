@@ -1299,11 +1299,6 @@ def run_cuberite():
 
     # Cuberite'ı çalıştır
     os.chmod(mc_bin, 0o755)
-    fifo = "/tmp/mc_stdin"
-    pathlib.Path(fifo).unlink(missing_ok=True)
-    os.mkfifo(fifo)
-    subprocess.Popen(["tail", "-f", "/dev/null"],
-                     stdout=open(fifo, "wb"), stderr=subprocess.DEVNULL)
 
     def _pipe_output(stream, prefix="[MC]"):
         """Cuberite stdout/stderr'ini log tamponuna aktar."""
@@ -1315,11 +1310,18 @@ def run_cuberite():
         except Exception:
             pass
 
+    # FIFO yerine doğrudan pipe kullanımı (Deadlock çözümü)
+    tail_proc = subprocess.Popen(
+        ["tail", "-f", "/dev/null"], 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.DEVNULL
+    )
+
     while True:
         print(f"[MC] Cuberite baslatiliyor: {mc_bin}")
         proc = subprocess.Popen(
             [mc_bin], cwd=mc_dir,
-            stdin=open(fifo, "rb"),
+            stdin=tail_proc.stdout,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True, bufsize=1)
