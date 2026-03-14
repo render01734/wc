@@ -777,19 +777,22 @@ class PlayerConn:
                 try: w.close()
                 except Exception: pass
 
-    async def run(self):
+async def run(self):
         b = pick_backend()
         if not b:
-            print(f"[WARN] Backend yok! {self.peer}")
+            # Sadece ping atan servislere backend yok hatasi basma
             self.client_w.close(); return
+        
         try:
             await self.connect_backend(b)
         except Exception as e:
-            print(f"[ERR] Backend: {e}")
             self.client_w.close(); return
+            
         async with _active_lock:
             _active.append(self)
-        print(f"[CONN] {self.peer} -> {b['host']}:{b['port']} ({len(_active)} aktif)")
+            
+        # [CONN] ve [QUIT] loglarını kaldırdık, sadece [JOIN] ile 
+        # yani oyuncu ismini girdikten sonra log basacak
         await asyncio.gather(self.pipe_s2c(), self.pipe_c2s())
 
 
@@ -1067,6 +1070,16 @@ class _H(http.server.BaseHTTPRequestHandler):
                     "addr":       bore or "",
                     "table_rows": rows,
                 }
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type",   "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+                return
+
+# Eğer mod gameserver ise HTML yerine JSON bas
+            if MODE != "proxy":
+                payload = {"status": "active", "mode": MODE}
                 body = json.dumps(payload).encode()
                 self.send_response(200)
                 self.send_header("Content-Type",   "application/json")
