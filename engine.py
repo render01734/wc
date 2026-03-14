@@ -68,6 +68,11 @@ if "wc-yccy" in os.environ.get("RENDER_EXTERNAL_HOSTNAME", ""):
 
 HTTP_PORT     = int(os.environ.get("PORT", 8080))
 MC_PORT       = int(os.environ.get("MC_PORT", 25565))
+
+# DÜZELTME: 'all' modunda Cuberite ve Proxy çakışmasını engellemek için
+# Cuberite portu 25566 yapıldı. Proxy ana portta (25565) kalmaya devam eder.
+CUBERITE_PORT = 25566 if MODE == "all" else MC_PORT
+
 DATA_DIR      = os.environ.get("DATA_DIR", "/data")
 SERVER_DIR    = os.environ.get("SERVER_DIR", "/server")
 BORE_FILE     = "/tmp/bore_address.txt"
@@ -76,7 +81,8 @@ BACKENDS_FILE = f"{DATA_DIR}/backends.json"
 
 _current_bore_addr = None
 
-SETTINGS_INI = """
+# SETTINGS_INI artık CUBERITE_PORT değerini dinamik olarak kullanıyor
+SETTINGS_INI = f"""
 [Authentication]
 Authenticate=0
 OnlineMode=0
@@ -89,7 +95,7 @@ Plugin=WCSync
 [Server]
 Description=Distributed World Engine
 MaxPlayers=999
-Ports=25565
+Ports={CUBERITE_PORT}
 NetworkCompressionThreshold=256 
 
 [Worlds]
@@ -359,7 +365,6 @@ class WorldState:
             if bid == 0: self.blocks.pop(key, None)
             else:        
                 self.blocks[key] = bid
-                # STABILIZASYON 3: Memory Leak Koruması (Aşırı RAM tüketimini engeller)
                 if len(self.blocks) > 50000: 
                     self.blocks.pop(next(iter(self.blocks)))
         self._save()
@@ -516,7 +521,6 @@ def _cross_peers(conn):
     return [c for c in snap if c is not conn and c.play_state and c.cs_info is not None and 
            (c.backend_host != conn.backend_host or c.backend_port != conn.backend_port)]
 
-# STABILIZASYON 1: "await drain()" çakışmaları engellendi. (Fire-and-forget writes)
 async def bcast_spawn(new_conn, info):
     peers = _cross_peers(new_conn)
     for c in peers:
@@ -736,7 +740,6 @@ class PlayerConn:
             except Exception: pass
 
     async def _cleanup(self):
-        # STABILIZASYON 2: Race Condition (Hayalet Oyuncu) Koruması
         if self.cs_info:
             info_snapshot = self.cs_info
             peers_snapshot = _cross_peers(self)
@@ -779,8 +782,9 @@ class PlayerConn:
                 n_players = sum(1 for c in list(_active) if c.username != "?")
                 n_backends = len(load_backends())
 
+                # DÜZELTME: Ping uyumluluğu için istemci versiyonu yansıtılıyor
                 status_json = json.dumps({
-                    "version":     {"name": "1.8.9", "protocol": 47},
+                    "version":     {"name": "1.8.x", "protocol": _proto},
                     "players":     {"max": 999, "online": n_players, "sample": []},
                     "description": {"text": f"\u00a7aWC-Engine \u00a77\u2503 \u00a7e{n_backends} sunucu \u00a77| \u00a7f{n_players} oyuncu"}
                 })
@@ -995,7 +999,7 @@ HTML = """\
         <button class="flt on" data-f="">TÜMÜ</button>
         <button class="flt" data-f="ERR">HATA</button>
         <button class="flt" data-f="WARN">UYARI</button>
-        <button class="flt" data-f="CONN,JOIN,QUIT,SYNC">OYUNCU</button>
+        <button class="flt" data-f="CONN,JOIN,QUIT,SYNC">OYOYUNCU</button>
         <button class="flt" data-f="BORE,REG">TUNNEL</button>
         <button class="flt" data-f="MC">MC</button>
         <button class="clr" id="clrBtn">TEMİZLE</button>
@@ -1499,7 +1503,8 @@ def main():
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
         threading.Thread(target=run_cuberite, daemon=True).start()
         time.sleep(3)
-        save_backends([{"host": "127.0.0.1", "port": MC_PORT, "label": "LocalCuberite"}])
+        # DÜZELTME: Proxy'ye kaydederken yeni Cuberite portunu kullan
+        save_backends([{"host": "127.0.0.1", "port": CUBERITE_PORT, "label": "LocalCuberite"}])
         asyncio.run(run_proxy_async())
     elif MODE == "http": run_http()
     else: print(f"Bilinmeyen mod: {MODE}"); sys.exit(1)
