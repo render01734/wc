@@ -2,9 +2,9 @@
 # Otomatik başlatıcı — Render hostname'e göre otomatik mod seçer
 
 if [[ "$RENDER_EXTERNAL_HOSTNAME" == *"wc-yccy"* ]]; then
-    export ENGINE_MODE="proxy"
+    export ENGINE_MODE="all" # <-- BURASI DEĞİŞTİ (proxy -> all)
     export DATA_DIR="/data"
-    echo "[START] Otomatik Proxy modu algilandi: $RENDER_EXTERNAL_HOSTNAME"
+    echo "[START] Otomatik ALL modu algilandi: $RENDER_EXTERNAL_HOSTNAME"
 else
     export ENGINE_MODE="gameserver"
     export SERVER_DIR="/server"
