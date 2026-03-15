@@ -3,8 +3,8 @@
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
   • FIX: Cuberite Loglari terminalde gorunur
-  • FIX: /hub komutu icin Yetki Bypass (HOOK) sistemi eklendi (%100 calisir)
-  • FIX: Render API zaman asimi 15 saniyeye yukseltildi
+  • FIX: /hub komutu icin Yetki Engeli kaldirildi (Bos Permission sistemi)
+  • FIX: Lua OpenGUI cökmelerine karsi Hata Yakalayici (pcall) eklendi
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -141,29 +141,35 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("WCHub")
-    Plugin:SetVersion(7)
+    Plugin:SetVersion(8)
     
-    -- BindCommand yerine garanti olan Hook (Kanca) yontemini kullaniyoruz
-    cPluginManager:AddHook(cPluginManager.HOOK_EXECUTE_COMMAND, OnCommand)
+    -- Bos string ("") yetki (permission) kisitlamasini tamamen kaldirir. Herkes kullanabilir.
+    cPluginManager:BindCommand("/hub", "", HandleHubCommand, "Sunucu secici menusunu acar.")
+    cPluginManager:BindCommand("/sunucu", "", HandleHubCommand, "Sunucu secici menusunu acar.")
     
-    LOG("[HUB] WCHub kanca (hook) moduna gecti! /hub veya /sunucu yazilabilir.")
+    LOG("[HUB] WCHub komutlari yetkisiz erisime acildi (Bos Perm)!")
     return true
 end
 
-function OnCommand(Player, CommandSplit, EntireCommand)
-    local cmd = string.lower(CommandSplit[1] or "")
-    if cmd == "/hub" or cmd == "/sunucu" then
+function HandleHubCommand(Split, Player)
+    -- Hata yakalayici: Eger GUI acilirken cokerse, sunucu log atar ama oyuncu 'unknown command' hatasi gormez.
+    local isSuccess, err = pcall(function()
         OpenGUI(Player)
-        return true -- Sunucuya 'Unknown command' hatasi verdirmeden komutu yutar
+    end)
+    
+    if not isSuccess then
+        LOGWARNING("[WCHub] OpenGUI fonksiyonu coktu: " .. tostring(err))
+        Player:SendMessageFailure("§cGUI tetiklenirken ic sistem hatasi olustu. Yoneticiye bildirin.")
     end
-    return false
+    
+    return true
 end
 
 function OpenGUI(Player)
     local PlayerName = Player:GetName()
     local World = Player:GetWorld()
     
-    LOG("[WCHub] " .. PlayerName .. " GUI'yi tetikledi. API istegi atiliyor...")
+    LOG("[WCHub] " .. PlayerName .. " komutu kullandi. API istegi atiliyor...")
 
     if type(cUrlClient) == "nil" then
         LOGWARNING("[WCHub] cUrlClient API'si bulunamadi! HTTP destegi yok.")
