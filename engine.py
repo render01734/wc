@@ -2,8 +2,8 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • FIX: Kurt (/kurt) sistemi icin Ultra-Zirhli Hata Ayiklama
-  • FIX: Lua cokmeleri dogrudan oyuncu chat'ine yansitilacak
+  • FIX: Kurt (/kurt) sistemi icin Hata Ayiklama (Saf Obje Modu)
+  • FIX: eMonsterType type-casting hatasi giderildi
   • WEB: Canli Konsol (Terminal) aktif.
   • GUI: Saf Sohbet UI & Hub Menüsü devrede.
 """
@@ -204,7 +204,7 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("yaver")
-    Plugin:SetVersion(5)
+    Plugin:SetVersion(6)
     
     Ini = cIniFile()
     Ini:ReadFile("YaverData.ini")
@@ -218,7 +218,7 @@ function Initialize(Plugin)
     cPluginManager:BindCommand("/kurt", "", HandleKurtCommand, "Koruyucu kurdunu yanina cagirir.")
     
     cRoot:Get():GetDefaultWorld():ScheduleTask(20 * 3, PeriodicWolfTask)
-    LOG("[YAVER] Ultra Zirhli Koruyucu Kurt sistemi aktif!")
+    LOG("[YAVER] Ultra Zirhli Koruyucu Kurt sistemi aktif (Saf Obje Modu)!")
     return true
 end
 
@@ -294,14 +294,19 @@ function SpawnWolfForPlayer(Player)
         pcall(function() World:DoWithEntityByID(ActiveWolves[UUID], function(Ent) Ent:Destroy() end) end)
     end
     
-    -- Geriye donuk uyumluluk icin type id (95 = Wolf)
-    local WolfType = cMonster.mtWolf or 95 
-    local WolfID = World:SpawnMob(Player:GetPosX(), Player:GetPosY() + 1.0, Player:GetPosZ(), WolfType)
+    local WolfID = cEntity.INVALID_ID
+    local isSuccess, err = pcall(function()
+        -- Hatanin kaynagi olan (or 95) tamamen kaldirildi! Sadece obje kaldi.
+        WolfID = World:SpawnMob(Player:GetPosX(), Player:GetPosY() + 1.0, Player:GetPosZ(), cMonster.mtWolf)
+    end)
     
-    if WolfID and WolfID > 0 then
+    if not isSuccess then
+        error("SpawnMob motor tarafindan reddedildi: " .. tostring(err))
+    end
+    
+    if WolfID ~= cEntity.INVALID_ID then
         ActiveWolves[UUID] = WolfID
         World:DoWithEntityByID(WolfID, function(Ent)
-            -- Her bir ozelligi ayri pcall icine aldik ki biri cokerse digeri calismaya devam etsin!
             local lvl = GetWolfLevel(UUID)
             
             pcall(function() Ent:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+Tık)") end)
@@ -322,11 +327,11 @@ function SpawnWolfForPlayer(Player)
             end)
         end)
     else
-        error("SpawnMob komutu " .. tostring(WolfID) .. " dondurdu. (Oyun motoru canavar uretmeyi reddetti)")
+        error("SpawnMob calisti ama INVALID_ID dondurdu. (Oyun motoru kurt uretemiyor)")
     end
 end
 
--- MANUEL KURT CAGIRMA KOMUTU (TAM KORUMALI VE HATA RAPORLAYICI)
+-- MANUEL KURT CAGIRMA KOMUTU
 function HandleKurtCommand(Split, Player)
     local isSuccess, err = pcall(function()
         local UUID = Player:GetUUID()
@@ -341,9 +346,8 @@ function HandleKurtCommand(Split, Player)
         end
     end)
     
-    -- Eger bir hata olursa OYUNCU CHATINE DIREKT YAZDIRIYORUZ!
     if not isSuccess then
-        Player:SendMessageFailure("§c[LUA HATASI DETAYI] -> " .. tostring(err))
+        Player:SendMessageFailure("§c[SISTEM HATASI] -> " .. tostring(err))
         LOGWARNING("[YAVER] /kurt Hata: " .. tostring(err))
     end
     return true
@@ -371,7 +375,7 @@ end
 -- ================= Etkilesim =================
 function OnRightClickingEntity(Player, Entity)
     local isSuccess, err = pcall(function()
-        if Entity:IsMob() and Entity:GetMobType() == (cMonster.mtWolf or 95) then
+        if Entity:IsMob() and Entity:GetMobType() == cMonster.mtWolf then
             local UUID = Player:GetUUID()
             if ActiveWolves[UUID] == Entity:GetUniqueID() then
                 if Player:IsCrouched() then
@@ -396,7 +400,7 @@ function OnRightClickingEntity(Player, Entity)
             end
         end
     end)
-    if not isSuccess then Player:SendMessageFailure("§c[LUA TIKLAMA HATASI] " .. tostring(err)) end
+    if not isSuccess then Player:SendMessageFailure("§c[TIKLAMA HATASI] " .. tostring(err)) end
     return false
 end
 
@@ -405,7 +409,7 @@ function OnTakeDamage(Receiver, TCA)
     pcall(function()
         local Attacker = TCA.Attacker
         if not Attacker then return end
-        if Attacker:IsMob() and Attacker:GetMobType() == (cMonster.mtWolf or 95) then
+        if Attacker:IsMob() and Attacker:GetMobType() == cMonster.mtWolf then
             for uuid, wid in pairs(ActiveWolves) do
                 if wid == Attacker:GetUniqueID() then
                     local lvl = GetWolfLevel(uuid)
@@ -432,7 +436,7 @@ end
 function OnKilled(Victim, TCA, CustomDeathMessage)
     pcall(function()
         local Attacker = TCA.Attacker
-        if Victim:IsMob() and Victim:GetMobType() == (cMonster.mtWolf or 95) then
+        if Victim:IsMob() and Victim:GetMobType() == cMonster.mtWolf then
             for uuid, wid in pairs(ActiveWolves) do
                 if wid == Victim:GetUniqueID() then
                     ActiveWolves[uuid] = nil
@@ -487,7 +491,7 @@ def write_configs(server_dir=SERVER_DIR):
         f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
         f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="5"}',
         f"{server_dir}/Plugins/WCHub/main.lua": _make_wchub_lua(HTTP_PORT).strip(),
-        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="5"}',
+        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="6"}',
         f"{server_dir}/Plugins/yaver/main.lua": YAVER_MAIN.strip(),
     }
     for path, content in files.items():
