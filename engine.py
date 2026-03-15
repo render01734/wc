@@ -191,39 +191,65 @@ function OnRightClick(Player, ...)
 end
 
 function OpenGUI(Player)
-    cNetwork:Get(ProxyURL .. "/api/servers", function(Body, Data)
-        if Body and Body ~= "" then
-            local Window = cLuaWindow(cWindow.wtChest, 3, "§8Sunucu Agi")
-            local servers = Split(Body, ";")
-            
-            for i, srv in ipairs(servers) do
-                local parts = Split(srv, ":")
-                if #parts == 2 then
-                    local item = cItem(E_ITEM_STAINED_GLASS_PANE, 1, 5)
-                    item.m_CustomName = "§a" .. parts[1]
-                    item.m_Lore = "§7Aktif Oyuncu: §e" .. parts[2] .. "|§8Tikla ve baglan!"
-                    Window:SetSlot(Player, i - 1, item)
+    -- cNetwork:Get Cuberite'de YOKTUR; dogru API cUrlClient:Get'tir.
+    -- Callback farkli bir thread'den gelir, bu yuzden Cuberite API'sini
+    -- kullanmadan once ScheduleTask ile ana thread'e donmek zorunludur.
+    local PlayerName = Player:GetName()
+    local World = Player:GetWorld()
+
+    cUrlClient:Get(ProxyURL .. "/api/servers", {
+        OnSuccess = function(Body, DataCallbacks)
+            -- Ana thread'e don (thread-safe)
+            World:ScheduleTask(0, function()
+                -- Player referansini yeniden bul (kopuk referans olusmasin)
+                local TargetPlayer = nil
+                cRoot:Get():FindAndDoWithPlayer(PlayerName, function(P)
+                    TargetPlayer = P
+                end)
+                if not TargetPlayer then return end
+
+                if not Body or Body == "" then
+                    TargetPlayer:SendMessageFailure("§cSunucu listesi bos geldi.")
+                    return
                 end
-            end
-            
-            Window:SetOnClicked(function(a_Window, a_Player, a_SlotNum, a_ClickAction, a_ClickedItem)
-                if a_SlotNum >= 0 and a_SlotNum < 27 then
-                    if a_ClickedItem.m_ItemType ~= E_ITEM_EMPTY then
-                        local target = string.sub(a_ClickedItem.m_CustomName, 3)
-                        a_Player:SendMessageSuccess("§a" .. target .. " sunucusuna baglaniliyor...")
-                        a_Player:ExecuteCommand("/wc_transfer " .. target)
-                        a_Window:Close(a_Player)
+
+                local Window = cLuaWindow(cWindow.wtChest, 3, "§8Sunucu Agi")
+                local servers = Split(Body, ";")
+
+                for i, srv in ipairs(servers) do
+                    local parts = Split(srv, ":")
+                    if #parts == 2 then
+                        local item = cItem(E_ITEM_STAINED_GLASS_PANE, 1, 5)
+                        item.m_CustomName = "§a" .. parts[1]
+                        item.m_Lore = "§7Aktif Oyuncu: §e" .. parts[2] .. "|§8Tikla ve baglan!"
+                        Window:SetSlot(TargetPlayer, i - 1, item)
                     end
-                    return true
                 end
-                return false
+
+                Window:SetOnClicked(function(a_Window, a_Player, a_SlotNum, a_ClickAction, a_ClickedItem)
+                    if a_SlotNum >= 0 and a_SlotNum < 27 then
+                        if a_ClickedItem.m_ItemType ~= E_ITEM_EMPTY then
+                            local target = string.sub(a_ClickedItem.m_CustomName, 3)
+                            a_Player:SendMessageSuccess("§a" .. target .. " sunucusuna baglaniliyor...")
+                            a_Player:ExecuteCommand("/wc_transfer " .. target)
+                            a_Window:Close(a_Player)
+                        end
+                        return true
+                    end
+                    return false
+                end)
+
+                TargetPlayer:OpenWindow(Window)
             end)
-            
-            Player:OpenWindow(Window)
-        else
-            Player:SendMessageFailure("§cSunuculara ulasilamadi. Proxy baglantisi yok.")
-        end
-    end)
+        end,
+        OnError = function(ErrorMessage)
+            World:ScheduleTask(0, function()
+                cRoot:Get():FindAndDoWithPlayer(PlayerName, function(P)
+                    P:SendMessageFailure("§cSunuculara ulasilamadi: " .. (ErrorMessage or "?"))
+                end)
+            end)
+        end,
+    })
 end
 """
 
