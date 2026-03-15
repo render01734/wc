@@ -2,10 +2,10 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • FIX: Dinamik Isimlendirme Kusursuzlastirildi (Sadece GM1, GM2...)
-  • FIX: Alt Sunucu GUI Relay eklendi (Pusula artik aninda aciliyor)
-  • WCSync: Merkezi Envanter Senkronizasyonu
-  • WCHub: GUI ile Sunucular Arasi Kesintisiz Gecis
+  • FIX: Cuberite Loglari artik terminalde gorunur (Sorun tespiti icin)
+  • FIX: Lua sessiz cokmelerine karsi pcall ve LOG sistemi eklendi
+  • FIX: POST istegindeki player_file bloğu hatasi giderildi
+  • FIX: Render API zaman asimi 15 saniyeye yukseltildi
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -196,31 +196,42 @@ function OnRightClick(Player, ...)
 end
 
 function OpenGUI(Player)
-    -- cNetwork:Get Cuberite'de YOKTUR; dogru API cUrlClient:Get'tir.
-    -- Callback farkli bir thread'den gelir, bu yuzden Cuberite API'sini
-    -- kullanmadan once ScheduleTask ile ana thread'e donmek zorunludur.
     local PlayerName = Player:GetName()
     local World = Player:GetWorld()
+    
+    LOG("[WCHub] " .. PlayerName .. " pusulaya tikladi. API istegi basliyor...")
+
+    if type(cUrlClient) == "nil" then
+        LOGWARNING("[WCHub] cUrlClient API'si bulunamadi! HTTP destegi yok.")
+        Player:SendMessageFailure("§cSunucu secici modulu sistemde eksik (cUrlClient hatasi).")
+        return
+    end
 
     cUrlClient:Get(ProxyURL .. "/api/servers", {
         OnSuccess = function(Body, DataCallbacks)
-            -- Ana thread'e don (thread-safe)
+            LOG("[WCHub] API Yaniti Alindi. Uzunluk: " .. string.len(Body or ""))
             World:ScheduleTask(0, function()
-                -- Player referansini yeniden bul (kopuk referans olusmasin)
                 local TargetPlayer = nil
-                cRoot:Get():FindAndDoWithPlayer(PlayerName, function(P)
-                    TargetPlayer = P
-                end)
+                cRoot:Get():FindAndDoWithPlayer(PlayerName, function(P) TargetPlayer = P end)
                 if not TargetPlayer then return end
 
                 if not Body or Body == "" then
-                    TargetPlayer:SendMessageFailure("§cSunucu listesi bos geldi.")
+                    TargetPlayer:SendMessageFailure("§cSunucu listesi su an bos.")
                     return
                 end
 
-                local Window = cLuaWindow(cWindow.wtChest, 3, "§8Sunucu Agi")
-                local servers = Split(Body, ";")
+                -- GUI olusturma kisminda hata yakalayici (pcall) eklendi
+                local isSuccess, Window = pcall(function()
+                    return cLuaWindow(cWindow.wtChest, 3, "§8Sunucu Agi")
+                end)
 
+                if not isSuccess or not Window then
+                    LOGWARNING("[WCHub] GUI Olusturulamadi: " .. tostring(Window))
+                    TargetPlayer:SendMessageFailure("§cPencere olusturulamadi (Surum uyumsuzlugu).")
+                    return
+                end
+
+                local servers = Split(Body, ";")
                 for i, srv in ipairs(servers) do
                     local parts = Split(srv, ":")
                     if #parts == 2 then
@@ -248,6 +259,7 @@ function OpenGUI(Player)
             end)
         end,
         OnError = function(ErrorMessage)
+            LOGWARNING("[WCHub] API Hatasi: " .. tostring(ErrorMessage))
             World:ScheduleTask(0, function()
                 cRoot:Get():FindAndDoWithPlayer(PlayerName, function(P)
                     P:SendMessageFailure("§cSunuculara ulasilamadi: " .. (ErrorMessage or "?"))
@@ -659,7 +671,7 @@ setInterval(()=>location.reload(),15000);
                 if proxy_url:
                     try:
                         req = urllib.request.Request(f"{proxy_url}/api/servers")
-                        resp = urllib.request.urlopen(req, timeout=5).read()
+                        resp = urllib.request.urlopen(req, timeout=15).read() # Zaman asimi 15'e cikarildi
                         self.send_response(200); self.end_headers(); self.wfile.write(resp)
                     except Exception as e:
                         print(f"[RELAY] GUI Liste Hatasi: {e}")
@@ -718,7 +730,8 @@ setInterval(()=>location.reload(),15000);
                 self.wfile.write(json.dumps({"ok": False, "message": str(e)}).encode())
             return
 
-
+        # ── EKSİK OLAN IF BLOĞU BURAYA EKLENDİ (ÖNEMLİ) ────────────────────────────────
+        elif self.path.startswith("/api/player_file"):
             name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
             name = "".join(c for c in name if c.isalnum() or c in "-_")
             length = int(self.headers.get("Content-Length", 0))
@@ -878,6 +891,9 @@ def run_cuberite():
         for raw in stream:
             line = raw.rstrip() if isinstance(raw, str) else raw.decode("utf-8", "replace").rstrip()
             if not line: continue
+            
+            # --- YENI: Cuberite'in tum ciktilarini (Hatalari) konsola yansit! ---
+            print(f"[CUBERITE] {line}")
             
             if "WCSYNC_JOIN:" in line:
                 def _do_join(ln):
