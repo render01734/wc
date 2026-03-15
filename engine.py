@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-⛏️  Minecraft Distributed Hub Engine  —  REBUILT & OPTIMIZED
+⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • Mimari Hatasi Giderildi: Bore tünel çakışmaları ve sonsuz GM döngüsü çözüldü.
-  • Yerel İletişim: Ana sunucudaki (ALL modu) oyun, tünelsiz (127.0.0.1) bağlanır.
-  • Heartbeat: Sunucular 15 saniyede bir kendini günceller (Sonsuz kayıt engellendi).
-  • Tam BungeeCord Mimarisi (Hot-Swap / Kesintisiz Gecis)
+  • Tünel Çakışması ve DB Zaman Uyuşmazlığı (KICK Hatası) ÇÖZÜLDÜ!
+  • WCSync: Merkezi Envanter Senkronizasyonu GERİ EKLENDİ (API Entegreli)
+  • WCHub: Pusula ile Sunucular Arası Kesintisiz Geçiş
+  • Race Condition Engellendi (DB Kilit Sistemi)
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -13,12 +13,6 @@ import threading, zlib, time, http.server, urllib.request, urllib.parse
 import subprocess, glob, sqlite3
 from collections import deque
 import datetime
-
-try:
-    import aiosqlite
-except ImportError:
-    print("[SISTEM] 'aiosqlite' bulunamadi! 'pip install aiosqlite' komutunu calistirin.")
-    sys.exit(1)
 
 # ══════════════════════════════════════════════════════════
 #  SİSTEM DEĞİŞKENLERİ VE YAPILANDIRMA
@@ -36,60 +30,18 @@ DATA_DIR      = os.environ.get("DATA_DIR", "/data")
 SERVER_DIR    = os.environ.get("SERVER_DIR", "/server")
 DB_FILE       = f"{DATA_DIR}/hub.db"
 
-# Tünel adreslerini ayırıyoruz (Hata 1'in Çözümü)
-_proxy_bore_addr = None  # Sadece oyuncularin baglanacagi Ana IP
-_active_players = []
+_proxy_bore_addr = None
+_active_players  = []
+_DB_LOCK         = threading.Lock() # Race condition önleyici kilit
 
 # ══════════════════════════════════════════════════════════
-#  CANLI LOG TAMPONU (WEB PANEL İÇİN)
-# ══════════════════════════════════════════════════════════
-
-_LOG_BUF     = deque(maxlen=300) 
-_LOG_LOCK    = threading.Lock()
-_SSE_CLIENTS = []
-_SSE_LOCK    = threading.Lock()
-
-_LOG_COLORS = {
-    "[CONN]": "#4ecca3", "[JOIN]": "#4ecca3", "[QUIT]": "#f8b400", 
-    "[BORE]": "#7ec8e3", "[REG]": "#a8edea", "[PROXY]": "#4ecca3", 
-    "[HTTP]": "#555", "[MC]": "#c5a3ff", "[DB]": "#f8b400", 
-    "[API]": "#555", "[ERR]": "#ff6b6b",
-}
-
-def _log_color(line):
-    for tag, color in _LOG_COLORS.items():
-        if tag in line: return color
-    return "#c8c8c8"
-
-class _TeeLogger:
-    def __init__(self, orig): self._orig = orig
-    def write(self, text):
-        self._orig.write(text)
-        stripped = text.strip()
-        if stripped:
-            ts = datetime.datetime.now().strftime("%H:%M:%S")
-            entry = {"ts": ts, "msg": stripped, "color": _log_color(stripped)}
-            with _LOG_LOCK: _LOG_BUF.append(entry)
-            payload = f"data: {json.dumps(entry)}\n\n"
-            with _SSE_LOCK:
-                dead = []
-                for q in _SSE_CLIENTS:
-                    try: q.put_nowait(payload)
-                    except: dead.append(q)
-                for q in dead: _SSE_CLIENTS.remove(q)
-    def flush(self): self._orig.flush()
-    def isatty(self): return False
-
-sys.stdout = _TeeLogger(sys.stdout)
-sys.stderr = _TeeLogger(sys.stderr)
-
-# ══════════════════════════════════════════════════════════
-#  VERİTABANI (SQLITE) İŞLEMLERİ
+#  VERİTABANI İŞLEMLERİ (YENİLENDİ: Saat Uyuşmazlığı Çözüldü)
 # ══════════════════════════════════════════════════════════
 
 async def init_db():
     pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     try:
+        import aiosqlite
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS servers (
@@ -99,9 +51,7 @@ async def init_db():
             """)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS players (
-                    username TEXT PRIMARY KEY, uuid TEXT, last_server TEXT,
-                    inventory TEXT, pos_x REAL DEFAULT 0, pos_y REAL DEFAULT 5,
-                    pos_z REAL DEFAULT 0, health REAL DEFAULT 20
+                    username TEXT PRIMARY KEY, last_server TEXT
                 )
             """)
             await db.commit()
@@ -110,7 +60,7 @@ async def init_db():
         print(f"[DB] HATA: Veritabani Olusturulamadi -> {e}")
 
 # ══════════════════════════════════════════════════════════
-#  CUBERITE AYARLARI VE LUA (TELEPORT YÜZÜĞÜ)
+#  LUA EKLENTİLERİ (WCSync, WCHub, Yaver Desteği)
 # ══════════════════════════════════════════════════════════
 
 SETTINGS_INI = f"""
@@ -121,6 +71,8 @@ ServerID=WCHubEngine
 
 [Plugins]
 Plugin=WCHub
+Plugin=WCSync
+Plugin=yaver
 
 [Server]
 Description=Minecraft Distributed Hub
@@ -130,7 +82,47 @@ Ports={CUBERITE_PORT}
 NetworkCompressionThreshold=-1
 """
 
-PLUGIN_MAIN = """
+# WCSync: Oyuncu girip çıktığında Python tetikleyicisi için log atar
+WCSYNC_MAIN = """
+function Initialize(Plugin)
+    Plugin:SetName("WCSync")
+    Plugin:SetVersion(2)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, OnPlayerJoined)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
+    cPluginManager:BindConsoleCommand("wcreload", HandleConsoleReload, "Python tetikleyici")
+    cRoot:Get():GetDefaultWorld():ScheduleTask(200, PeriodicSave)
+    LOG("[SYNC] WCSync aktif! Anti-Dupe devrede.")
+    return true
+end
+
+function PeriodicSave(World)
+    World:ForEachPlayer(function(Player)
+        Player:SaveToDisk()
+        LOG("WCSYNC_SAVE:" .. Player:GetName() .. ":" .. Player:GetUUID())
+    end)
+    World:ScheduleTask(200, PeriodicSave)
+end
+
+function OnPlayerJoined(Player) LOG("WCSYNC_JOIN:" .. Player:GetName() .. ":" .. Player:GetUUID()) end
+
+function OnPlayerDestroyed(Player)
+    Player:SaveToDisk()
+    LOG("WCSYNC_QUIT:" .. Player:GetName() .. ":" .. Player:GetUUID())
+end
+
+function HandleConsoleReload(Split)
+    if #Split > 1 then
+        cRoot:Get():FindAndDoWithPlayer(Split[2], function(P)
+            P:LoadFromDisk()
+            P:SendMessageSuccess("Envanteriniz merkezden esitlendi!")
+        end)
+    end
+    return true
+end
+"""
+
+# WCHub: GUI menüsü ve Pusula
+WCHUB_MAIN = """
 local ProxyURL = "http://127.0.0.1:8080"
 if os.getenv("PROXY_URL") then ProxyURL = os.getenv("PROXY_URL") end
 
@@ -142,12 +134,9 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("WCHub")
-    Plugin:SetVersion(4)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, OnPlayerJoined)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
+    Plugin:SetVersion(2)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, GiveRing)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_RIGHT_CLICK, OnRightClick)
-    
-    cRoot:Get():GetDefaultWorld():ScheduleTask(200, PeriodicSave)
     LOG("[HUB] WCHub aktif! Yuzuk sistemi devrede.")
     return true
 end
@@ -155,32 +144,12 @@ end
 function GiveRing(Player)
     local inv = Player:GetInventory()
     local hasRing = false
-    for i=0, 35 do
-        local item = inv:GetSlot(i)
-        if item.m_ItemType == E_ITEM_COMPASS then hasRing = true break end
-    end
+    for i=0, 35 do if inv:GetSlot(i).m_ItemType == E_ITEM_COMPASS then hasRing = true break end end
     if not hasRing then
         local ring = cItem(E_ITEM_COMPASS, 1)
         ring.m_CustomName = "§eSunucu Secici §7(Sag Tik)"
         inv:AddItem(ring)
     end
-end
-
-function OnPlayerJoined(Player) GiveRing(Player) end
-
-function OnPlayerDestroyed(Player)
-    local payload = string.format('{"x":%f,"y":%f,"z":%f,"hp":%f}', Player:GetPosX(), Player:GetPosY(), Player:GetPosZ(), Player:GetHealth())
-    local req = cNetwork::CreateRequest(ProxyURL .. "/api/player?name=" .. Player:GetName())
-    req:SetMethod("POST"); cNetwork:PostData(req, payload, function() end)
-end
-
-function PeriodicSave(World)
-    World:ForEachPlayer(function(Player)
-        local payload = string.format('{"x":%f,"y":%f,"z":%f,"hp":%f}', Player:GetPosX(), Player:GetPosY(), Player:GetPosZ(), Player:GetHealth())
-        local req = cNetwork::CreateRequest(ProxyURL .. "/api/player?name=" .. Player:GetName())
-        req:SetMethod("POST"); cNetwork:PostData(req, payload, function() end)
-    end)
-    World:ScheduleTask(200, PeriodicSave)
 end
 
 function OnRightClick(Player, BlockX, BlockY, BlockZ, BlockFace, CursorX, CursorY, CursorZ)
@@ -193,7 +162,7 @@ function OnRightClick(Player, BlockX, BlockY, BlockZ, BlockFace, CursorX, Cursor
                 for i, srv in ipairs(servers) do
                     local parts = Split(srv, ":")
                     if #parts == 2 then
-                        Player:SendMessage(cCompositeChat():AddTextPart("§8[§b" .. parts[1] .. "§8] §7- " .. parts[2] .. " oyuncu ")
+                        Player:SendMessage(cCompositeChat():AddTextPart("§8[§b" .. parts[1] .. "§8] §7- Aktif ")
                             :AddRunCommandPart("§a[GEÇİŞ YAP]", "/wc_transfer " .. parts[1]))
                     end
                 end
@@ -209,8 +178,10 @@ end
 def write_configs(server_dir=SERVER_DIR):
     files = {
         f"{server_dir}/settings.ini": SETTINGS_INI.strip(),
-        f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="4"}',
-        f"{server_dir}/Plugins/WCHub/main.lua": PLUGIN_MAIN.strip(),
+        f"{server_dir}/Plugins/WCSync/Info.lua": 'g_PluginInfo = {Name="WCSync", Version="2"}',
+        f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
+        f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="2"}',
+        f"{server_dir}/Plugins/WCHub/main.lua": WCHUB_MAIN.strip(),
     }
     for path, content in files.items():
         try:
@@ -219,7 +190,7 @@ def write_configs(server_dir=SERVER_DIR):
         except Exception: pass
 
 # ══════════════════════════════════════════════════════════
-#  PROTOKOL (PACKET PARSER)
+#  PROTOKOL & PAKET İŞLEME
 # ══════════════════════════════════════════════════════════
 
 def vi_enc(v):
@@ -281,7 +252,7 @@ def mc_str_dec(data, pos=0):
     return data[pos:pos+n].decode("utf-8", errors="replace"), pos+n
 
 # ══════════════════════════════════════════════════════════
-#  PROXY (YÖNLENDİRİCİ VE HOT-SWAP)
+#  PROXY: YÖNLENDİRİCİ VE ENVANTER KORUMALI HOT-SWAP
 # ══════════════════════════════════════════════════════════
 
 class PlayerConn:
@@ -294,39 +265,56 @@ class PlayerConn:
         self.username = "?"
         self.current_label = ""
         self.play_state = False
+        self.is_swapping = False
 
     async def get_target_server(self, requested_label=None):
-        async with aiosqlite.connect(DB_FILE) as db:
-            db.row_factory = aiosqlite.Row
-            if requested_label:
-                async with db.execute("SELECT * FROM servers WHERE label=?", (requested_label,)) as cur:
+        import aiosqlite
+        now = int(time.time())
+        try:
+            async with aiosqlite.connect(DB_FILE) as db:
+                db.row_factory = aiosqlite.Row
+                if requested_label:
+                    async with db.execute("SELECT * FROM servers WHERE label=?", (requested_label,)) as cur:
+                        return await cur.fetchone()
+                
+                async with db.execute("SELECT last_server FROM players WHERE username=?", (self.username,)) as cur:
+                    p_row = await cur.fetchone()
+                    if p_row and p_row['last_server']:
+                        async with db.execute("SELECT * FROM servers WHERE label=?", (p_row['last_server'],)) as scur:
+                            s_row = await scur.fetchone()
+                            if s_row and (now - s_row['last_seen']) < 60: return s_row
+                
+                async with db.execute("SELECT * FROM servers WHERE players < 100 AND (? - last_seen) < 60 ORDER BY players ASC LIMIT 1", (now,)) as cur:
                     return await cur.fetchone()
-            
-            async with db.execute("SELECT last_server FROM players WHERE username=?", (self.username,)) as cur:
-                p_row = await cur.fetchone()
-                if p_row and p_row['last_server']:
-                    async with db.execute("SELECT * FROM servers WHERE label=?", (p_row['last_server'],)) as scur:
-                        s_row = await scur.fetchone()
-                        if s_row and (int(time.time()) - s_row['last_seen']) < 60: return s_row
-            
-            async with db.execute("SELECT * FROM servers WHERE players < 100 AND (CAST(strftime('%s', 'now') AS INTEGER) - last_seen) < 60 ORDER BY players ASC LIMIT 1") as cur:
-                return await cur.fetchone()
-
-    async def connect_backend(self, host, port):
-        if self.server_w: self.server_w.close()
-        self.server_r, self.server_w = await asyncio.open_connection(host, port, limit=2**20)
+        except Exception as e: print(f"[PROXY] DB Hatasi: {e}"); return None
 
     async def hot_swap(self, target_label):
         if self.current_label == target_label: return
-        srv = await self.get_target_server(target_label)
+        self.is_swapping = True
+        self.play_state = False
         
+        # Oyuncuya bildirim gonder
+        msg = json.dumps({"text": f"§a{target_label} sunucusuna geciliyor... Envanter senkronize ediliyor.", "color": "yellow"})
+        self.client_w.write(pkt_make(0x02, mc_str_enc(msg) + bytes([0]), self.comp))
+        await self.client_w.drain()
+
+        # Eski sunucuyu kapat ki WCSYNC_QUIT calissin ve Json merkeze yollansin!
+        if self.server_w:
+            self.server_w.close()
+            self.server_w = None
+            self.server_r = None
+            
+        # Json merkeze islensin diye WCSYNC icin zorunlu bekleme suresi (Kritik Anti-Dupe Taktigi)
+        await asyncio.sleep(2.5)
+        
+        srv = await self.get_target_server(target_label)
         if not srv:
-            msg = json.dumps({"text": f"{target_label} bulunamadi veya kapali!", "color": "red"})
+            msg = json.dumps({"text": f"§c{target_label} baglantisi basarisiz!", "color": "red"})
             self.client_w.write(pkt_make(0x02, mc_str_enc(msg) + bytes([0]), self.comp))
+            self.is_swapping = False
             return
 
-        self.play_state = False
-        await self.connect_backend(srv['host'], srv['port'])
+        self.server_r, self.server_w = await asyncio.open_connection(srv['host'], srv['port'], limit=2**20)
         
         hs = vi_enc(47) + mc_str_enc(srv['host']) + struct.pack(">H", srv['port']) + vi_enc(2)
         self.server_w.write(pkt_make(0x00, hs, -1))
@@ -349,18 +337,20 @@ class PlayerConn:
                 
                 self.current_label = target_label
                 self.play_state = True
-                print(f"[PROXY] {self.username} => {target_label} sunucusuna gecis yapti.")
+                self.is_swapping = False
                 
+                import aiosqlite
                 async with aiosqlite.connect(DB_FILE) as db:
                     await db.execute("UPDATE players SET last_server=? WHERE username=?", (target_label, self.username))
                     await db.commit()
                 break
             
     async def pipe_c2s(self):
-        try:
-            while True:
+        while True:
+            if self.is_swapping or not self.server_w:
+                await asyncio.sleep(0.1); continue
+            try:
                 pid, payload, raw = await pkt_read(self.client_r, self.comp)
-                
                 if pid == 0x01 and self.play_state: 
                     msg, _ = mc_str_dec(payload)
                     if msg.startswith("/wc_transfer "):
@@ -375,22 +365,23 @@ class PlayerConn:
                                 try: c.client_w.write(b_pkt)
                                 except: pass
                         continue 
-
-                if self.server_w:
-                    self.server_w.write(raw)
-                    await self.server_w.drain()
-        except: pass
+                self.server_w.write(raw)
+                await self.server_w.drain()
+            except Exception:
+                if not self.is_swapping: break
 
     async def pipe_s2c(self):
-        try:
-            while True:
-                if not self.server_r: await asyncio.sleep(0.1); continue
+        while True:
+            if self.is_swapping or not self.server_r:
+                await asyncio.sleep(0.1); continue
+            try:
                 pid, payload, raw = await pkt_read(self.server_r, self.comp)
                 if pid == 0x03 and self.comp < 0:
                     self.comp, _ = vi_dec(payload)
                 self.client_w.write(raw)
                 await self.client_w.drain()
-        except: pass
+            except Exception:
+                if not self.is_swapping: break
 
     async def run(self):
         try:
@@ -413,11 +404,11 @@ class PlayerConn:
                 
                 srv = await self.get_target_server()
                 if not srv:
-                    self.client_w.write(pkt_make(0x00, mc_str_enc(json.dumps({"text":"§cSunucu bulunamadi veya kapali."})), -1))
+                    self.client_w.write(pkt_make(0x00, mc_str_enc(json.dumps({"text":"§cSunucu bulunamadi veya hepsi kapali."})), -1))
                     return
 
                 self.current_label = srv['label']
-                await self.connect_backend(srv['host'], srv['port'])
+                self.server_r, self.server_w = await asyncio.open_connection(srv['host'], srv['port'], limit=2**20)
                 self.server_w.write(raw)
                 self.server_w.write(raw2)
                 await self.server_w.drain()
@@ -426,6 +417,7 @@ class PlayerConn:
                 self.play_state = True
                 print(f"[JOIN] {self.username} -> {self.current_label} sunucusuna girdi.")
                 
+                import aiosqlite
                 async with aiosqlite.connect(DB_FILE) as db:
                     await db.execute("INSERT OR IGNORE INTO players (username, last_server) VALUES (?, ?)", (self.username, self.current_label))
                     await db.commit()
@@ -443,224 +435,72 @@ async def handle_player(cr, cw):
     await PlayerConn(cr, cw).run()
 
 # ══════════════════════════════════════════════════════════
-#  HTTP API VE WEB PANEL
+#  HTTP API VE DOSYA SENKRONİZASYONU
 # ══════════════════════════════════════════════════════════
 
-HTML = """\
-<!DOCTYPE html>
-<html lang="tr">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>WC Hub Engine</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet">
-  <style>
-    :root{{--bg:#0d0f1a;--panel:#111827;--border:#1e3a5f;--accent:#00ffc8;--accent2:#0099ff;--warn:#f8b400;--err:#ff4f4f;--dim:#4a5568;--text:#cbd5e0;}}
-    *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;min-height:100vh;padding:20px;
-          background-image:radial-gradient(ellipse 80% 60% at 50% -10%,#0a2a4a55,transparent),
-          repeating-linear-gradient(0deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px),
-          repeating-linear-gradient(90deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px);}}
-    .wrap{{max-width:920px;margin:0 auto;display:flex;flex-direction:column;gap:14px}}
-    .header{{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);padding-bottom:12px}}
-    .logo{{font-family:'Rajdhani',sans-serif;font-size:1.7rem;font-weight:700;color:var(--accent);letter-spacing:.08em;text-shadow:0 0 20px #00ffc855}}
-    .logo span{{color:var(--text);font-weight:400}}
-    .addr-box{{background:linear-gradient(135deg,#0a2a4a,#0a1a35);border:1px solid var(--accent);border-radius:8px;padding:12px 18px;display:flex;align-items:center;gap:14px;box-shadow:0 0 24px #00ffc81a}}
-    .addr-lbl{{font-size:.68rem;color:var(--dim);white-space:nowrap}}
-    .addr-val{{font-size:1.25rem;color:var(--accent);flex:1;word-break:break-all;text-shadow:0 0 12px #00ffc844}}
-    .copy-btn{{background:#00ffc815;border:1px solid var(--accent);color:var(--accent);border-radius:6px;padding:6px 14px;font-size:.73rem;cursor:pointer;font-family:'Share Tech Mono',monospace;transition:all .15s;white-space:nowrap}}
-    .copy-btn:hover{{background:var(--accent);color:#000}}
-    .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}
-    .stat{{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px;position:relative;overflow:hidden}}
-    .stat::before{{content:'';position:absolute;inset:0;background:linear-gradient(135deg,#00ffc808,transparent);pointer-events:none}}
-    .stat-val{{font-size:2rem;color:var(--accent);font-family:'Rajdhani',sans-serif;font-weight:700;line-height:1}}
-    .stat-lbl{{font-size:.68rem;color:var(--dim);margin-top:4px}}
-    .panel{{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden}}
-    .panel-hdr{{display:flex;align-items:center;justify-content:space-between;padding:9px 16px;border-bottom:1px solid var(--border);background:#0a1428}}
-    table{{width:100%;border-collapse:collapse}}
-    th{{color:var(--dim);font-size:.68rem;padding:7px 16px;text-align:left;text-transform:uppercase;background:#0a1428;border-bottom:1px solid var(--border)}}
-    td{{padding:8px 16px;font-size:.82rem;border-bottom:1px solid #1e3a5f33}}
-    tr:last-child td{{border-bottom:none}}
-    .sdot{{width:7px;height:7px;border-radius:50%;background:var(--accent);display:inline-block;margin-right:6px;box-shadow:0 0 5px var(--accent);animation:blink 1.4s infinite}}
-    @keyframes blink{{0%,100%{{opacity:1;transform:scale(1)}}50%{{opacity:.4;transform:scale(.7)}}}}
-    #con{{background:#070d1a;height:340px;overflow-y:auto;padding:10px 14px;font-size:.76rem;line-height:1.75;}}
-    .ll{{display:flex;gap:8px}}
-    .lt{{color:var(--dim);flex-shrink:0;font-size:.66rem;padding-top:1px}}
-    .lm{{word-break:break-all;flex:1}}
-  </style>
-</head>
-<body>
-<div class="wrap">
-  <div class="header">
-    <div class="logo">⛏ WC<span>-HUB</span></div>
-    <div style="font-size:.72rem;color:var(--dim)">Mod: {mode_label}</div>
-  </div>
-  {addr_block}
-  <div class="stats">
-    <div class="stat"><div class="stat-val" id="s-p">{player_count}</div><div class="stat-lbl">Aktif Oyuncu</div></div>
-    <div class="stat"><div class="stat-val" id="s-b">{registered_players}</div><div class="stat-lbl">Kayıtlı Hesap</div></div>
-    <div class="stat"><div class="stat-val" id="s-s">{server_count}</div><div class="stat-lbl">Oyun Sunucusu (Hub)</div></div>
-  </div>
-  <div class="panel">
-    <table id="srv-tbl"><tr><th>Sunucu Adı</th><th>Oyuncu Sayısı</th><th>Durum</th></tr>{rows}</table>
-  </div>
-  <div class="panel">
-    <div class="panel-hdr"><span style="font-size:.72rem;color:var(--accent);">CANLI KONSOL</span></div>
-    <div id="con">Yükleniyor...</div>
-  </div>
-</div>
-<script>
-(function(){{
-  const con=document.getElementById('con'); let allLines=[];
-  function esc(s){{return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
-  function renderLine(e){{
-    const d=document.createElement('div');d.className='ll';
-    d.innerHTML='<span class="lt">'+e.ts+'</span><span class="lm" style="color:'+e.color+'">'+esc(e.msg)+'</span>'; return d;
-  }}
-  function addLine(e){{
-    allLines.push(e); if(allLines.length>300){{allLines.shift();const f=con.querySelector('.ll');if(f)f.remove();}}
-    con.appendChild(renderLine(e)); con.scrollTop=con.scrollHeight;
-  }}
-  fetch('/api/logs/history').then(r=>r.json()).then(arr=>{{con.innerHTML='';arr.forEach(e=>addLine(e));}}).catch(()=>{{}});
-  function connectSSE(){{
-    const es=new EventSource('/api/logs/stream');
-    es.onmessage=e=>{{try{{addLine(JSON.parse(e.data));}}catch(x){{}}}};
-    es.onerror=()=>{{es.close();setTimeout(connectSSE,3000);}};
-  }}
-  connectSSE();
-  setInterval(()=>{{
-    fetch('/api/status').then(r=>r.json()).then(d=>{{
-      document.getElementById('s-p').textContent=d.players;
-      document.getElementById('s-b').textContent=d.registered;
-      document.getElementById('s-s').textContent=d.servers;
-      document.getElementById('srv-tbl').innerHTML='<tr><th>Sunucu Adı</th><th>Oyuncu Sayısı</th><th>Durum</th></tr>'+d.table_rows;
-      if(d.addr){{const av=document.querySelector('.addr-val');if(av)av.textContent=d.addr;}}
-    }}).catch(()=>{{}});
-  }}, 5000);
-}})();
-</script>
-</body></html>"""
-
-def _build_rows():
-    rows, server_count, registered = "", 0, 0
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute("SELECT label, players, last_seen FROM servers ORDER BY label ASC")
-        for s in cur.fetchall():
-            age_sec = int(time.time()) - s['last_seen']
-            status = '<span class="sdot"></span><span style="color:#00ffc8">Aktif</span>' if age_sec < 45 else f'<span style="color:var(--warn)">Pasif ({age_sec}sn)</span>'
-            rows += f"<tr><td>{s['label']}</td><td>{s['players']}</td><td>{status}</td></tr>"
-            server_count += 1
-        cur.execute("SELECT COUNT(*) FROM players")
-        registered = cur.fetchone()[0]
-        conn.close()
-    except Exception as e: rows = f'<tr><td colspan="3">Hata: {e}</td></tr>'
-    
-    if not rows: rows = '<tr><td colspan="3" style="text-align:center;color:#555">Henüz oyun sunucusu bağlanmadı...</td></tr>'
-    return rows, server_count, registered
-
 class HttpHandler(http.server.BaseHTTPRequestHandler):
-    def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        super().end_headers()
-
     def do_GET(self):
-        if self.path == "/":
-            rows, s_count, reg_count = _build_rows()
-            bore = _proxy_bore_addr
-            if bore:
-                addr_block = (f'<div class="addr-box"><div><div class="addr-lbl">MİNECRAFT SUNUCU ADRESİ (Bu adresi KOPYALA ve Oyuna Gir)</div>'
-                              f'<div class="addr-val" style="font-size:1.5rem">{bore}</div></div>'
-                              f'<button class="copy-btn" onclick="navigator.clipboard.writeText(\'{bore}\');'
-                              f'this.textContent=\'Kopyalandı\';setTimeout(()=>this.textContent=\'Kopyala\',1500)">Kopyala</button></div>')
+        if self.path.startswith("/api/player_file?name="):
+            name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
+            name = "".join(c for c in name if c.isalnum() or c in "-_")
+            filepath = f"{DATA_DIR}/players/{name}.json"
+            if os.path.exists(filepath):
+                body = pathlib.Path(filepath).read_bytes()
+                self.send_response(200); self.end_headers(); self.wfile.write(body)
             else:
-                addr_block = '<div class="addr-box" style="border-color:var(--warn)"><div class="addr-val" style="color:var(--warn);">⏳ Ana Hub Tüneli Açılıyor... Lütfen Bekleyin...</div></div>'
-            
-            body = HTML.format(addr_block=addr_block, player_count=len(_active_players), registered_players=reg_count, server_count=s_count, rows=rows, mode_label=MODE.upper()).encode()
-            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers(); self.wfile.write(body)
-            return
-
-        if self.path == "/api/status":
-            rows, s_count, reg_count = _build_rows()
-            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
-            self.wfile.write(json.dumps({"players": len(_active_players), "registered": reg_count, "servers": s_count, "addr": _proxy_bore_addr or "", "table_rows": rows}).encode())
-            return
-
-        if self.path == "/api/logs/stream":
-            import queue as _q; q = _q.Queue(maxsize=200)
-            with _SSE_LOCK: _SSE_CLIENTS.append(q)
-            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.send_header("Cache-Control", "no-cache"); self.end_headers()
-            try:
-                while True:
-                    try: self.wfile.write(q.get(timeout=25).encode()); self.wfile.flush()
-                    except _q.Empty: self.wfile.write(b": ping\n\n"); self.wfile.flush()
-            except: pass
-            finally:
-                with _SSE_LOCK:
-                    if q in _SSE_CLIENTS: _SSE_CLIENTS.remove(q)
-            return
-
-        if self.path == "/api/logs/history":
-            with _LOG_LOCK: data = list(_LOG_BUF)
-            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(json.dumps(data).encode())
+                self.send_response(404); self.end_headers()
             return
 
         if self.path == "/api/servers":
             try:
                 conn = sqlite3.connect(DB_FILE); conn.row_factory = sqlite3.Row; cur = conn.cursor()
-                cur.execute("SELECT label, players FROM servers WHERE (CAST(strftime('%s', 'now') AS INTEGER) - last_seen) < 60 ORDER BY label ASC")
+                cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 60 ORDER BY label ASC", (int(time.time()),))
                 resp = ";".join([f"{r['label']}:{r['players']}" for r in cur.fetchall()])
                 conn.close()
                 self.send_response(200); self.end_headers(); self.wfile.write(resp.encode())
             except Exception: self.send_response(500); self.end_headers()
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        if length == 0: self.send_response(400); self.end_headers(); return
-        data = self.rfile.read(length).decode('utf-8')
-
-        if self.path.startswith("/api/player?name="):
+        if self.path.startswith("/api/player_file?name="):
             name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
-            try:
-                p_data = json.loads(data)
-                conn = sqlite3.connect(DB_FILE)
-                conn.execute("UPDATE players SET pos_x=?, pos_y=?, pos_z=?, health=? WHERE username=?", (p_data.get('x',0), p_data.get('y',5), p_data.get('z',0), p_data.get('hp',20), name))
-                conn.commit(); conn.close()
-                self.send_response(200); self.end_headers()
-            except: self.send_response(500); self.end_headers()
+            name = "".join(c for c in name if c.isalnum() or c in "-_")
+            length = int(self.headers.get("Content-Length", 0))
+            data = self.rfile.read(length)
+            pathlib.Path(f"{DATA_DIR}/players").mkdir(parents=True, exist_ok=True)
+            pathlib.Path(f"{DATA_DIR}/players/{name}.json").write_bytes(data)
+            self.send_response(200); self.end_headers()
+            return
 
         elif self.path == "/api/register":
+            length = int(self.headers.get("Content-Length", 0))
             try:
-                s_data = json.loads(data)
+                s_data = json.loads(self.rfile.read(length))
                 host, port = s_data['host'], s_data['port']
+                now = int(time.time())
                 
-                conn = sqlite3.connect(DB_FILE)
-                cur = conn.cursor()
-                
-                # Check if this Host:Port already exists to prevent duplicates!
-                cur.execute("SELECT label FROM servers WHERE host=? AND port=?", (host, port))
-                row = cur.fetchone()
-                
-                if row:
-                    label = row[0]
-                    conn.execute("UPDATE servers SET last_seen=CAST(strftime('%s', 'now') AS INTEGER) WHERE label=?", (label,))
-                else:
-                    cur.execute("SELECT COUNT(*) FROM servers")
-                    label = f"GM{cur.fetchone()[0] + 1}"
-                    conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))", (label, host, port))
-                
-                conn.commit(); conn.close()
+                with _DB_LOCK: # Race Condition Kilidi!
+                    conn = sqlite3.connect(DB_FILE)
+                    cur = conn.cursor()
+                    cur.execute("SELECT label FROM servers WHERE host=? AND port=?", (host, port))
+                    row = cur.fetchone()
+                    if row:
+                        label = row[0]
+                        conn.execute("UPDATE servers SET last_seen=? WHERE label=?", (now, label))
+                    else:
+                        cur.execute("SELECT COUNT(*) FROM servers")
+                        label = f"GM{cur.fetchone()[0] + 1}"
+                        conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, ?)", (label, host, port, now))
+                    conn.commit(); conn.close()
                 
                 self.send_response(200); self.end_headers(); self.wfile.write(json.dumps({"label": label}).encode())
-            except Exception as e: print(f"[API] Kayit Hatasi: {e}"); self.send_response(500); self.end_headers()
+                print(f"[REG] Sunucu Islendi: {label} ({host}:{port})")
+            except Exception as e:
+                print(f"[REG] Kayit Hatasi: {e}"); self.send_response(500); self.end_headers()
 
     def log_message(self, format, *args): pass
 
 # ══════════════════════════════════════════════════════════
-#  BAŞLATICI YÖNTEMLER VE HEARTBEAT (KALP ATIŞI)
+#  BAŞLATICI YÖNTEMLER, CUBERITE VE TÜNEL
 # ══════════════════════════════════════════════════════════
 
 def run_http():
@@ -685,13 +525,12 @@ def run_bore_for_proxy():
         except: pass
         time.sleep(5)
 
-# GameServer'lar (Alt sunucular) kendi tünellerini açıp merkeze bildirir.
 def run_bore_for_gameserver():
     import re
     proxy_url = os.environ.get("PROXY_URL", "")
     if not proxy_url: return
-    
     current_gs_bore = None
+    
     def heartbeat():
         while True:
             time.sleep(15)
@@ -700,7 +539,7 @@ def run_bore_for_gameserver():
                     host, port_str = current_gs_bore.split(":")
                     req = urllib.request.Request(f"{proxy_url}/api/register", data=json.dumps({"host": host, "port": int(port_str)}).encode(), headers={"Content-Type": "application/json"})
                     urllib.request.urlopen(req, timeout=5)
-                except Exception as e: print(f"[REG] Hub'a ulasilamiyor: {e}")
+                except Exception: pass
 
     threading.Thread(target=heartbeat, daemon=True).start()
 
@@ -713,7 +552,7 @@ def run_bore_for_gameserver():
                 m = re.search(r"bore\.pub:(\d+)", line)
                 if m:
                     current_gs_bore = f"bore.pub:{m.group(1)}"
-                    print(f"[BORE] Alt Sunucu Tüneli Açıldı: {current_gs_bore} -> Hub'a bildiriliyor...")
+                    print(f"[BORE] Alt Sunucu Tüneli: {current_gs_bore}")
             proc.wait()
         except: pass
         time.sleep(5)
@@ -723,20 +562,66 @@ def run_cuberite():
     mc_bin = next(iter(glob.glob("/server/**/Cuberite", recursive=True)), None)
     if not mc_bin: return
     os.chmod(mc_bin, 0o755)
-    while True:
-        subprocess.Popen([mc_bin], cwd=str(pathlib.Path(mc_bin).parent)).wait()
-        time.sleep(5)
+    
+    persistent_world = f"{DATA_DIR}/world" if MODE == "all" else "/server/world"
+    proxy_url = os.environ.get("PROXY_URL", f"http://127.0.0.1:{HTTP_PORT}")
+    
+    def _pipe_output(stream, proc):
+        for raw in stream:
+            line = raw.rstrip() if isinstance(raw, str) else raw.decode("utf-8", "replace").rstrip()
+            if not line: continue
+            
+            # WCSync Tetikleyicileri (Envanter İndir/Yükle)
+            if "WCSYNC_JOIN:" in line:
+                def _do_join(ln):
+                    try:
+                        name, uuid = ln.split("WCSYNC_JOIN:")[1].strip().split(":")
+                        uuid_clean = uuid.replace("-", "")
+                        req = urllib.request.Request(f"{proxy_url}/api/player_file?name={name}")
+                        data = urllib.request.urlopen(req, timeout=5).read()
+                        
+                        paths = [pathlib.Path(f"{persistent_world}/players/{uuid}.json"), pathlib.Path(f"{persistent_world}/players/{uuid_clean}.json")]
+                        for p in paths:
+                            p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(data)
+                        
+                        time.sleep(1.0)
+                        proc.stdin.write(f"wcreload {name}\n"); proc.stdin.flush()
+                        print(f"[SYNC] {name} envanteri indirildi ve oyuna islendi.")
+                    except Exception as e:
+                        if "404" not in str(e): print(f"[SYNC] Hata: {e}")
+                threading.Thread(target=_do_join, args=(line,), daemon=True).start()
+                
+            elif "WCSYNC_QUIT:" in line or "WCSYNC_SAVE:" in line:
+                def _do_upload(ln):
+                    try:
+                        time.sleep(1.0)
+                        tag = "WCSYNC_QUIT:" if "WCSYNC_QUIT:" in ln else "WCSYNC_SAVE:"
+                        name, uuid = ln.split(tag)[1].strip().split(":")
+                        uuid_clean = uuid.replace("-", "")
+                        
+                        p1 = pathlib.Path(f"{persistent_world}/players/{uuid}.json")
+                        p2 = pathlib.Path(f"{persistent_world}/players/{uuid_clean}.json")
+                        target_p = p1 if p1.exists() else (p2 if p2.exists() else None)
+                        
+                        if target_p:
+                            req = urllib.request.Request(f"{proxy_url}/api/player_file?name={name}", data=target_p.read_bytes(), method="POST")
+                            urllib.request.urlopen(req, timeout=5)
+                            print(f"[SYNC] {name} envanteri merkeze yuklendi.")
+                    except Exception as e: print(f"[SYNC] Upload Hatasi: {e}")
+                threading.Thread(target=_do_upload, args=(line,), daemon=True).start()
 
-# Ana makinedeki yerel oyunu (Tünelsiz) Hub'a bildirir.
+    while True:
+        proc = subprocess.Popen([mc_bin], cwd=str(pathlib.Path(mc_bin).parent), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        threading.Thread(target=_pipe_output, args=(proc.stdout, proc), daemon=True).start()
+        proc.wait(); time.sleep(5)
+
 def register_local_cuberite():
     while True:
         time.sleep(15)
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{HTTP_PORT}/api/register", data=json.dumps({"host": "127.0.0.1", "port": CUBERITE_PORT}).encode(), headers={"Content-Type": "application/json"})
-            res = urllib.request.urlopen(req, timeout=5)
-            label = json.loads(res.read().decode())['label']
-            print(f"[REG] Yerel Oyun Sunucusu Kaydedildi: {label} (127.0.0.1:{CUBERITE_PORT})")
-        except: pass
+            urllib.request.urlopen(req, timeout=5)
+        except Exception: pass
 
 async def run_proxy():
     await init_db()
@@ -747,7 +632,7 @@ async def run_proxy():
 def main():
     print(f"""
 +--------------------------------------------------+
-|  Minecraft BungeeCord Hub Engine - REBUILT       |
+|  Minecraft Bungee Network & Anti-Dupe Engine     |
 |  Mod: {MODE:<43}|
 +--------------------------------------------------+""")
 
@@ -761,19 +646,10 @@ def main():
         run_cuberite()
         
     elif MODE == "all":
-        # 1. Web API'yi başlat
         threading.Thread(target=run_http, daemon=True).start()
-        
-        # 2. Proxy için dışarıya TEK BİR tünel aç
         threading.Thread(target=run_bore_for_proxy, daemon=True).start()
-        
-        # 3. Arka planda oyunu başlat
         threading.Thread(target=run_cuberite, daemon=True).start()
-        
-        # 4. Yerel oyunu dışarı açmadan (tünelsiz) Hub'a periyodik kaydet
         threading.Thread(target=register_local_cuberite, daemon=True).start()
-        
-        # 5. Yönlendiriciyi (Proxy) çalıştır
         time.sleep(2)
         asyncio.run(run_proxy())
 
