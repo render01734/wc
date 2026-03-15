@@ -2,10 +2,10 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • BUG FIX: Havaya sağ tıklama algılaması eklendi (Pusula Fix)
-  • BUG FIX: Bore Port değişimindeki sonsuz GM çoğalması çözüldü (Sabit Label)
+  • GUI UPDATE: Gercek Sandik Menusu (Chest GUI) eklendi!
+  • FIX: Pusulayi havaya tiklama, yere atamama ve olunce gitmeme eklendi.
   • WCSync: Merkezi Envanter Senkronizasyonu
-  • WCHub: Pusula ile Sunucular Arası Kesintisiz Geçiş
+  • WCHub: GUI ile Sunucular Arasi Kesintisiz Gecis
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -35,7 +35,7 @@ _active_players  = []
 _DB_LOCK         = threading.Lock()
 
 # ══════════════════════════════════════════════════════════
-#  VERİTABANI İŞLEMLERİ (Otomatik Temizlik Eklendi)
+#  VERİTABANI İŞLEMLERİ (Otomatik Hızlı Temizlik)
 # ══════════════════════════════════════════════════════════
 
 async def init_db():
@@ -54,8 +54,8 @@ async def init_db():
                     username TEXT PRIMARY KEY, last_server TEXT
                 )
             """)
-            # Hayalet (Portu degismis, olu) sunuculari baslangicta temizle!
-            await db.execute("DELETE FROM servers WHERE (? - last_seen) > 300", (int(time.time()),))
+            # Hayalet sunuculari daha hizli temizle (45 saniye)
+            await db.execute("DELETE FROM servers WHERE (? - last_seen) > 45", (int(time.time()),))
             await db.commit()
         print(f"[DB] SQLite Merkez Veritabani Hazir.")
     except Exception as e:
@@ -122,7 +122,7 @@ function HandleConsoleReload(Split)
 end
 """
 
-# BUG FIX: HOOK_PLAYER_USING_ITEM eklendi (Havaya sag tiklama)
+# GUI VE PUSULA MEKANİKLERİ BURADA YENİDEN YAZILDI
 WCHUB_MAIN = """
 local ProxyURL = "http://127.0.0.1:8080"
 if os.getenv("PROXY_URL") then ProxyURL = os.getenv("PROXY_URL") end
@@ -135,45 +135,96 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("WCHub")
-    Plugin:SetVersion(3)
+    Plugin:SetVersion(4)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, GiveRing)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED, GiveRing)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_RIGHT_CLICK, OnRightClick)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_USING_ITEM, OnRightClick)
-    LOG("[HUB] WCHub aktif! Yuzuk sistemi devrede.")
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_TOSS_ITEM, OnPlayerTossItem)
+    cPluginManager:AddHook(cPluginManager.HOOK_KILLED, OnKilled)
+    LOG("[HUB] WCHub GUI aktif! Yuzuk yere dusmez ve sandik acilir.")
     return true
 end
 
 function GiveRing(Player)
     local inv = Player:GetInventory()
     local hasRing = false
-    for i=0, 35 do if inv:GetSlot(i).m_ItemType == E_ITEM_COMPASS then hasRing = true break end end
+    for i=0, 35 do 
+        if inv:GetSlot(i).m_ItemType == E_ITEM_COMPASS then hasRing = true break end 
+    end
     if not hasRing then
         local ring = cItem(E_ITEM_COMPASS, 1)
         ring.m_CustomName = "§eSunucu Secici §7(Sag Tik)"
-        inv:AddItem(ring)
+        inv:SetHotbarSlot(8, ring)
     end
 end
 
-function OnRightClick(Player, BlockX, BlockY, BlockZ, BlockFace, CursorX, CursorY, CursorZ)
-    local EquippedItem = Player:GetEquippedItem()
-    if EquippedItem.m_ItemType == E_ITEM_COMPASS then
-        cNetwork:Get(ProxyURL .. "/api/servers", function(Body, Data)
-            if Body and Body ~= "" then
-                Player:SendMessageInfo("§e--- Aktif Sunucular ---")
-                local servers = Split(Body, ";")
-                for i, srv in ipairs(servers) do
-                    local parts = Split(srv, ":")
-                    if #parts == 2 then
-                        Player:SendMessage(cCompositeChat():AddTextPart("§8[§b" .. parts[1] .. "§8] §7- Aktif ")
-                            :AddRunCommandPart("§a[GEÇİŞ YAP]", "/wc_transfer " .. parts[1]))
-                    end
-                end
-            else
-                Player:SendMessageFailure("Sunuculara ulasilamadi.")
-            end
-        end)
+function OnPlayerTossItem(Player, NumTicks, Item)
+    if Item.m_ItemType == E_ITEM_COMPASS then
+        Player:SendMessageWarning("§cPusulayi yere atamazsin!")
+        return true -- Yere atmayi engeller
     end
     return false
+end
+
+function OnKilled(Victim, TCA, CustomDeathMessage)
+    if Victim:IsPlayer() then
+        local inv = Victim:GetInventory()
+        for i=0, 35 do
+            if inv:GetSlot(i).m_ItemType == E_ITEM_COMPASS then
+                inv:SetSlot(i, cItem(E_ITEM_EMPTY, 0)) -- Olunce pusulayi sil ki yere dusmesin
+            end
+        end
+    end
+    return false
+end
+
+function OnRightClick(Player, BlockX, BlockY, BlockZ, BlockFace, CursorX, CursorY, CursorZ)
+    local item = Player:GetEquippedItem()
+    if item.m_ItemType == E_ITEM_COMPASS then
+        OpenGUI(Player)
+        return true -- Blok yerlestirmeyi veya diger aksiyonlari iptal et
+    end
+    return false
+end
+
+function OpenGUI(Player)
+    cNetwork:Get(ProxyURL .. "/api/servers", function(Body, Data)
+        if Body and Body ~= "" then
+            -- 3 Satirli Sandik Menusu Olustur (GUI)
+            local Window = cLuaWindow(cWindow.wtChest, 3, "§8Sunucu Agi")
+            local servers = Split(Body, ";")
+            
+            for i, srv in ipairs(servers) do
+                local parts = Split(srv, ":")
+                if #parts == 2 then
+                    -- Yesil cam pane (Item ID: 160, Damage: 5)
+                    local item = cItem(E_ITEM_STAINED_GLASS_PANE, 1, 5)
+                    item.m_CustomName = "§a" .. parts[1]
+                    item.m_Lore = "§7Aktif Oyuncu: §e" .. parts[2] .. "|§8Tikla ve baglan!"
+                    Window:SetSlot(Player, i - 1, item)
+                end
+            end
+            
+            -- Menude Tiklama Olayi (GUI Click)
+            Window:SetOnClicked(function(a_Window, a_Player, a_SlotNum, a_ClickAction, a_ClickedItem)
+                if a_SlotNum >= 0 and a_SlotNum < 27 then
+                    if a_ClickedItem.m_ItemType ~= E_ITEM_EMPTY then
+                        local target = string.sub(a_ClickedItem.m_CustomName, 3)
+                        a_Player:SendMessageSuccess("§a" .. target .. " sunucusuna baglaniliyor...")
+                        a_Player:ExecuteCommand("/wc_transfer " .. target)
+                        a_Window:Close(a_Player)
+                    end
+                    return true -- Esyayi envantere almayi engeller!
+                end
+                return false
+            end)
+            
+            Player:OpenWindow(Window)
+        else
+            Player:SendMessageFailure("§cSunuculara ulasilamadi.")
+        end
+    end)
 end
 """
 
@@ -182,7 +233,7 @@ def write_configs(server_dir=SERVER_DIR):
         f"{server_dir}/settings.ini": SETTINGS_INI.strip(),
         f"{server_dir}/Plugins/WCSync/Info.lua": 'g_PluginInfo = {Name="WCSync", Version="2"}',
         f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
-        f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="3"}',
+        f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="4"}',
         f"{server_dir}/Plugins/WCHub/main.lua": WCHUB_MAIN.strip(),
     }
     for path, content in files.items():
@@ -211,6 +262,7 @@ def vi_dec(data, pos=0):
         r |= (b & 0x7F) << shift
         if not (b & 0x80): return r, pos
         shift += 7
+    return 0, pos
 
 async def vi_rd(reader):
     r = shift = 0
@@ -452,7 +504,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
                 conn = sqlite3.connect(DB_FILE)
                 conn.row_factory = sqlite3.Row
                 cur = conn.cursor()
-                cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 60", (int(time.time()),))
+                cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 45", (int(time.time()),))
                 servers = [{"sunucu": r["label"], "oyuncu_sayisi": r["players"]} for r in cur.fetchall()]
                 conn.close()
             except:
@@ -481,7 +533,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/servers":
             try:
                 conn = sqlite3.connect(DB_FILE); conn.row_factory = sqlite3.Row; cur = conn.cursor()
-                cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 60 ORDER BY label ASC", (int(time.time()),))
+                cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 45 ORDER BY label ASC", (int(time.time()),))
                 resp = ";".join([f"{r['label']}:{r['players']}" for r in cur.fetchall()])
                 conn.close()
                 self.send_response(200); self.end_headers(); self.wfile.write(resp.encode())
@@ -503,7 +555,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             try:
                 s_data = json.loads(self.rfile.read(length))
                 host, port = s_data['host'], s_data['port']
-                req_label = s_data.get('label') # BUG FIX: Sabit Label kontrolu
+                req_label = s_data.get('label')
                 now = int(time.time())
                 
                 with _DB_LOCK: 
@@ -567,7 +619,7 @@ def run_bore_for_gameserver():
     proxy_url = os.environ.get("PROXY_URL", "")
     if not proxy_url: return
     current_gs_bore = None
-    label = os.environ.get("SERVER_LABEL", "AltSunucu") # BUG FIX: Sabit Label
+    label = os.environ.get("SERVER_LABEL", "AltSunucu")
     
     def heartbeat():
         while True:
@@ -657,7 +709,7 @@ def register_local_cuberite():
     while True:
         time.sleep(15)
         try:
-            payload = json.dumps({"host": "127.0.0.1", "port": CUBERITE_PORT, "label": "GM1"}) # BUG FIX: Sabit Label
+            payload = json.dumps({"host": "127.0.0.1", "port": CUBERITE_PORT, "label": "GM1"})
             req = urllib.request.Request(f"http://127.0.0.1:{HTTP_PORT}/api/register", data=payload.encode(), headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=5)
         except Exception: pass
