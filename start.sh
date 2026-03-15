@@ -7,10 +7,12 @@ echo "[SISTEM] Baslatma dizisi basliyor..."
 # Artik isimlendirme (GM1, GM2) tamamen Python tarafindan otomatik yapilacak.
 
 if [[ "$RENDER_EXTERNAL_HOSTNAME" == *"wc-yccy"* ]]; then
+    # Eger baglanti url'sinde wc-yccy varsa bu sunucu MERKEZ HUB'dir
     export ENGINE_MODE="all"
     export DATA_DIR="/data"
     echo "[START] Otomatik ALL modu algilandi (Ana Hub)"
 else
+    # Eger isim farkliysa, bu sunucu ALT SUNUCUDUR ve merkeze baglanmalidir
     export ENGINE_MODE="gameserver"
     export SERVER_DIR="/server"
     export DATA_DIR="/server/world"
