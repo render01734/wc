@@ -2,11 +2,10 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • FIX: Cuberite Loglari artik terminalde gorunur (Sorun tespiti icin)
-  • FIX: Lua sessiz cokmelerine karsi pcall ve LOG sistemi eklendi
+  • FIX: Cuberite Loglari terminalde gorunur (Sorun tespiti icin)
+  • FIX: Pusula kaldirildi, yerine /hub ve /sunucu komutlari eklendi
   • FIX: POST istegindeki player_file bloğu hatasi giderildi
   • FIX: Render API zaman asimi 15 saniyeye yukseltildi
-  • DEBUG: Pusula (Sag Tik) algilama testi eklendi
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -143,68 +142,26 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("WCHub")
-    Plugin:SetVersion(5)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, GiveRing)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED, GiveRing)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_RIGHT_CLICK, OnRightClick)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_USING_ITEM, OnRightClick)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_TOSS_ITEM, OnPlayerTossItem)
-    cPluginManager:AddHook(cPluginManager.HOOK_KILLED, OnKilled)
-    LOG("[HUB] WCHub GUI aktif! Yuzuk yere dusmez ve sandik acilir.")
+    Plugin:SetVersion(6)
+    
+    -- Pusula yerine komut sistemi bagliyoruz
+    cPluginManager:BindCommand("/hub", "*", HandleHubCommand, "Sunucu secici menusunu acar.")
+    cPluginManager:BindCommand("/sunucu", "*", HandleHubCommand, "Sunucu secici menusunu acar.")
+    
+    LOG("[HUB] WCHub komut tabanli sisteme gecti! /hub veya /sunucu yazilabilir.")
     return true
 end
 
-function GiveRing(Player)
-    local inv = Player:GetInventory()
-    local hasRing = false
-    for i=0, 35 do 
-        if inv:GetSlot(i).m_ItemType == E_ITEM_COMPASS then hasRing = true break end 
-    end
-    if not hasRing then
-        local ring = cItem(E_ITEM_COMPASS, 1)
-        ring.m_CustomName = "§eSunucu Secici §7(Sag Tik)"
-        inv:SetHotbarSlot(8, ring)
-    end
-end
-
-function OnPlayerTossItem(Player, NumTicks, Item)
-    if Item.m_ItemType == E_ITEM_COMPASS then
-        Player:SendMessageWarning("§cPusulayi yere atamazsin!")
-        return true
-    end
-    return false
-end
-
-function OnKilled(Victim, TCA, CustomDeathMessage)
-    if Victim:IsPlayer() then
-        local inv = Victim:GetInventory()
-        for i=0, 35 do
-            if inv:GetSlot(i).m_ItemType == E_ITEM_COMPASS then
-                inv:SetSlot(i, cItem(E_ITEM_EMPTY, 0))
-            end
-        end
-    end
-    return false
-end
-
-function OnRightClick(Player, ...)
-    local item = Player:GetEquippedItem()
-    
-    -- YENİ EKLENEN LOG: Tıklama algılandığında konsola basacak
-    LOG("[WCHub-DEBUG] " .. Player:GetName() .. " sag tikladi. Esya ID: " .. tostring(item.m_ItemType))
-    
-    if item.m_ItemType == E_ITEM_COMPASS then
-        OpenGUI(Player)
-        return true
-    end
-    return false
+function HandleHubCommand(Split, Player)
+    OpenGUI(Player)
+    return true
 end
 
 function OpenGUI(Player)
     local PlayerName = Player:GetName()
     local World = Player:GetWorld()
     
-    LOG("[WCHub] " .. PlayerName .. " pusulaya tikladi. API istegi basliyor...")
+    LOG("[WCHub] " .. PlayerName .. " /hub komutunu kullandi. API istegi basliyor...")
 
     if type(cUrlClient) == "nil" then
         LOGWARNING("[WCHub] cUrlClient API'si bulunamadi! HTTP destegi yok.")
@@ -225,7 +182,7 @@ function OpenGUI(Player)
                     return
                 end
 
-                -- GUI olusturma kisminda hata yakalayici (pcall) eklendi
+                -- GUI olusturma kisminda hata yakalayici (pcall)
                 local isSuccess, Window = pcall(function()
                     return cLuaWindow(cWindow.wtChest, 3, "§8Sunucu Agi")
                 end)
@@ -896,7 +853,7 @@ def run_cuberite():
             line = raw.rstrip() if isinstance(raw, str) else raw.decode("utf-8", "replace").rstrip()
             if not line: continue
             
-            # --- YENI: Cuberite'in tum ciktilarini (Hatalari) konsola yansit! ---
+            # --- Cuberite'in tum ciktilarini (Hatalari) konsola yansit! ---
             print(f"[CUBERITE] {line}")
             
             if "WCSYNC_JOIN:" in line:
