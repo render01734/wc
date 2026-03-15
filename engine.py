@@ -2,10 +2,10 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • Tünel Çakışması ve DB Zaman Uyuşmazlığı ÇÖZÜLDÜ!
-  • WCSync: Merkezi Envanter Senkronizasyonu (API Entegreli)
+  • BUG FIX: Havaya sağ tıklama algılaması eklendi (Pusula Fix)
+  • BUG FIX: Bore Port değişimindeki sonsuz GM çoğalması çözüldü (Sabit Label)
+  • WCSync: Merkezi Envanter Senkronizasyonu
   • WCHub: Pusula ile Sunucular Arası Kesintisiz Geçiş
-  • Ana Web Adresinde JSON Formatında IP Gösterimi Eklendi
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -35,7 +35,7 @@ _active_players  = []
 _DB_LOCK         = threading.Lock()
 
 # ══════════════════════════════════════════════════════════
-#  VERİTABANI İŞLEMLERİ
+#  VERİTABANI İŞLEMLERİ (Otomatik Temizlik Eklendi)
 # ══════════════════════════════════════════════════════════
 
 async def init_db():
@@ -54,6 +54,8 @@ async def init_db():
                     username TEXT PRIMARY KEY, last_server TEXT
                 )
             """)
+            # Hayalet (Portu degismis, olu) sunuculari baslangicta temizle!
+            await db.execute("DELETE FROM servers WHERE (? - last_seen) > 300", (int(time.time()),))
             await db.commit()
         print(f"[DB] SQLite Merkez Veritabani Hazir.")
     except Exception as e:
@@ -120,6 +122,7 @@ function HandleConsoleReload(Split)
 end
 """
 
+# BUG FIX: HOOK_PLAYER_USING_ITEM eklendi (Havaya sag tiklama)
 WCHUB_MAIN = """
 local ProxyURL = "http://127.0.0.1:8080"
 if os.getenv("PROXY_URL") then ProxyURL = os.getenv("PROXY_URL") end
@@ -132,9 +135,10 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("WCHub")
-    Plugin:SetVersion(2)
+    Plugin:SetVersion(3)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, GiveRing)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_RIGHT_CLICK, OnRightClick)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_USING_ITEM, OnRightClick)
     LOG("[HUB] WCHub aktif! Yuzuk sistemi devrede.")
     return true
 end
@@ -178,7 +182,7 @@ def write_configs(server_dir=SERVER_DIR):
         f"{server_dir}/settings.ini": SETTINGS_INI.strip(),
         f"{server_dir}/Plugins/WCSync/Info.lua": 'g_PluginInfo = {Name="WCSync", Version="2"}',
         f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
-        f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="2"}',
+        f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="3"}',
         f"{server_dir}/Plugins/WCHub/main.lua": WCHUB_MAIN.strip(),
     }
     for path, content in files.items():
@@ -439,7 +443,6 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
-        # 1. Ana ekranda IP gosteren JSON Paneli
         if self.path == "/":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -500,20 +503,30 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             try:
                 s_data = json.loads(self.rfile.read(length))
                 host, port = s_data['host'], s_data['port']
+                req_label = s_data.get('label') # BUG FIX: Sabit Label kontrolu
                 now = int(time.time())
                 
                 with _DB_LOCK: 
                     conn = sqlite3.connect(DB_FILE)
                     cur = conn.cursor()
-                    cur.execute("SELECT label FROM servers WHERE host=? AND port=?", (host, port))
-                    row = cur.fetchone()
-                    if row:
-                        label = row[0]
-                        conn.execute("UPDATE servers SET last_seen=? WHERE label=?", (now, label))
+                    if req_label:
+                        cur.execute("SELECT label FROM servers WHERE label=?", (req_label,))
+                        if cur.fetchone():
+                            conn.execute("UPDATE servers SET host=?, port=?, last_seen=? WHERE label=?", (host, port, now, req_label))
+                            label = req_label
+                        else:
+                            conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, ?)", (req_label, host, port, now))
+                            label = req_label
                     else:
-                        cur.execute("SELECT COUNT(*) FROM servers")
-                        label = f"GM{cur.fetchone()[0] + 1}"
-                        conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, ?)", (label, host, port, now))
+                        cur.execute("SELECT label FROM servers WHERE host=? AND port=?", (host, port))
+                        row = cur.fetchone()
+                        if row:
+                            label = row[0]
+                            conn.execute("UPDATE servers SET last_seen=? WHERE label=?", (now, label))
+                        else:
+                            cur.execute("SELECT COUNT(*) FROM servers")
+                            label = f"GM{cur.fetchone()[0] + 1}"
+                            conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, ?)", (label, host, port, now))
                     conn.commit(); conn.close()
                 
                 self.send_response(200); self.end_headers(); self.wfile.write(json.dumps({"label": label}).encode())
@@ -554,6 +567,7 @@ def run_bore_for_gameserver():
     proxy_url = os.environ.get("PROXY_URL", "")
     if not proxy_url: return
     current_gs_bore = None
+    label = os.environ.get("SERVER_LABEL", "AltSunucu") # BUG FIX: Sabit Label
     
     def heartbeat():
         while True:
@@ -561,7 +575,8 @@ def run_bore_for_gameserver():
             if current_gs_bore:
                 try:
                     host, port_str = current_gs_bore.split(":")
-                    req = urllib.request.Request(f"{proxy_url}/api/register", data=json.dumps({"host": host, "port": int(port_str)}).encode(), headers={"Content-Type": "application/json"})
+                    payload = json.dumps({"host": host, "port": int(port_str), "label": label})
+                    req = urllib.request.Request(f"{proxy_url}/api/register", data=payload.encode(), headers={"Content-Type": "application/json"})
                     urllib.request.urlopen(req, timeout=5)
                 except Exception: pass
 
@@ -642,7 +657,8 @@ def register_local_cuberite():
     while True:
         time.sleep(15)
         try:
-            req = urllib.request.Request(f"http://127.0.0.1:{HTTP_PORT}/api/register", data=json.dumps({"host": "127.0.0.1", "port": CUBERITE_PORT}).encode(), headers={"Content-Type": "application/json"})
+            payload = json.dumps({"host": "127.0.0.1", "port": CUBERITE_PORT, "label": "GM1"}) # BUG FIX: Sabit Label
+            req = urllib.request.Request(f"http://127.0.0.1:{HTTP_PORT}/api/register", data=payload.encode(), headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=5)
         except Exception: pass
 
