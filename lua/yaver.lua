@@ -90,7 +90,7 @@ end
 
 -- ================= Kurt Cantasi (Envanter) =================
 function GetBackpack(UUID)
-    local Window = cLuaWindow(cWindow.wtChest, 3, "§8Yaver Cantasi")
+    local Window = cLuaWindow(cWindow.wtChest, 9, 3, "§8Yaver Cantasi")
     local InvIni = cIniFile()
     InvIni:ReadFile("YaverInv.ini")
     for i=0, 26 do
@@ -190,7 +190,7 @@ function OnRightClickingEntity(Player, Entity)
         if ActiveWolves[UUID] == Entity:GetUniqueID() then
             
             if Player:IsCrouched() then
-                Player:ExecuteCommand("/hub")
+                cPluginManager:Get():ExecuteCommand(Player, "/hub")
                 return true
             end
             
