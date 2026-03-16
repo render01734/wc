@@ -5,8 +5,8 @@
   • FIX: MySQL iptal edildi, Tam Otomatik SQLite (Tak-Çalıştır) geri döndü!
   • FIX: Kurt (/kurt) sistemi icin 'GetWolfType' Tarayicisi devrede.
   • WEB: Canli Konsol (Terminal) aktif.
-  • GITHUB: Lua betikleri artik dinamik olarak GitHub'dan cekiliyor.
   • MASTER: Tüm sunucuları tek noktadan dinleme ve komut/script senkronizasyonu aktif!
+  • DİNAMİK: GitHub 'list' dosyası üzerinden sonsuz otomatik Lua eklenti desteği!
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -49,13 +49,12 @@ def log_msg(text):
     line = f"[{stamp}] {text}"
     SYSTEM_LOGS.append(line)
     print(line)
-    # Eğer gameserver ise, logu merkeze göndermek için sıraya ekle
     if MODE == "gameserver":
         with _LOG_LOCK:
             _pending_remote_logs.append(text)
 
 # ══════════════════════════════════════════════════════════
-#  VERİTABANI İŞLEMLERİ (Tam Otomatik SQLite)
+#  VERİTABANI İŞLEMLERİ
 # ══════════════════════════════════════════════════════════
 
 async def init_db():
@@ -87,19 +86,69 @@ async def init_db():
         log_msg(f"[DB] HATA: Veritabani Olusturulamadi -> {e}")
 
 # ══════════════════════════════════════════════════════════
-#  YAPILANDIRMA VE GITHUB SCRIPT GÜNCELLEYİCİ
+#  DİNAMİK GITHUB SCRIPT GÜNCELLEYİCİ VE YAPILANDIRMA
 # ══════════════════════════════════════════════════════════
 
-SETTINGS_INI = f"""
+def update_and_configure(server_dir=SERVER_DIR):
+    base_url = "https://raw.githubusercontent.com/Exma0/va/refs/heads/main"
+    list_url = f"{base_url}/list"
+    
+    log_msg("[GÜNCELLEME] GitHub'dan dinamik eklenti listesi (list dosyası) kontrol ediliyor...")
+    try:
+        req = urllib.request.Request(list_url)
+        lines = urllib.request.urlopen(req, timeout=10).read().decode('utf-8').splitlines()
+    except Exception as e:
+        log_msg(f"[GÜNCELLEME HATA] Liste çekilemedi: {e}")
+        lines = ["wcsync.lua", "wchub.lua", "yaver.lua"] # Liste çekilemezse varsayılanlara dön
+        
+    plugin_names = []
+    success_count = 0
+    total_scripts = 0
+    
+    for line in lines:
+        script_name = line.strip()
+        if not script_name or not script_name.endswith('.lua'): continue
+        total_scripts += 1
+        
+        # Klasör adı belirleme (eski eklentilerin büyük/küçük harf yapısını korumak için, yeniler otomatik açılır)
+        if script_name == "wcsync.lua": folder_name = "WCSync"
+        elif script_name == "wchub.lua": folder_name = "WCHub"
+        else: folder_name = script_name[:-4] # Örn: yeni.lua -> klasör adı "yeni"
+        
+        plugin_names.append(folder_name)
+        
+        try:
+            req = urllib.request.Request(f"{base_url}/{script_name}")
+            code = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
+            
+            # WCHub için HTTP port enjeksiyonu
+            if folder_name == "WCHub" or folder_name.lower() == "wchub":
+                code = code.replace("{PORT}", str(HTTP_PORT))
+                
+            plugin_dir = f"{server_dir}/Plugins/{folder_name}"
+            pathlib.Path(plugin_dir).mkdir(parents=True, exist_ok=True)
+            
+            # main.lua dosyasını yaz
+            pathlib.Path(f"{plugin_dir}/main.lua").write_text(code + "\n", encoding="utf-8")
+            
+            # Cuberite'ın eklentiyi görmesi için zorunlu olan Info.lua dosyasını dinamik oluştur
+            info_content = f'g_PluginInfo = {{Name="{folder_name}", Version="1"}}'
+            pathlib.Path(f"{plugin_dir}/Info.lua").write_text(info_content + "\n", encoding="utf-8")
+            
+            success_count += 1
+        except Exception as e:
+            log_msg(f"[GÜNCELLEME HATA] {script_name} çekilemedi: {e}")
+            
+    # settings.ini dosyasını indirilen listeye göre dinamik olarak baştan yarat
+    plugins_ini = "\n".join([f"Plugin={name}" for name in plugin_names])
+    settings_ini = f"""
 [Authentication]
 Authenticate=0
 OnlineMode=0
 ServerID=WCHubEngine
 
 [Plugins]
-Plugin=WCHub
-Plugin=WCSync
-Plugin=yaver
+{plugins_ini}
 
 [Server]
 Description=Minecraft Distributed Hub
@@ -108,47 +157,12 @@ Port={CUBERITE_PORT}
 Ports={CUBERITE_PORT}
 NetworkCompressionThreshold=-1
 """
-
-def write_configs(server_dir=SERVER_DIR):
-    files = {
-        f"{server_dir}/settings.ini": SETTINGS_INI.strip(),
-        f"{server_dir}/Plugins/WCSync/Info.lua": 'g_PluginInfo = {Name="WCSync", Version="3"}',
-        f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="12"}',
-        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="11"}',
-    }
-    for path, content in files.items():
-        try:
-            pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-            pathlib.Path(path).write_text(content + "\n", encoding="utf-8")
-        except Exception: pass
-
-def update_lua_scripts(server_dir=SERVER_DIR):
-    """GitHub reposundan Lua betiklerini çeker ve günceller."""
-    base_url = "https://github.com/Exma0/va/tree/main"
-    success_count = 0
-    scripts = {
-        "wcsync.lua": f"{server_dir}/Plugins/WCSync/main.lua",
-        "wchub.lua": f"{server_dir}/Plugins/WCHub/main.lua",
-        "yaver.lua": f"{server_dir}/Plugins/yaver/main.lua"
-    }
+    try:
+        pathlib.Path(f"{server_dir}/settings.ini").write_text(settings_ini.strip() + "\n", encoding="utf-8")
+    except: pass
     
-    log_msg("[GÜNCELLEME] GitHub'dan Lua betikleri kontrol ediliyor...")
-    for repo_file, local_path in scripts.items():
-        try:
-            req = urllib.request.Request(f"{base_url}/{repo_file}")
-            code = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
-            
-            if repo_file == "wchub.lua":
-                code = code.replace("{PORT}", str(HTTP_PORT))
-                
-            pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-            pathlib.Path(local_path).write_text(code + "\n", encoding="utf-8")
-            success_count += 1
-        except Exception as e:
-            log_msg(f"[GÜNCELLEME HATA] {repo_file} çekilemedi: {e}")
-            
-    if success_count == len(scripts):
-        log_msg("[GÜNCELLEME] Tüm Lua betikleri başarıyla güncellendi.")
+    if total_scripts > 0 and success_count > 0:
+        log_msg(f"[GÜNCELLEME] {success_count}/{total_scripts} eklenti basariyla senkronize edildi.")
         return True
     return False
 
@@ -475,7 +489,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
 <div class="section-title">Sunucular</div>
 <div class="actions">
   <button class="btn btn-danger" id="restartAllBtn" onclick="restartAll()">🔄 Tüm Sunucuları Yeniden Başlat</button>
-  <button class="btn btn-success" id="updateScriptsBtn" onclick="updateScripts()">📥 Ağı Güncelle (GitHub)</button>
+  <button class="btn btn-success" id="updateScriptsBtn" onclick="updateScripts()">📥 Ağı Güncelle (GitHub Dinamik Liste)</button>
   <span id="statusMsg" style="color:#8b949e;font-size:.82rem"></span>
 </div>
 <table>
@@ -634,20 +648,19 @@ async function sendCommand() {{
     def do_POST(self):
         global _cmd_counter, _last_script_update
 
-        # YENI SCRIPT GUNCELLEME ENDPOINT'I
+        # YENİ SCRIPT GÜNCELLEME ENDPOINT'İ (Dinamik Liste Üzerinden)
         if self.path == "/api/update_scripts":
-            success = update_lua_scripts()
+            success = update_and_configure()
             if success:
-                # Merkezin güncellenme tarihini değiştir, alt sunucular bunu fark edip kendini güncelleyecek
                 _last_script_update = time.time()
                 if _cuberite_proc and _cuberite_proc.poll() is None:
                     _cuberite_proc.stdin.write("reload\n")
                     _cuberite_proc.stdin.flush()
                 self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
-                self.wfile.write(json.dumps({"ok": True, "message": "Scriptler güncellendi ve tüm ağa iletiliyor!"}).encode())
+                self.wfile.write(json.dumps({"ok": True, "message": "Yeni Scriptler Listeden çekildi ve ağa iletiliyor!"}).encode())
             else:
                 self.send_response(500); self.send_header("Content-Type","application/json"); self.end_headers()
-                self.wfile.write(json.dumps({"ok": False, "message": "Scriptleri çekerken bir sorun yaşandı."}).encode())
+                self.wfile.write(json.dumps({"ok": False, "message": "Listeden scriptleri çekerken sorun yaşandı."}).encode())
             return
             
         if self.path == "/api/command":
@@ -656,12 +669,10 @@ async function sendCommand() {{
                 data = json.loads(self.rfile.read(length))
                 cmd = data.get("command", "")
                 if cmd:
-                    # Komutu havuza ekle (alt sunucular çekecek)
                     _cmd_counter += 1
                     _cmd_history.append({"id": _cmd_counter, "cmd": cmd})
                     if len(_cmd_history) > 100: _cmd_history.pop(0)
 
-                    # Eger local bir sunucu çalışıyorsa ona direkt yolla
                     if _cuberite_proc and _cuberite_proc.poll() is None:
                         _cuberite_proc.stdin.write(cmd + "\n")
                         _cuberite_proc.stdin.flush()
@@ -675,7 +686,6 @@ async function sendCommand() {{
             self.end_headers()
             return
             
-        # ALT SUNUCU SENKRONİZASYON KÖPRÜSÜ
         if self.path == "/api/node_sync":
             length = int(self.headers.get("Content-Length", 0))
             try:
@@ -693,12 +703,9 @@ async function sendCommand() {{
                         conn.close()
                     except: pass
                 
-                # Gelen logları merkezi ekrana yansıt
                 for l in data.get("logs", []):
-                    # Zaten log_msg formatında geldiği için başına sadece sunucu ismini ekliyoruz
                     SYSTEM_LOGS.append(f"[{label}] {l.split('] ', 1)[-1]}")
 
-                # Sunucuya gönderilecek verileri hazırla
                 client_cmd_id = data.get("last_cmd_id", 0)
                 client_update_ts = data.get("last_update_ts", 0)
 
@@ -882,14 +889,13 @@ def run_bore_for_gameserver():
                     if resp_data.get("restart"): _restart_local_cuberite()
                 except Exception: pass
 
-    # ALT SUNUCU SENKRONİZASYON MOTORU
     def sync_loop():
         global _pending_remote_logs
         last_cmd_id = 0
         last_update_ts = time.time()
 
         while True:
-            time.sleep(1.5) # Gerçek zamanlıya çok yakın bir tepkime süresi
+            time.sleep(1.5)
             with _LOG_LOCK:
                 logs_to_send = list(_pending_remote_logs)
                 _pending_remote_logs.clear()
@@ -908,7 +914,6 @@ def run_bore_for_gameserver():
                 resp = urllib.request.urlopen(req, timeout=5).read()
                 data = json.loads(resp)
 
-                # Merkezden gelen yeni komutları çalıştır
                 for cmd_obj in data.get("commands", []):
                     cid = cmd_obj["id"]
                     cmd = cmd_obj["cmd"]
@@ -918,17 +923,15 @@ def run_bore_for_gameserver():
                             _cuberite_proc.stdin.write(cmd + "\n")
                             _cuberite_proc.stdin.flush()
 
-                # Merkezden gelen script güncelleme sinyali
                 if data.get("update_scripts") and data.get("current_ts") > last_update_ts:
                     last_update_ts = data.get("current_ts")
-                    log_msg("[SYNC] Merkezden guncelleme sinyali alindi! GitHub'dan cekiliyor...")
-                    update_lua_scripts()
+                    log_msg("[SYNC] Merkezden guncelleme sinyali alindi! Yeni eklentiler listeleniyor...")
+                    update_and_configure()
                     if _cuberite_proc and _cuberite_proc.poll() is None:
                         _cuberite_proc.stdin.write("reload\n")
                         _cuberite_proc.stdin.flush()
 
             except Exception as e:
-                # İnternet koparsa loglar kaybolmasın diye geri iade et
                 with _LOG_LOCK:
                     for l in reversed(logs_to_send):
                         _pending_remote_logs.insert(0, l)
@@ -951,8 +954,7 @@ def run_bore_for_gameserver():
         time.sleep(5)
 
 def run_cuberite():
-    write_configs()
-    update_lua_scripts() # Baslarken github'dan son versionlari ceker
+    update_and_configure() # Baslarken github'daki dinamik listeden son eklentileri ceker
     mc_bin = next(iter(glob.glob("/server/**/Cuberite", recursive=True)), None)
     if not mc_bin: return
     os.chmod(mc_bin, 0o755)
