@@ -6,6 +6,7 @@
   • FIX: Kurt (/kurt) sistemi icin 'GetWolfType' Tarayicisi devrede.
   • WEB: Canli Konsol (Terminal) aktif.
   • GITHUB: Lua betikleri artik dinamik olarak GitHub'dan cekiliyor.
+  • MASTER: Tüm sunucuları tek noktadan dinleme ve komut/script senkronizasyonu aktif!
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -35,14 +36,23 @@ _active_players   = []
 _DB_LOCK          = threading.Lock()
 _cuberite_proc    = None   
 
-# === CANLI KONSOL LOGLARI İÇİN TAMPON ===
+# === MERKEZİ SENKRONİZASYON DEĞİŞKENLERİ ===
 SYSTEM_LOGS = deque(maxlen=200)
+_cmd_history = []
+_cmd_counter = 0
+_last_script_update = time.time()
+_pending_remote_logs = []
+_LOG_LOCK = threading.Lock()
 
 def log_msg(text):
     stamp = datetime.datetime.now().strftime("%H:%M:%S")
     line = f"[{stamp}] {text}"
     SYSTEM_LOGS.append(line)
     print(line)
+    # Eğer gameserver ise, logu merkeze göndermek için sıraya ekle
+    if MODE == "gameserver":
+        with _LOG_LOCK:
+            _pending_remote_logs.append(text)
 
 # ══════════════════════════════════════════════════════════
 #  VERİTABANI İŞLEMLERİ (Tam Otomatik SQLite)
@@ -128,7 +138,6 @@ def update_lua_scripts(server_dir=SERVER_DIR):
             req = urllib.request.Request(f"{base_url}/{repo_file}")
             code = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
             
-            # WCHub içerisindeki proxy portunu dinamik olarak enjekte et
             if repo_file == "wchub.lua":
                 code = code.replace("{PORT}", str(HTTP_PORT))
                 
@@ -466,7 +475,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
 <div class="section-title">Sunucular</div>
 <div class="actions">
   <button class="btn btn-danger" id="restartAllBtn" onclick="restartAll()">🔄 Tüm Sunucuları Yeniden Başlat</button>
-  <button class="btn btn-success" id="updateScriptsBtn" onclick="updateScripts()">📥 Script Güncelle (GitHub)</button>
+  <button class="btn btn-success" id="updateScriptsBtn" onclick="updateScripts()">📥 Ağı Güncelle (GitHub)</button>
   <span id="statusMsg" style="color:#8b949e;font-size:.82rem"></span>
 </div>
 <table>
@@ -474,7 +483,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
   <tbody id="serverBody">{rows if rows else '<tr><td colspan="4" style="color:#8b949e;text-align:center;padding:28px">Aktif sunucu yok</td></tr>'}</tbody>
 </table>
 
-<div class="section-title">🖥️ Canlı Sistem Konsolu (Yerel)</div>
+<div class="section-title">🖥️ Canlı Sistem Konsolu (Ağdaki Tüm Sunucular)</div>
 <div class="console-box" id="consoleBox">Yükleniyor...</div>
 <div class="console-input-row">
     <input type="text" class="console-input" id="cmdInput" placeholder="Komut yazın... (Örn: say Merhaba veya time set day)">
@@ -510,7 +519,7 @@ async function restartOne(label){{
 
 async function updateScripts(){{
   const btn=document.getElementById('updateScriptsBtn');
-  btn.disabled=true; toast('GitHub dan scriptler çekiliyor...');
+  btn.disabled=true; toast('Tüm ağ GitHub üzerinden güncelleniyor...');
   try{{
     const r=await fetch('/api/update_scripts',{{method:'POST'}});
     const d=await r.json();
@@ -553,7 +562,7 @@ async function sendCommand() {{
             headers: {{'Content-Type': 'application/json'}},
             body: JSON.stringify({{command: cmd}})
         }});
-        toast('✅ Komut gönderildi');
+        toast('✅ Tüm sunuculara iletildi!');
         fetchLogs();
     }} catch(e){{toast('❌ Gönderim hatası', true);}}
 }}
@@ -623,19 +632,22 @@ async function sendCommand() {{
             except Exception: self.send_response(500); self.end_headers()
 
     def do_POST(self):
+        global _cmd_counter, _last_script_update
+
         # YENI SCRIPT GUNCELLEME ENDPOINT'I
         if self.path == "/api/update_scripts":
             success = update_lua_scripts()
             if success:
-                # Scriptler yenilendi, sunucuya aninda algilamasi icin reload at
+                # Merkezin güncellenme tarihini değiştir, alt sunucular bunu fark edip kendini güncelleyecek
+                _last_script_update = time.time()
                 if _cuberite_proc and _cuberite_proc.poll() is None:
                     _cuberite_proc.stdin.write("reload\n")
                     _cuberite_proc.stdin.flush()
                 self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
-                self.wfile.write(json.dumps({"ok": True, "message": "Scriptler GitHub'dan başarıyla güncellendi ve aktif edildi!"}).encode())
+                self.wfile.write(json.dumps({"ok": True, "message": "Scriptler güncellendi ve tüm ağa iletiliyor!"}).encode())
             else:
                 self.send_response(500); self.send_header("Content-Type","application/json"); self.end_headers()
-                self.wfile.write(json.dumps({"ok": False, "message": "Scriptleri çekerken bir sorun yaşandı. Konsolu kontrol et."}).encode())
+                self.wfile.write(json.dumps({"ok": False, "message": "Scriptleri çekerken bir sorun yaşandı."}).encode())
             return
             
         if self.path == "/api/command":
@@ -643,10 +655,17 @@ async function sendCommand() {{
             try:
                 data = json.loads(self.rfile.read(length))
                 cmd = data.get("command", "")
-                if cmd and _cuberite_proc and _cuberite_proc.poll() is None:
-                    _cuberite_proc.stdin.write(cmd + "\n")
-                    _cuberite_proc.stdin.flush()
-                    log_msg(f"[WEB-KOMUT] {cmd}")
+                if cmd:
+                    # Komutu havuza ekle (alt sunucular çekecek)
+                    _cmd_counter += 1
+                    _cmd_history.append({"id": _cmd_counter, "cmd": cmd})
+                    if len(_cmd_history) > 100: _cmd_history.pop(0)
+
+                    # Eger local bir sunucu çalışıyorsa ona direkt yolla
+                    if _cuberite_proc and _cuberite_proc.poll() is None:
+                        _cuberite_proc.stdin.write(cmd + "\n")
+                        _cuberite_proc.stdin.flush()
+                    log_msg(f"[WEB-KOMUT] {cmd} (Ağdaki tüm sunuculara iletiliyor...)")
                     self.send_response(200)
                 else:
                     self.send_response(400)
@@ -654,6 +673,51 @@ async function sendCommand() {{
                 log_msg(f"[WEB-KOMUT HATA] {e}")
                 self.send_response(500)
             self.end_headers()
+            return
+            
+        # ALT SUNUCU SENKRONİZASYON KÖPRÜSÜ
+        if self.path == "/api/node_sync":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                data = json.loads(self.rfile.read(length))
+                srv_id = data.get("server_id", "UNKNOWN")
+                
+                label = srv_id[:6]
+                with _DB_LOCK:
+                    try:
+                        conn = sqlite3.connect(DB_FILE)
+                        cur = conn.cursor()
+                        cur.execute("SELECT label FROM servers WHERE server_id=?", (srv_id,))
+                        row = cur.fetchone()
+                        if row: label = row[0]
+                        conn.close()
+                    except: pass
+                
+                # Gelen logları merkezi ekrana yansıt
+                for l in data.get("logs", []):
+                    # Zaten log_msg formatında geldiği için başına sadece sunucu ismini ekliyoruz
+                    SYSTEM_LOGS.append(f"[{label}] {l.split('] ', 1)[-1]}")
+
+                # Sunucuya gönderilecek verileri hazırla
+                client_cmd_id = data.get("last_cmd_id", 0)
+                client_update_ts = data.get("last_update_ts", 0)
+
+                new_cmds = [c for c in _cmd_history if c["id"] > client_cmd_id]
+                needs_update = _last_script_update > client_update_ts
+
+                resp = {
+                    "commands": new_cmds,
+                    "update_scripts": needs_update,
+                    "current_ts": _last_script_update
+                }
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(resp).encode())
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
             return
 
         if self.path == "/api/restart_all":
@@ -791,6 +855,7 @@ def run_bore_for_proxy():
         time.sleep(5)
 
 def run_bore_for_gameserver():
+    global _pending_remote_logs, _cuberite_proc
     import re
     proxy_url = os.environ.get("PROXY_URL", "")
     if not proxy_url: return
@@ -817,7 +882,59 @@ def run_bore_for_gameserver():
                     if resp_data.get("restart"): _restart_local_cuberite()
                 except Exception: pass
 
+    # ALT SUNUCU SENKRONİZASYON MOTORU
+    def sync_loop():
+        global _pending_remote_logs
+        last_cmd_id = 0
+        last_update_ts = time.time()
+
+        while True:
+            time.sleep(1.5) # Gerçek zamanlıya çok yakın bir tepkime süresi
+            with _LOG_LOCK:
+                logs_to_send = list(_pending_remote_logs)
+                _pending_remote_logs.clear()
+
+            payload = {
+                "server_id": server_id,
+                "logs": logs_to_send,
+                "last_cmd_id": last_cmd_id,
+                "last_update_ts": last_update_ts
+            }
+
+            try:
+                req = urllib.request.Request(f"{proxy_url}/api/node_sync",
+                                             data=json.dumps(payload).encode(),
+                                             headers={"Content-Type": "application/json"})
+                resp = urllib.request.urlopen(req, timeout=5).read()
+                data = json.loads(resp)
+
+                # Merkezden gelen yeni komutları çalıştır
+                for cmd_obj in data.get("commands", []):
+                    cid = cmd_obj["id"]
+                    cmd = cmd_obj["cmd"]
+                    if cid > last_cmd_id:
+                        last_cmd_id = cid
+                        if _cuberite_proc and _cuberite_proc.poll() is None:
+                            _cuberite_proc.stdin.write(cmd + "\n")
+                            _cuberite_proc.stdin.flush()
+
+                # Merkezden gelen script güncelleme sinyali
+                if data.get("update_scripts") and data.get("current_ts") > last_update_ts:
+                    last_update_ts = data.get("current_ts")
+                    log_msg("[SYNC] Merkezden guncelleme sinyali alindi! GitHub'dan cekiliyor...")
+                    update_lua_scripts()
+                    if _cuberite_proc and _cuberite_proc.poll() is None:
+                        _cuberite_proc.stdin.write("reload\n")
+                        _cuberite_proc.stdin.flush()
+
+            except Exception as e:
+                # İnternet koparsa loglar kaybolmasın diye geri iade et
+                with _LOG_LOCK:
+                    for l in reversed(logs_to_send):
+                        _pending_remote_logs.insert(0, l)
+
     threading.Thread(target=heartbeat, daemon=True).start()
+    threading.Thread(target=sync_loop, daemon=True).start()
 
     while True:
         try:
