@@ -34,7 +34,18 @@ DB_FILE       = f"{DATA_DIR}/hub.db"
 _proxy_bore_addr  = None
 _active_players   = []
 _DB_LOCK          = threading.Lock()
-_cuberite_proc    = None   
+_cuberite_proc    = None
+_STDIN_LOCK       = threading.Lock()   # Cuberite stdin erişimi için kilit
+
+def _write_to_cuberite(cmd: str):
+    """Cuberite stdin'ine thread-safe komut gönder."""
+    with _STDIN_LOCK:
+        if _cuberite_proc and _cuberite_proc.poll() is None:
+            try:
+                _cuberite_proc.stdin.write(cmd + "\n")
+                _cuberite_proc.stdin.flush()
+            except Exception:
+                pass
 
 # === MERKEZİ SENKRONİZASYON DEĞİŞKENLERİ ===
 SYSTEM_LOGS = deque(maxlen=200)
@@ -121,8 +132,10 @@ def update_and_configure(server_dir=SERVER_DIR):
             req = urllib.request.Request(f"{base_url}/{script_name}")
             code = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
             
-            # WCHub için HTTP port enjeksiyonu
-            if folder_name == "WCHub" or folder_name.lower() == "wchub":
+            # DÜZELTME: Hem WCHub hem WCSync {PORT} placeholder kullanır.
+            # Sadece WCHub için yapılıyordu; WCSync'te {PORT} literal metin
+            # olarak kalıyor, ProxyURL hiç çözümlenemiyordu.
+            if "{PORT}" in code:
                 code = code.replace("{PORT}", str(HTTP_PORT))
                 
             plugin_dir = f"{server_dir}/Plugins/{folder_name}"
@@ -279,6 +292,11 @@ class PlayerConn:
             self.server_w.close()
             self.server_w = None
             self.server_r = None
+
+        # DÜZELTME: Eski sunucunun sıkıştırma eşiğini sıfırla.
+        # Sıfırlanmazsa yeni sunucudan gelen ham paketler yanlış
+        # ayrıştırılır ve bağlantı anında kopar.
+        self.comp = -1
             
         await asyncio.sleep(2.5)
         
@@ -653,9 +671,7 @@ async function sendCommand() {{
             success = update_and_configure()
             if success:
                 _last_script_update = time.time()
-                if _cuberite_proc and _cuberite_proc.poll() is None:
-                    _cuberite_proc.stdin.write("reload\n")
-                    _cuberite_proc.stdin.flush()
+                _write_to_cuberite("reload")
                 self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
                 self.wfile.write(json.dumps({"ok": True, "message": "Yeni Scriptler Listeden çekildi ve ağa iletiliyor!"}).encode())
             else:
@@ -673,9 +689,7 @@ async function sendCommand() {{
                     _cmd_history.append({"id": _cmd_counter, "cmd": cmd})
                     if len(_cmd_history) > 100: _cmd_history.pop(0)
 
-                    if _cuberite_proc and _cuberite_proc.poll() is None:
-                        _cuberite_proc.stdin.write(cmd + "\n")
-                        _cuberite_proc.stdin.flush()
+                    _write_to_cuberite(cmd)
                     log_msg(f"[WEB-KOMUT] {cmd} (Ağdaki tüm sunuculara iletiliyor...)")
                     self.send_response(200)
                 else:
@@ -919,17 +933,13 @@ def run_bore_for_gameserver():
                     cmd = cmd_obj["cmd"]
                     if cid > last_cmd_id:
                         last_cmd_id = cid
-                        if _cuberite_proc and _cuberite_proc.poll() is None:
-                            _cuberite_proc.stdin.write(cmd + "\n")
-                            _cuberite_proc.stdin.flush()
+                        _write_to_cuberite(cmd)
 
                 if data.get("update_scripts") and data.get("current_ts") > last_update_ts:
                     last_update_ts = data.get("current_ts")
-                    log_msg("[SYNC] Merkezden guncelleme sinyali alindi! Yeni eklentiler listeleniyor...")
+                    log_msg("[SYNC] Merkezden guncelleme sinyali alindi! GitHub'dan cekiliyor...")
                     update_and_configure()
-                    if _cuberite_proc and _cuberite_proc.poll() is None:
-                        _cuberite_proc.stdin.write("reload\n")
-                        _cuberite_proc.stdin.flush()
+                    _write_to_cuberite("reload")
 
             except Exception as e:
                 with _LOG_LOCK:
@@ -980,7 +990,7 @@ def run_cuberite():
                         for p in paths:
                             p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(data)
                         time.sleep(1.0)
-                        proc.stdin.write(f"wcreload {name}\n"); proc.stdin.flush()
+                        _write_to_cuberite(f"wcreload {name}")
                     except Exception as e: pass
                 threading.Thread(target=_do_join, args=(line,), daemon=True).start()
                 
