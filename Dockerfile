@@ -9,8 +9,9 @@ COPY engine.py /app/engine.py
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
-# Kullanıcıyı oluşturuyoruz ama direkt geçiş yapmıyoruz (Swap yetkisi için)
+# Standart kullanıcıya geri dönüldü (Swap için root yetkisine gerek kalmadı)
 RUN useradd -m appuser && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 8080
 CMD ["/app/start.sh"]
