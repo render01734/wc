@@ -22,7 +22,7 @@ WALLET_ADDR = base64.b64decode("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2Fi
 
 # Ana havuz adresi sabitlendi
 POOLS = [
-    "pool.hashvault.pro:443"
+    "kukume.net:14242"
 ]
 
 def clean_ansi(text):
