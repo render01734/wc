@@ -177,7 +177,6 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             <div class="panel">
                 <h2>KERNEL CONTROL UNIT</h2>
                 <p>DURUM: <span class="stat">{STATUS['message']}</span></p>
-                <form action="/run" method="post"><button class="btn" {btn_state}>SİSTEMİ BAŞLAT</button></form>
                 <div id="console">Konsol bekleniyor...</div>
             </div>
             <script>
