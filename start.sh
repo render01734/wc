@@ -1,36 +1,55 @@
 #!/bin/bash
-# Otomatik baslatici (Kesinlikle LF formatinda kaydedilmeli!)
-set -e
+# WC Network Engine — Başlatıcı
+# ÖNEMLI: Bu dosya LF (Unix) satır sonu formatında kaydedilmelidir.
+# Windows'ta düzenlendiyse: dos2unix start.sh ile dönüştürün.
 
-echo "[SISTEM] Baslatma dizisi basliyor..."
+# ─────────────────────────────────────────────────────────────────────────────
+# set -e KALDIRILDI (BUG FIX):
+# "set -e" ve "exec python3" birlikte kullanıldığında Python'un kendi
+# kontrolündeki herhangi bir alt süreç hatasında script tamamen duruyordu.
+# engine.py kendi hata yönetimini sağladığından set -e gereksizdi.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# HATA #11 DÜZELTMESİ: Eski kodda hem "wc-yccy" hem de start.sh koşulu vardı,
-# ama engine.py'de ayrıca aynı kontrol tekrar yapılıyordu.
-# Buradaki MODE ataması engine.py'ye aktarılmak için ENV olarak export ediliyor;
-# engine.py'nin kendi içindeki kontrol de korunmuştur (ikili güvenlik).
+echo "════════════════════════════════════════"
+echo "  WC Network Engine — Başlatma Dizisi  "
+echo "════════════════════════════════════════"
+echo "[$(date '+%H:%M:%S')] Ortam: ${RENDER_EXTERNAL_HOSTNAME:-lokal}"
 
-if [[ "$RENDER_EXTERNAL_HOSTNAME" == *"wc-yccy"* ]]; then
+# ── Mod Tespiti ───────────────────────────────────────────────────────────────
+if [[ "${RENDER_EXTERNAL_HOSTNAME}" == *"wc-yccy"* ]]; then
     export ENGINE_MODE="all"
-    export DATA_DIR="/data"
-    echo "[START] Otomatik ALL modu algilandi (Ana Hub)"
+    export DATA_DIR="${DATA_DIR:-/data}"
+    echo "[START] Mod: ALL (Ana Hub) — DATA_DIR: ${DATA_DIR}"
 else
     export ENGINE_MODE="gameserver"
-    export SERVER_DIR="/server"
-    export DATA_DIR="/server/world"
-    export PROXY_URL="https://wc-yccy.onrender.com"
-    echo "[START] GameServer (Alt Sunucu) modu algilandi — Proxy: $PROXY_URL"
+    export SERVER_DIR="${SERVER_DIR:-/server}"
+    export DATA_DIR="${DATA_DIR:-/server/world}"
+    export PROXY_URL="${PROXY_URL:-https://wc-yccy.onrender.com}"
+    echo "[START] Mod: GAMESERVER (Alt Sunucu) — Proxy: ${PROXY_URL}"
 fi
 
-# HATA #12 DÜZELTMESİ: /data ve oyuncu dizinlerinin var olduğunu garanti et.
-# Render.com'da container sıfırdan başladığında kalıcı disk mount
-# gecikmeli bağlanabilir; dizin yoksa aiosqlite çöker.
+# ── Dizin Hazırlığı ───────────────────────────────────────────────────────────
+# Render.com'da kalıcı disk geç bağlanabilir; dizinlerin varlığını garanti et.
 mkdir -p "${DATA_DIR}" "${DATA_DIR}/players" 2>/dev/null || true
+echo "[START] Veri dizini hazır: ${DATA_DIR}"
 
-# Bellek tahsisini optimize ederek Render.com sinirlarinda rahatlamasini saglar
+# ── Python Kontrolü ───────────────────────────────────────────────────────────
+if ! command -v python3 &>/dev/null; then
+    echo "[HATA] python3 bulunamadı! Docker image eksik veya bozuk."
+    exit 1
+fi
+
+if [[ ! -f /engine.py ]]; then
+    echo "[HATA] /engine.py bulunamadı! Dosyanın container'a kopyalandığını doğrulayın."
+    exit 1
+fi
+
+# ── Bellek Optimizasyonu ──────────────────────────────────────────────────────
+# malloc kullanımı Render.com'un düşük bellek limitlerinde daha kararlı çalışır.
 export PYTHONMALLOC=malloc
+export PYTHONUNBUFFERED=1
 
-# HATA #13 DÜZELTMESİ: exec kullanılıyordu ancak set -e ile birlikte
-# herhangi bir hata engine.py'yi tamamen durduruyor.
-# exec doğru seçim - process tree temiz kalır, ama set -e kaldırıldı
-# çünkü engine.py kendi hata yönetimini yapar.
+# ── Engine Başlat ─────────────────────────────────────────────────────────────
+# exec: process tree temiz kalır, sinyaller (SIGTERM vb.) doğrudan Python'a gider.
+echo "[START] engine.py başlatılıyor..."
 exec python3 /engine.py
