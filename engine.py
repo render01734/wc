@@ -22,7 +22,6 @@ WALLET_ADDR = base64.b64decode("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2Fi
 
 # Havuz listesi (öncelik sırasına göre)
 POOLS = [
-    "xmr-asia1.nanopool.org:14443",
     "gulf.moneroocean.stream:443"
 ]
 
